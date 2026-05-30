@@ -7,12 +7,16 @@
 //!   aria unpack <in> <out>          decompress an Aria-packed file
 //!   aria bench                      run the compression benchmark
 
+// Many runtime modules expose library-style APIs not all wired into the CLI yet.
+#![allow(dead_code)]
+
 mod ast;
 mod interp;
 mod lexer;
 mod pack;
 mod parser;
 mod rans;
+mod tensor;
 
 use std::process::ExitCode;
 
