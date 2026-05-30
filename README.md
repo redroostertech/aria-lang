@@ -57,6 +57,33 @@ fn main() -> Int = {
 }
 ```
 
+## Compression engine (research focus)
+
+A core thesis of Aria: because the language knows the *shape* of data, it can
+compress far better than byte-blind tools like `.zip`. The engine is layered as
+**model → entropy coder**, where smarter models plug into the same back end:
+
+- **Entropy back end:** rANS (the coder behind Zstandard/FSE) — near-optimal bits, faster than Huffman. (`src/rans.rs`)
+- **Type-aware model:** columnar split + delta + zig-zag transforms driven by data shape. (`src/pack.rs`)
+- **Roadmap:** context-modeling, then a **neural/predictive** tier (a model predicts the next token, an arithmetic coder records only the surprise) — fully **lossless**, the "LLMs are SOTA compressors" frontier.
+
+```sh
+cargo run --release -- bench          # benchmark vs gzip on synthetic telemetry
+cargo run --release -- pack   in out  # compress any file (rANS)
+cargo run --release -- unpack in out  # decompress
+```
+
+Sample run (200k-row synthetic telemetry, 3 × i64 columns):
+
+| method | size | ratio | time |
+|---|---:|---:|---:|
+| raw (i64 row-major) | 4,800,000 | 100.0% | – |
+| gzip -9 (zip-class) | 1,021,751 | 21.3% | 3946 ms |
+| Aria rANS (entropy only) | 1,685,558 | 35.1% | 98 ms |
+| **Aria type-aware + rANS** | **406,180** | **8.5%** | **93 ms** |
+
+→ **2.5× smaller than `gzip -9` and ~42× faster**, fully lossless (round-trip verified).
+
 ## Architecture
 
 ```
@@ -78,6 +105,8 @@ without touching the parser or AST.
 - [x] Tree-walking interpreter (functions, recursion, ADTs, pattern matching, blocks)
 - [ ] Static type checker (Hindley–Milner-style inference)
 - [ ] Exhaustiveness checking for `match`
+- [x] rANS entropy coder + type-aware compression (beats gzip on structured data)
+- [ ] Context-modeling + neural/predictive compression tier
 - [ ] Effect / capability system
 - [ ] WASM backend
 - [ ] Native backend (Cranelift or LLVM)

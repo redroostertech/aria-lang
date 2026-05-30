@@ -1,25 +1,49 @@
 //! Aria CLI.
 //!
 //! Usage:
-//!   aria run <file.aria>     parse and execute `main`
-//!   aria ast <file.aria>     print the parsed AST (debugging)
+//!   aria run   <file.aria>          parse and execute `main`
+//!   aria ast   <file.aria>          print the parsed AST (debugging)
+//!   aria pack  <in> <out>           compress any file (rANS entropy coder)
+//!   aria unpack <in> <out>          decompress an Aria-packed file
+//!   aria bench                      run the compression benchmark
 
 mod ast;
 mod interp;
 mod lexer;
+mod pack;
 mod parser;
+mod rans;
 
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 3 {
-        eprintln!("usage: aria <run|ast> <file.aria>");
+    if args.len() < 2 {
+        eprintln!("usage: aria <run|ast|pack|unpack|bench> [args...]");
         return ExitCode::from(2);
     }
-    let cmd = &args[1];
-    let path = &args[2];
 
+    match args[1].as_str() {
+        "run" | "ast" => run_source(&args),
+        "pack" => pack_file(&args, true),
+        "unpack" => pack_file(&args, false),
+        "bench" => {
+            pack::bench();
+            ExitCode::SUCCESS
+        }
+        other => {
+            eprintln!("unknown command `{}`", other);
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn run_source(args: &[String]) -> ExitCode {
+    if args.len() < 3 {
+        eprintln!("usage: aria {} <file.aria>", args[1]);
+        return ExitCode::from(2);
+    }
+    let path = &args[2];
     let src = match std::fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) => {
@@ -35,7 +59,6 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-
     let program = match parser::parse(toks) {
         Ok(p) => p,
         Err(e) => {
@@ -44,36 +67,65 @@ fn main() -> ExitCode {
         }
     };
 
-    match cmd.as_str() {
-        "ast" => {
-            println!("{:#?}", program);
-            ExitCode::SUCCESS
+    if args[1] == "ast" {
+        println!("{:#?}", program);
+        return ExitCode::SUCCESS;
+    }
+
+    let interp = match interp::Interp::new(&program) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            return ExitCode::FAILURE;
         }
-        "run" => {
-            let interp = match interp::Interp::new(&program) {
-                Ok(i) => i,
-                Err(e) => {
-                    eprintln!("error: {}", e);
-                    return ExitCode::FAILURE;
-                }
-            };
-            match interp.run_main() {
-                Ok(v) => {
-                    // `main` returning an Int sets the process exit code.
-                    match v {
-                        interp::Value::Int(n) => ExitCode::from((n & 0xff) as u8),
-                        _ => ExitCode::SUCCESS,
-                    }
-                }
-                Err(e) => {
-                    eprintln!("runtime error: {}", e);
-                    ExitCode::FAILURE
-                }
-            }
-        }
-        other => {
-            eprintln!("unknown command `{}` (use run or ast)", other);
-            ExitCode::from(2)
+    };
+    match interp.run_main() {
+        Ok(interp::Value::Int(n)) => ExitCode::from((n & 0xff) as u8),
+        Ok(_) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("runtime error: {}", e);
+            ExitCode::FAILURE
         }
     }
+}
+
+fn pack_file(args: &[String], compress: bool) -> ExitCode {
+    if args.len() < 4 {
+        eprintln!("usage: aria {} <in> <out>", args[1]);
+        return ExitCode::from(2);
+    }
+    let input = match std::fs::read(&args[2]) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("error: cannot read {}: {}", args[2], e);
+            return ExitCode::from(2);
+        }
+    };
+    let output = if compress {
+        rans::compress(&input)
+    } else {
+        match rans::decompress(&input) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("error: {}", e);
+                return ExitCode::FAILURE;
+            }
+        }
+    };
+    if let Err(e) = std::fs::write(&args[3], &output) {
+        eprintln!("error: cannot write {}: {}", args[3], e);
+        return ExitCode::FAILURE;
+    }
+    if compress {
+        let ratio = 100.0 * output.len() as f64 / input.len().max(1) as f64;
+        eprintln!(
+            "packed {} -> {} bytes ({:.1}% of original)",
+            input.len(),
+            output.len(),
+            ratio
+        );
+    } else {
+        eprintln!("unpacked {} -> {} bytes", input.len(), output.len());
+    }
+    ExitCode::SUCCESS
 }
