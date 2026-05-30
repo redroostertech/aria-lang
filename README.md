@@ -71,6 +71,11 @@ compress far better than byte-blind tools like `.zip`. The engine is layered as
 cargo run --release -- bench          # benchmark vs gzip on synthetic telemetry
 cargo run --release -- pack   in out  # compress any file (rANS)
 cargo run --release -- unpack in out  # decompress
+cargo run --release -- demo           # run the AI-native runtime demos:
+cargo run --release -- demo transformer  # tiny transformer forward pass
+cargo run --release -- demo predict      # context-mixing predictor (bits/byte)
+cargo run --release -- demo shape        # compile-time tensor shape checking
+cargo run --release -- demo rag          # native retrieval (embedding top-k)
 ```
 
 Sample run (200k-row synthetic telemetry, 3 × i64 columns):
@@ -106,7 +111,12 @@ without touching the parser or AST.
 - [ ] Static type checker (Hindley–Milner-style inference)
 - [ ] Exhaustiveness checking for `match`
 - [x] rANS entropy coder + type-aware compression (beats gzip on structured data)
-- [ ] Context-modeling + neural/predictive compression tier
+- [x] Shaped-tensor runtime (matmul/softmax/layernorm) + INT8 quantization
+- [x] Transformer forward pass (inference) running on the tensor core
+- [x] Arithmetic coder + context-mixing predictor (predictive-compression building blocks)
+- [x] Native RAG primitives (embedding store + cosine top-k retrieval)
+- [x] Compile-time tensor shape checking (dimension mismatch = compile error)
+- [ ] Wire predictor + arithmetic coder into an end-to-end neural codec
 - [ ] Effect / capability system
 - [ ] WASM backend
 - [ ] Native backend (Cranelift or LLVM)

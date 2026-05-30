@@ -10,13 +10,19 @@
 // Many runtime modules expose library-style APIs not all wired into the CLI yet.
 #![allow(dead_code)]
 
+mod arith;
 mod ast;
 mod interp;
 mod lexer;
 mod pack;
 mod parser;
+mod predict;
+mod rag;
 mod rans;
+mod shape;
 mod tensor;
+mod tensor_ext;
+mod transformer;
 
 use std::process::ExitCode;
 
@@ -35,11 +41,36 @@ fn main() -> ExitCode {
             pack::bench();
             ExitCode::SUCCESS
         }
+        "demo" => run_demo(args.get(2).map(|s| s.as_str())),
         other => {
             eprintln!("unknown command `{}`", other);
             ExitCode::from(2)
         }
     }
+}
+
+fn run_demo(which: Option<&str>) -> ExitCode {
+    match which {
+        Some("transformer") => transformer::demo(),
+        Some("predict") => predict::demo(),
+        Some("shape") => shape::demo(),
+        Some("rag") => rag::demo(),
+        Some(other) => {
+            eprintln!("unknown demo `{}` (try: transformer, predict, shape, rag)", other);
+            return ExitCode::from(2);
+        }
+        None => {
+            println!("== transformer ==");
+            transformer::demo();
+            println!("\n== predict ==");
+            predict::demo();
+            println!("\n== shape ==");
+            shape::demo();
+            println!("\n== rag ==");
+            rag::demo();
+        }
+    }
+    ExitCode::SUCCESS
 }
 
 fn run_source(args: &[String]) -> ExitCode {
