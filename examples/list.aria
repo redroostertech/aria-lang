@@ -1,0 +1,26 @@
+-- A recursive list type built from constructors, plus folds.
+-- Shows why exhaustive pattern matching makes generated code reliable:
+-- every case is named and the compiler can check none are missing.
+
+type List =
+  | Nil
+  | Cons(Int, List)
+
+fn sum(xs: List) -> Int =
+  match xs {
+    Nil          => 0,
+    Cons(h, rest) => h + sum(rest),
+  }
+
+fn length(xs: List) -> Int =
+  match xs {
+    Nil          => 0,
+    Cons(_, rest) => 1 + length(rest),
+  }
+
+fn main() -> Int = {
+  let xs = Cons(1, Cons(2, Cons(3, Cons(4, Nil))));
+  print_str(concat("sum    = ", int_to_str(sum(xs))));
+  print_str(concat("length = ", int_to_str(length(xs))));
+  sum(xs)
+}

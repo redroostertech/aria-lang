@@ -1,0 +1,16 @@
+[package]
+name = "aria"
+version = "0.1.0"
+edition = "2021"
+description = "Aria — an AI-native programming language (prototype)"
+
+[[bin]]
+name = "aria"
+path = "src/main.rs"
+
+# Zero dependencies on purpose: fast, reproducible compiles.
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = true

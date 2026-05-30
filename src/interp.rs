@@ -1,0 +1,400 @@
+//! Tree-walking interpreter.
+//!
+//! This is the "runs today" backend. Frontend (lexer/parser) is kept fully
+//! separate so a WASM or native code generator can be added as an alternative
+//! backend without touching anything here.
+
+use std::collections::HashMap;
+
+use crate::ast::*;
+
+#[derive(Debug, Clone)]
+pub enum Value {
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+    Str(String),
+    Data { ctor: String, fields: Vec<Value> },
+    Unit,
+}
+
+impl Value {
+    pub fn display(&self) -> String {
+        match self {
+            Value::Int(n) => n.to_string(),
+            Value::Float(f) => format!("{}", f),
+            Value::Bool(b) => b.to_string(),
+            Value::Str(s) => s.clone(),
+            Value::Unit => "()".to_string(),
+            Value::Data { ctor, fields } => {
+                if fields.is_empty() {
+                    ctor.clone()
+                } else {
+                    let inner: Vec<String> = fields.iter().map(|v| v.display()).collect();
+                    format!("{}({})", ctor, inner.join(", "))
+                }
+            }
+        }
+    }
+}
+
+type Scope = Vec<HashMap<String, Value>>;
+
+pub struct Interp {
+    fns: HashMap<String, FnDecl>,
+    /// constructor name -> arity
+    ctors: HashMap<String, usize>,
+}
+
+impl Interp {
+    pub fn new(program: &Program) -> Result<Self, String> {
+        let mut fns = HashMap::new();
+        let mut ctors = HashMap::new();
+        for item in &program.items {
+            match item {
+                Item::Fn(f) => {
+                    if fns.insert(f.name.clone(), f.clone()).is_some() {
+                        return Err(format!("duplicate function `{}`", f.name));
+                    }
+                }
+                Item::Type(t) => {
+                    for v in &t.variants {
+                        if ctors.insert(v.name.clone(), v.fields.len()).is_some() {
+                            return Err(format!("duplicate constructor `{}`", v.name));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(Interp { fns, ctors })
+    }
+
+    pub fn run_main(&self) -> Result<Value, String> {
+        let main = self
+            .fns
+            .get("main")
+            .ok_or_else(|| "no `main` function found".to_string())?;
+        if !main.params.is_empty() {
+            return Err("`main` must take no parameters".to_string());
+        }
+        let mut scope: Scope = vec![HashMap::new()];
+        self.eval(&main.body, &mut scope)
+    }
+
+    fn lookup<'a>(scope: &'a Scope, name: &str) -> Option<&'a Value> {
+        for frame in scope.iter().rev() {
+            if let Some(v) = frame.get(name) {
+                return Some(v);
+            }
+        }
+        None
+    }
+
+    fn eval(&self, e: &Expr, scope: &mut Scope) -> Result<Value, String> {
+        match e {
+            Expr::Int(n) => Ok(Value::Int(*n)),
+            Expr::Float(f) => Ok(Value::Float(*f)),
+            Expr::Bool(b) => Ok(Value::Bool(*b)),
+            Expr::Str(s) => Ok(Value::Str(s.clone())),
+            Expr::Unit => Ok(Value::Unit),
+
+            Expr::Var(name) => {
+                if let Some(v) = Interp::lookup(scope, name) {
+                    Ok(v.clone())
+                } else {
+                    Err(format!("unbound variable `{}`", name))
+                }
+            }
+
+            Expr::Ctor(name, args) => {
+                let arity = self
+                    .ctors
+                    .get(name)
+                    .ok_or_else(|| format!("unknown constructor `{}`", name))?;
+                if *arity != args.len() {
+                    return Err(format!(
+                        "constructor `{}` expects {} field(s), got {}",
+                        name,
+                        arity,
+                        args.len()
+                    ));
+                }
+                let mut fields = Vec::with_capacity(args.len());
+                for a in args {
+                    fields.push(self.eval(a, scope)?);
+                }
+                Ok(Value::Data {
+                    ctor: name.clone(),
+                    fields,
+                })
+            }
+
+            Expr::Call(name, args) => {
+                let mut vals = Vec::with_capacity(args.len());
+                for a in args {
+                    vals.push(self.eval(a, scope)?);
+                }
+                if let Some(v) = builtin(name, &vals)? {
+                    return Ok(v);
+                }
+                let f = self
+                    .fns
+                    .get(name)
+                    .ok_or_else(|| format!("unknown function `{}`", name))?;
+                if f.params.len() != vals.len() {
+                    return Err(format!(
+                        "function `{}` expects {} argument(s), got {}",
+                        name,
+                        f.params.len(),
+                        vals.len()
+                    ));
+                }
+                let mut frame = HashMap::new();
+                for (p, v) in f.params.iter().zip(vals.into_iter()) {
+                    frame.insert(p.name.clone(), v);
+                }
+                let mut call_scope: Scope = vec![frame];
+                self.eval(&f.body, &mut call_scope)
+            }
+
+            Expr::Unary(op, inner) => {
+                let v = self.eval(inner, scope)?;
+                match (op, v) {
+                    (UnOp::Neg, Value::Int(n)) => Ok(Value::Int(-n)),
+                    (UnOp::Neg, Value::Float(f)) => Ok(Value::Float(-f)),
+                    (UnOp::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
+                    (op, v) => Err(format!("cannot apply {:?} to {}", op, v.display())),
+                }
+            }
+
+            Expr::Binary(op, lhs, rhs) => self.eval_binary(*op, lhs, rhs, scope),
+
+            Expr::If(cond, then, els) => match self.eval(cond, scope)? {
+                Value::Bool(true) => self.eval(then, scope),
+                Value::Bool(false) => self.eval(els, scope),
+                other => Err(format!("`if` condition must be Bool, got {}", other.display())),
+            },
+
+            Expr::Match(scrut, arms) => {
+                let v = self.eval(scrut, scope)?;
+                for arm in arms {
+                    let mut binds = HashMap::new();
+                    if match_pattern(&arm.pat, &v, &mut binds) {
+                        scope.push(binds);
+                        let result = self.eval(&arm.body, scope);
+                        scope.pop();
+                        return result;
+                    }
+                }
+                Err(format!("no match arm for value {}", v.display()))
+            }
+
+            Expr::Block(stmts, last) => {
+                scope.push(HashMap::new());
+                let mut run = || -> Result<Value, String> {
+                    for s in stmts {
+                        match s {
+                            Stmt::Let(name, _ty, value) => {
+                                let v = self.eval(value, scope)?;
+                                scope.last_mut().unwrap().insert(name.clone(), v);
+                            }
+                            Stmt::Expr(e) => {
+                                self.eval(e, scope)?;
+                            }
+                        }
+                    }
+                    self.eval(last, scope)
+                };
+                let result = run();
+                scope.pop();
+                result
+            }
+        }
+    }
+
+    fn eval_binary(
+        &self,
+        op: BinOp,
+        lhs: &Expr,
+        rhs: &Expr,
+        scope: &mut Scope,
+    ) -> Result<Value, String> {
+        // Short-circuiting boolean operators.
+        match op {
+            BinOp::And => {
+                return match self.eval(lhs, scope)? {
+                    Value::Bool(false) => Ok(Value::Bool(false)),
+                    Value::Bool(true) => match self.eval(rhs, scope)? {
+                        Value::Bool(b) => Ok(Value::Bool(b)),
+                        v => Err(format!("`&&` expects Bool, got {}", v.display())),
+                    },
+                    v => Err(format!("`&&` expects Bool, got {}", v.display())),
+                };
+            }
+            BinOp::Or => {
+                return match self.eval(lhs, scope)? {
+                    Value::Bool(true) => Ok(Value::Bool(true)),
+                    Value::Bool(false) => match self.eval(rhs, scope)? {
+                        Value::Bool(b) => Ok(Value::Bool(b)),
+                        v => Err(format!("`||` expects Bool, got {}", v.display())),
+                    },
+                    v => Err(format!("`||` expects Bool, got {}", v.display())),
+                };
+            }
+            _ => {}
+        }
+
+        let l = self.eval(lhs, scope)?;
+        let r = self.eval(rhs, scope)?;
+
+        match op {
+            BinOp::Eq => return Ok(Value::Bool(values_equal(&l, &r))),
+            BinOp::Ne => return Ok(Value::Bool(!values_equal(&l, &r))),
+            _ => {}
+        }
+
+        match (&l, &r) {
+            (Value::Int(a), Value::Int(b)) => Ok(int_op(op, *a, *b)?),
+            (Value::Float(a), Value::Float(b)) => Ok(float_op(op, *a, *b)?),
+            _ => Err(format!(
+                "operator {:?} needs two Ints or two Floats, got {} and {}",
+                op,
+                l.display(),
+                r.display()
+            )),
+        }
+    }
+}
+
+fn int_op(op: BinOp, a: i64, b: i64) -> Result<Value, String> {
+    Ok(match op {
+        BinOp::Add => Value::Int(a + b),
+        BinOp::Sub => Value::Int(a - b),
+        BinOp::Mul => Value::Int(a * b),
+        BinOp::Div => {
+            if b == 0 {
+                return Err("division by zero".into());
+            }
+            Value::Int(a / b)
+        }
+        BinOp::Mod => {
+            if b == 0 {
+                return Err("modulo by zero".into());
+            }
+            Value::Int(a % b)
+        }
+        BinOp::Lt => Value::Bool(a < b),
+        BinOp::Le => Value::Bool(a <= b),
+        BinOp::Gt => Value::Bool(a > b),
+        BinOp::Ge => Value::Bool(a >= b),
+        _ => return Err(format!("operator {:?} not valid on Int", op)),
+    })
+}
+
+fn float_op(op: BinOp, a: f64, b: f64) -> Result<Value, String> {
+    Ok(match op {
+        BinOp::Add => Value::Float(a + b),
+        BinOp::Sub => Value::Float(a - b),
+        BinOp::Mul => Value::Float(a * b),
+        BinOp::Div => Value::Float(a / b),
+        BinOp::Lt => Value::Bool(a < b),
+        BinOp::Le => Value::Bool(a <= b),
+        BinOp::Gt => Value::Bool(a > b),
+        BinOp::Ge => Value::Bool(a >= b),
+        _ => return Err(format!("operator {:?} not valid on Float", op)),
+    })
+}
+
+fn values_equal(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Int(x), Value::Int(y)) => x == y,
+        (Value::Float(x), Value::Float(y)) => x == y,
+        (Value::Bool(x), Value::Bool(y)) => x == y,
+        (Value::Str(x), Value::Str(y)) => x == y,
+        (Value::Unit, Value::Unit) => true,
+        (
+            Value::Data {
+                ctor: c1,
+                fields: f1,
+            },
+            Value::Data {
+                ctor: c2,
+                fields: f2,
+            },
+        ) => c1 == c2 && f1.len() == f2.len() && f1.iter().zip(f2).all(|(x, y)| values_equal(x, y)),
+        _ => false,
+    }
+}
+
+fn match_pattern(pat: &Pattern, val: &Value, binds: &mut HashMap<String, Value>) -> bool {
+    match pat {
+        Pattern::Wild => true,
+        Pattern::Var(name) => {
+            binds.insert(name.clone(), val.clone());
+            true
+        }
+        Pattern::Int(i) => matches!(val, Value::Int(v) if v == i),
+        Pattern::Bool(b) => matches!(val, Value::Bool(v) if v == b),
+        Pattern::Ctor(name, subs) => match val {
+            Value::Data { ctor, fields } if ctor == name && fields.len() == subs.len() => subs
+                .iter()
+                .zip(fields)
+                .all(|(p, f)| match_pattern(p, f, binds)),
+            _ => false,
+        },
+    }
+}
+
+/// Returns Ok(Some(value)) if `name` is a builtin, Ok(None) otherwise.
+fn builtin(name: &str, args: &[Value]) -> Result<Option<Value>, String> {
+    let one = |args: &[Value]| -> Result<Value, String> {
+        if args.len() != 1 {
+            return Err(format!("`{}` expects 1 argument", name));
+        }
+        Ok(args[0].clone())
+    };
+    match name {
+        "print_int" => match one(args)? {
+            Value::Int(n) => {
+                println!("{}", n);
+                Ok(Some(Value::Unit))
+            }
+            v => Err(format!("print_int expects Int, got {}", v.display())),
+        },
+        "print_float" => match one(args)? {
+            Value::Float(f) => {
+                println!("{}", f);
+                Ok(Some(Value::Unit))
+            }
+            v => Err(format!("print_float expects Float, got {}", v.display())),
+        },
+        "print_bool" => match one(args)? {
+            Value::Bool(b) => {
+                println!("{}", b);
+                Ok(Some(Value::Unit))
+            }
+            v => Err(format!("print_bool expects Bool, got {}", v.display())),
+        },
+        "print_str" => match one(args)? {
+            Value::Str(s) => {
+                println!("{}", s);
+                Ok(Some(Value::Unit))
+            }
+            v => Err(format!("print_str expects String, got {}", v.display())),
+        },
+        "concat" => {
+            if args.len() != 2 {
+                return Err("concat expects 2 arguments".into());
+            }
+            match (&args[0], &args[1]) {
+                (Value::Str(a), Value::Str(b)) => Ok(Some(Value::Str(format!("{}{}", a, b)))),
+                _ => Err("concat expects two Strings".into()),
+            }
+        }
+        "int_to_str" => match one(args)? {
+            Value::Int(n) => Ok(Some(Value::Str(n.to_string()))),
+            v => Err(format!("int_to_str expects Int, got {}", v.display())),
+        },
+        _ => Ok(None),
+    }
+}

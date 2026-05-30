@@ -1,0 +1,35 @@
+-- Aria intro example.
+-- Demonstrates: functions, recursion, ADTs, pattern matching, blocks.
+
+-- A sum type. Uppercase = type/constructor, lowercase = value/function.
+type Shape =
+  | Circle(Float)
+  | Rect(Float, Float)
+
+fn area(s: Shape) -> Float =
+  match s {
+    Circle(r)  => 3.14159 * r * r,
+    Rect(w, h) => w * h,
+  }
+
+fn factorial(n: Int) -> Int =
+  match n {
+    0 => 1,
+    _ => n * factorial(n - 1),
+  }
+
+fn classify(n: Int) -> String =
+  if n < 0 {
+    "negative"
+  } else {
+    if n == 0 { "zero" } else { "positive" }
+  }
+
+fn main() -> Int = {
+  print_str(concat("5! = ", int_to_str(factorial(5))));
+  print_float(area(Circle(2.0)));
+  print_float(area(Rect(3.0, 4.0)));
+  print_str(classify(-7));
+  print_str(classify(42));
+  0
+}
