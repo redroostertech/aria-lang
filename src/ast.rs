@@ -12,7 +12,12 @@ pub enum Ty {
     Bool,
     Str,
     Unit,
-    Named(String),
+    /// A named type, possibly with type arguments, e.g. `List[Int]` or `Option[T]`.
+    /// A non-generic named type has an empty argument list.
+    Named(String, Vec<Ty>),
+    /// A type variable, either a declared generic parameter (`T`) or a fresh
+    /// unification variable introduced by the checker.
+    Var(String),
 }
 
 #[derive(Debug, Clone)]
@@ -88,6 +93,8 @@ pub struct Param {
 #[derive(Debug, Clone)]
 pub struct FnDecl {
     pub name: String,
+    /// Declared generic type parameters, e.g. `[T, U]`.
+    pub type_params: Vec<String>,
     pub params: Vec<Param>,
     pub ret: Ty,
     pub body: Expr,
@@ -102,6 +109,8 @@ pub struct Variant {
 #[derive(Debug, Clone)]
 pub struct TypeDecl {
     pub name: String,
+    /// Declared generic type parameters, e.g. `[T]`.
+    pub params: Vec<String>,
     pub variants: Vec<Variant>,
 }
 

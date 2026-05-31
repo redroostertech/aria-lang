@@ -85,13 +85,14 @@ impl Parser {
     fn parse_fn(&mut self) -> Result<FnDecl, String> {
         self.expect(&Tok::Fn)?;
         let name = self.expect_ident()?;
+        let type_params = self.parse_type_params()?;
         self.expect(&Tok::LParen)?;
         let mut params = Vec::new();
         if *self.peek() != Tok::RParen {
             loop {
                 let pname = self.expect_ident()?;
                 self.expect(&Tok::Colon)?;
-                let ty = self.parse_type()?;
+                let ty = self.parse_type(&type_params)?;
                 params.push(Param { name: pname, ty });
                 if *self.peek() == Tok::Comma {
                     self.advance();
@@ -102,20 +103,42 @@ impl Parser {
         }
         self.expect(&Tok::RParen)?;
         self.expect(&Tok::Arrow)?;
-        let ret = self.parse_type()?;
+        let ret = self.parse_type(&type_params)?;
         self.expect(&Tok::Eq)?;
         let body = self.parse_expr(0)?;
         Ok(FnDecl {
             name,
+            type_params,
             params,
             ret,
             body,
         })
     }
 
+    // Parse an optional `[T, U, ...]` type-parameter list on a declaration.
+    fn parse_type_params(&mut self) -> Result<Vec<String>, String> {
+        let mut params = Vec::new();
+        if *self.peek() == Tok::LBracket {
+            self.advance();
+            if *self.peek() != Tok::RBracket {
+                loop {
+                    params.push(self.expect_ident()?);
+                    if *self.peek() == Tok::Comma {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+            }
+            self.expect(&Tok::RBracket)?;
+        }
+        Ok(params)
+    }
+
     fn parse_type_decl(&mut self) -> Result<TypeDecl, String> {
         self.expect(&Tok::Type)?;
         let name = self.expect_ident()?;
+        let params = self.parse_type_params()?;
         self.expect(&Tok::Eq)?;
         // Optional leading pipe.
         if *self.peek() == Tok::Pipe {
@@ -129,7 +152,7 @@ impl Parser {
                 self.advance();
                 if *self.peek() != Tok::RParen {
                     loop {
-                        fields.push(self.parse_type()?);
+                        fields.push(self.parse_type(&params)?);
                         if *self.peek() == Tok::Comma {
                             self.advance();
                         } else {
@@ -146,19 +169,51 @@ impl Parser {
                 break;
             }
         }
-        Ok(TypeDecl { name, variants })
+        Ok(TypeDecl {
+            name,
+            params,
+            variants,
+        })
     }
 
-    fn parse_type(&mut self) -> Result<Ty, String> {
+    // Parse a type expression. `tparams` lists the generic parameters in scope;
+    // a bare name found there becomes a `Ty::Var`, builtins map to their concrete
+    // types, and anything else is a `Ty::Named` with optional `[..]` arguments.
+    fn parse_type(&mut self, tparams: &[String]) -> Result<Ty, String> {
         let name = self.expect_ident()?;
-        Ok(match name.as_str() {
-            "Int" => Ty::Int,
-            "Float" => Ty::Float,
-            "Bool" => Ty::Bool,
-            "String" => Ty::Str,
-            "Unit" => Ty::Unit,
-            _ => Ty::Named(name),
-        })
+        // A bare builtin name (no brackets) stays a concrete builtin type.
+        let builtin = match name.as_str() {
+            "Int" => Some(Ty::Int),
+            "Float" => Some(Ty::Float),
+            "Bool" => Some(Ty::Bool),
+            "String" => Some(Ty::Str),
+            "Unit" => Some(Ty::Unit),
+            _ => None,
+        };
+        let mut args = Vec::new();
+        if *self.peek() == Tok::LBracket {
+            self.advance();
+            if *self.peek() != Tok::RBracket {
+                loop {
+                    args.push(self.parse_type(tparams)?);
+                    if *self.peek() == Tok::Comma {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+            }
+            self.expect(&Tok::RBracket)?;
+        }
+        if args.is_empty() {
+            if let Some(b) = builtin {
+                return Ok(b);
+            }
+            if tparams.iter().any(|p| p == &name) {
+                return Ok(Ty::Var(name));
+            }
+        }
+        Ok(Ty::Named(name, args))
     }
 
     // ---- expressions (Pratt) --------------------------------------------
@@ -379,7 +434,7 @@ impl Parser {
                 let mut ann = None;
                 if *self.peek() == Tok::Colon {
                     self.advance();
-                    ann = Some(self.parse_type()?);
+                    ann = Some(self.parse_type(&[])?);
                 }
                 self.expect(&Tok::Eq)?;
                 let value = self.parse_expr(0)?;

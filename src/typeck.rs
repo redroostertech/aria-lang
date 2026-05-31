@@ -3,8 +3,14 @@
 //! This is the keystone of the AI-native thesis: the compiler is the model's
 //! correctness signal. The checker is sound and *bottom-up* — it synthesizes a
 //! type for every expression and checks it against the declared annotations on
-//! functions, constructors, and `let` bindings. Because Aria has no generics
-//! yet, every type is concrete and no unification is needed.
+//! functions, constructors, and `let` bindings.
+//!
+//! Aria now supports parametric polymorphism (generics). Types may contain
+//! unification variables (`Ty::Var`). The checker uses a Hindley-Milner-style
+//! substitution map keyed on fresh-variable names: at each use of a generic
+//! constructor or generic function, its declared type parameters are
+//! INSTANTIATED with fresh unification variables, then unification drives the
+//! variables to concrete types (or reports a clear mismatch).
 //!
 //! Beyond ordinary type mismatches it enforces the two things that most reduce
 //! generated-code bugs:
@@ -12,10 +18,12 @@
 //!     wildcard provided), so "forgot a case" is a compile error;
 //!   * arity/field checks on calls and constructors.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 use crate::ast::*;
 
+/// Render a type for diagnostics, resolving any solved variables first.
 pub fn show(t: &Ty) -> String {
     match t {
         Ty::Int => "Int".to_string(),
@@ -23,23 +31,51 @@ pub fn show(t: &Ty) -> String {
         Ty::Bool => "Bool".to_string(),
         Ty::Str => "String".to_string(),
         Ty::Unit => "Unit".to_string(),
-        Ty::Named(n) => n.clone(),
+        Ty::Var(n) => n.clone(),
+        Ty::Named(n, args) => {
+            if args.is_empty() {
+                n.clone()
+            } else {
+                let inner: Vec<String> = args.iter().map(show).collect();
+                format!("{}[{}]", n, inner.join(", "))
+            }
+        }
     }
 }
 
 type Scope = Vec<HashMap<String, Ty>>;
 
+// A constructor's declared signature, retaining the owning type's generic
+// parameters so each use can be instantiated with fresh variables.
+#[derive(Clone)]
+struct CtorSig {
+    type_params: Vec<String>, // generic params of the owning type
+    fields: Vec<Ty>,          // field types (may mention the params as Ty::Var)
+    tyname: String,           // owning type name
+}
+
+// A function's declared signature, retaining its generic parameters.
+#[derive(Clone)]
+struct FnSig {
+    type_params: Vec<String>,
+    params: Vec<Ty>,
+    ret: Ty,
+}
+
 struct Checker {
-    fns: HashMap<String, (Vec<Ty>, Ty)>,
-    ctors: HashMap<String, (Vec<Ty>, String)>, // ctor -> (field types, owning type)
-    types: HashMap<String, Vec<String>>,        // type -> variant ctor names
+    fns: HashMap<String, FnSig>,
+    ctors: HashMap<String, CtorSig>,
+    types: HashMap<String, (Vec<String>, Vec<String>)>, // type -> (params, variant ctor names)
+    // Union-find / substitution for unification variables, plus a fresh counter.
+    subst: RefCell<HashMap<String, Ty>>,
+    counter: RefCell<u64>,
 }
 
 /// Type-check a whole program. Returns every error found, not just the first.
 pub fn check(program: &Program) -> Result<(), Vec<String>> {
-    let mut fns: HashMap<String, (Vec<Ty>, Ty)> = HashMap::new();
-    let mut ctors: HashMap<String, (Vec<Ty>, String)> = HashMap::new();
-    let mut types: HashMap<String, Vec<String>> = HashMap::new();
+    let mut fns: HashMap<String, FnSig> = HashMap::new();
+    let mut ctors: HashMap<String, CtorSig> = HashMap::new();
+    let mut types: HashMap<String, (Vec<String>, Vec<String>)> = HashMap::new();
     let mut errors: Vec<String> = Vec::new();
 
     // Pass 1: gather declarations.
@@ -50,68 +86,141 @@ pub fn check(program: &Program) -> Result<(), Vec<String>> {
                 for v in &t.variants {
                     variants.push(v.name.clone());
                     if ctors
-                        .insert(v.name.clone(), (v.fields.clone(), t.name.clone()))
+                        .insert(
+                            v.name.clone(),
+                            CtorSig {
+                                type_params: t.params.clone(),
+                                fields: v.fields.clone(),
+                                tyname: t.name.clone(),
+                            },
+                        )
                         .is_some()
                     {
                         errors.push(format!("duplicate constructor `{}`", v.name));
                     }
                 }
-                if types.insert(t.name.clone(), variants).is_some() {
+                if types
+                    .insert(t.name.clone(), (t.params.clone(), variants))
+                    .is_some()
+                {
                     errors.push(format!("duplicate type `{}`", t.name));
                 }
             }
             Item::Fn(f) => {
                 let params = f.params.iter().map(|p| p.ty.clone()).collect();
-                if fns.insert(f.name.clone(), (params, f.ret.clone())).is_some() {
+                if fns
+                    .insert(
+                        f.name.clone(),
+                        FnSig {
+                            type_params: f.type_params.clone(),
+                            params,
+                            ret: f.ret.clone(),
+                        },
+                    )
+                    .is_some()
+                {
                     errors.push(format!("duplicate function `{}`", f.name));
                 }
             }
         }
     }
 
-    // Pass 2: every Named type referenced must be defined.
-    let known = |t: &Ty, errs: &mut Vec<String>, ctx: &str| {
-        if let Ty::Named(n) = t {
-            if !types.contains_key(n) {
-                errs.push(format!("{}: unknown type `{}`", ctx, n));
+    // Pass 2: every Named type referenced must be defined, with the right arity,
+    // and its arguments must in turn be valid. Type variables in scope are fine.
+    fn known(
+        t: &Ty,
+        types: &HashMap<String, (Vec<String>, Vec<String>)>,
+        params: &[String],
+        errs: &mut Vec<String>,
+        ctx: &str,
+    ) {
+        match t {
+            Ty::Named(n, args) => {
+                match types.get(n) {
+                    None => errs.push(format!("{}: unknown type `{}`", ctx, n)),
+                    Some((decl_params, _)) => {
+                        if decl_params.len() != args.len() {
+                            errs.push(format!(
+                                "{}: type `{}` expects {} type argument(s), got {}",
+                                ctx,
+                                n,
+                                decl_params.len(),
+                                args.len()
+                            ));
+                        }
+                    }
+                }
+                for a in args {
+                    known(a, types, params, errs, ctx);
+                }
             }
+            Ty::Var(_) => {} // a declared generic parameter; fine
+            _ => {}
         }
-    };
+    }
     for item in &program.items {
         match item {
             Item::Fn(f) => {
                 for p in &f.params {
-                    known(&p.ty, &mut errors, &format!("function `{}` parameter `{}`", f.name, p.name));
+                    known(
+                        &p.ty,
+                        &types,
+                        &f.type_params,
+                        &mut errors,
+                        &format!("function `{}` parameter `{}`", f.name, p.name),
+                    );
                 }
-                known(&f.ret, &mut errors, &format!("function `{}` return type", f.name));
+                known(
+                    &f.ret,
+                    &types,
+                    &f.type_params,
+                    &mut errors,
+                    &format!("function `{}` return type", f.name),
+                );
             }
             Item::Type(t) => {
                 for v in &t.variants {
                     for ft in &v.fields {
-                        known(ft, &mut errors, &format!("constructor `{}` field", v.name));
+                        known(
+                            ft,
+                            &types,
+                            &t.params,
+                            &mut errors,
+                            &format!("constructor `{}` field", v.name),
+                        );
                     }
                 }
             }
         }
     }
 
-    let checker = Checker { fns, ctors, types };
+    let checker = Checker {
+        fns,
+        ctors,
+        types,
+        subst: RefCell::new(HashMap::new()),
+        counter: RefCell::new(0),
+    };
 
-    // Pass 3: check each function body against its declared return type.
+    // Pass 3: check each function body against its declared return type. Each
+    // function gets a fresh unification context so leftover variables from one
+    // body cannot leak into another.
     for item in &program.items {
         if let Item::Fn(f) = item {
+            checker.subst.borrow_mut().clear();
             let mut scope: Scope = vec![HashMap::new()];
             for p in &f.params {
                 scope[0].insert(p.name.clone(), p.ty.clone());
             }
             match checker.synth(&f.body, &mut scope) {
                 Ok(t) => {
-                    if t != f.ret {
+                    if let Err(e) = checker.unify(&t, &f.ret) {
                         errors.push(format!(
-                            "function `{}`: body has type {} but return type is {}",
+                            "function `{}`: body has type {} but return type is {} ({})",
                             f.name,
-                            show(&t),
-                            show(&f.ret)
+                            show(&checker.resolve(&t)),
+                            show(&checker.resolve(&f.ret)),
+                            e
                         ));
                     }
                 }
@@ -150,9 +259,102 @@ impl Checker {
         None
     }
 
-    fn lookup_fn(&self, name: &str) -> Option<(Vec<Ty>, Ty)> {
-        builtin_sig(name).or_else(|| self.fns.get(name).cloned())
+    // ---- unification primitives -----------------------------------------
+
+    // Allocate a fresh unification variable.
+    fn fresh(&self) -> Ty {
+        let mut c = self.counter.borrow_mut();
+        let id = *c;
+        *c += 1;
+        Ty::Var(format!("?{}", id))
     }
+
+    // Instantiate a list of declared parameter names with fresh variables,
+    // returning the substitution to apply to a signature.
+    fn instantiate_map(&self, params: &[String]) -> HashMap<String, Ty> {
+        params.iter().map(|p| (p.clone(), self.fresh())).collect()
+    }
+
+    // Substitute declared parameter names (as `Ty::Var`) using `map`.
+    fn apply_map(ty: &Ty, map: &HashMap<String, Ty>) -> Ty {
+        match ty {
+            Ty::Var(n) => map.get(n).cloned().unwrap_or_else(|| ty.clone()),
+            Ty::Named(n, args) => {
+                Ty::Named(n.clone(), args.iter().map(|a| Self::apply_map(a, map)).collect())
+            }
+            other => other.clone(),
+        }
+    }
+
+    // Follow the substitution chain shallowly (one level) for a variable.
+    fn prune(&self, ty: &Ty) -> Ty {
+        if let Ty::Var(n) = ty {
+            if let Some(bound) = self.subst.borrow().get(n).cloned() {
+                return self.prune(&bound);
+            }
+        }
+        ty.clone()
+    }
+
+    // Fully resolve a type by substituting all solved variables, for display.
+    fn resolve(&self, ty: &Ty) -> Ty {
+        let t = self.prune(ty);
+        match t {
+            Ty::Named(n, args) => {
+                Ty::Named(n, args.iter().map(|a| self.resolve(a)).collect())
+            }
+            other => other,
+        }
+    }
+
+    fn occurs(&self, var: &str, ty: &Ty) -> bool {
+        match self.prune(ty) {
+            Ty::Var(n) => n == var,
+            Ty::Named(_, args) => args.iter().any(|a| self.occurs(var, a)),
+            _ => false,
+        }
+    }
+
+    // Unify two types, recording variable bindings in the substitution.
+    fn unify(&self, a: &Ty, b: &Ty) -> Result<(), String> {
+        let a = self.prune(a);
+        let b = self.prune(b);
+        match (&a, &b) {
+            (Ty::Int, Ty::Int)
+            | (Ty::Float, Ty::Float)
+            | (Ty::Bool, Ty::Bool)
+            | (Ty::Str, Ty::Str)
+            | (Ty::Unit, Ty::Unit) => Ok(()),
+            (Ty::Var(x), Ty::Var(y)) if x == y => Ok(()),
+            (Ty::Var(x), _) => {
+                if self.occurs(x, &b) {
+                    return Err(format!("infinite type: {} occurs in {}", x, show(&self.resolve(&b))));
+                }
+                self.subst.borrow_mut().insert(x.clone(), b.clone());
+                Ok(())
+            }
+            (_, Ty::Var(y)) => {
+                if self.occurs(y, &a) {
+                    return Err(format!("infinite type: {} occurs in {}", y, show(&self.resolve(&a))));
+                }
+                self.subst.borrow_mut().insert(y.clone(), a.clone());
+                Ok(())
+            }
+            (Ty::Named(n1, a1), Ty::Named(n2, a2)) if n1 == n2 && a1.len() == a2.len() => {
+                for (x, y) in a1.iter().zip(a2.iter()) {
+                    self.unify(x, y)?;
+                }
+                Ok(())
+            }
+            _ => Err(format!(
+                "expected {}, found {}",
+                show(&self.resolve(&a)),
+                show(&self.resolve(&b))
+            )),
+        }
+    }
+
+    // ---- synthesis -------------------------------------------------------
 
     fn synth(&self, e: &Expr, scope: &mut Scope) -> Result<Ty, String> {
         match e {
@@ -166,38 +368,45 @@ impl Checker {
                 .ok_or_else(|| format!("unbound variable `{}`", name)),
 
             Expr::Ctor(name, args) => {
-                let (fields, tyname) = self
+                let sig = self
                     .ctors
                     .get(name)
                     .cloned()
                     .ok_or_else(|| format!("unknown constructor `{}`", name))?;
-                if args.len() != fields.len() {
+                if args.len() != sig.fields.len() {
                     return Err(format!(
                         "constructor `{}` expects {} field(s), got {}",
                         name,
-                        fields.len(),
+                        sig.fields.len(),
                         args.len()
                     ));
                 }
-                for (i, (arg, ft)) in args.iter().zip(fields.iter()).enumerate() {
+                // Instantiate the owning type's parameters with fresh variables.
+                let map = self.instantiate_map(&sig.type_params);
+                for (i, (arg, ft)) in args.iter().zip(sig.fields.iter()).enumerate() {
                     let at = self.synth(arg, scope)?;
-                    if at != *ft {
-                        return Err(format!(
-                            "constructor `{}` field {} expects {}, got {}",
-                            name,
-                            i,
-                            show(ft),
-                            show(&at)
-                        ));
-                    }
+                    let expected = Self::apply_map(ft, &map);
+                    self.unify(&expected, &at).map_err(|e| {
+                        format!("constructor `{}` field {}: {}", name, i, e)
+                    })?;
                 }
-                Ok(Ty::Named(tyname))
+                let type_args: Vec<Ty> = sig
+                    .type_params
+                    .iter()
+                    .map(|p| map.get(p).cloned().unwrap())
+                    .collect();
+                Ok(Ty::Named(sig.tyname.clone(), type_args))
             }
 
             Expr::Call(name, args) => {
-                let (params, ret) = self
-                    .lookup_fn(name)
-                    .ok_or_else(|| format!("unknown function `{}`", name))?;
+                let (params, ret, type_params) =
+                    if let Some((p, r)) = builtin_sig(name) {
+                        (p, r, Vec::new())
+                    } else if let Some(sig) = self.fns.get(name).cloned() {
+                        (sig.params, sig.ret, sig.type_params)
+                    } else {
+                        return Err(format!("unknown function `{}`", name));
+                    };
                 if args.len() != params.len() {
                     return Err(format!(
                         "function `{}` expects {} argument(s), got {}",
@@ -206,52 +415,48 @@ impl Checker {
                         args.len()
                     ));
                 }
+                // Instantiate the function's generic parameters with fresh vars.
+                let map = self.instantiate_map(&type_params);
                 for (i, (arg, pt)) in args.iter().zip(params.iter()).enumerate() {
                     let at = self.synth(arg, scope)?;
-                    if at != *pt {
-                        return Err(format!(
-                            "function `{}` argument {} expects {}, got {}",
-                            name,
-                            i,
-                            show(pt),
-                            show(&at)
-                        ));
-                    }
+                    let expected = Self::apply_map(pt, &map);
+                    self.unify(&expected, &at).map_err(|e| {
+                        format!("function `{}` argument {}: {}", name, i, e)
+                    })?;
                 }
-                Ok(ret)
+                Ok(Self::apply_map(&ret, &map))
             }
 
             Expr::Unary(op, inner) => {
-                let t = self.synth(inner, scope)?;
+                let t = self.prune(&self.synth(inner, scope)?);
                 match (op, &t) {
                     (UnOp::Neg, Ty::Int) => Ok(Ty::Int),
                     (UnOp::Neg, Ty::Float) => Ok(Ty::Float),
                     (UnOp::Not, Ty::Bool) => Ok(Ty::Bool),
-                    _ => Err(format!("cannot apply {:?} to {}", op, show(&t))),
+                    _ => Err(format!("cannot apply {:?} to {}", op, show(&self.resolve(&t)))),
                 }
             }
 
             Expr::Binary(op, lhs, rhs) => {
                 let lt = self.synth(lhs, scope)?;
                 let rt = self.synth(rhs, scope)?;
-                synth_binary(*op, &lt, &rt)
+                self.synth_binary(*op, &lt, &rt)
             }
 
             Expr::If(cond, then, els) => {
                 let ct = self.synth(cond, scope)?;
-                if ct != Ty::Bool {
-                    return Err(format!("`if` condition must be Bool, got {}", show(&ct)));
-                }
+                self.unify(&Ty::Bool, &ct)
+                    .map_err(|_| format!("`if` condition must be Bool, got {}", show(&self.resolve(&ct))))?;
                 let tt = self.synth(then, scope)?;
                 let et = self.synth(els, scope)?;
-                if tt != et {
-                    return Err(format!(
+                self.unify(&tt, &et).map_err(|_| {
+                    format!(
                         "`if` branches have differing types: {} vs {}",
-                        show(&tt),
-                        show(&et)
-                    ));
-                }
-                Ok(tt)
+                        show(&self.resolve(&tt)),
+                        show(&self.resolve(&et))
+                    )
+                })?;
+                Ok(self.resolve(&tt))
             }
 
             Expr::Match(scrut, arms) => self.synth_match(scrut, arms, scope),
@@ -264,14 +469,14 @@ impl Checker {
                             Stmt::Let(name, ann, value) => {
                                 let vt = self.synth(value, scope)?;
                                 let bound = if let Some(a) = ann {
-                                    if *a != vt {
-                                        return Err(format!(
+                                    self.unify(a, &vt).map_err(|_| {
+                                        format!(
                                             "let `{}`: annotated {} but value is {}",
                                             name,
-                                            show(a),
-                                            show(&vt)
-                                        ));
-                                    }
+                                            show(&self.resolve(a)),
+                                            show(&self.resolve(&vt))
+                                        )
+                                    })?;
                                     a.clone()
                                 } else {
                                     vt
@@ -316,22 +521,22 @@ impl Checker {
             match &result {
                 None => result = Some(bt),
                 Some(rt) => {
-                    if *rt != bt {
-                        return Err(format!(
+                    self.unify(rt, &bt).map_err(|_| {
+                        format!(
                             "match arms have differing types: {} vs {}",
-                            show(rt),
-                            show(&bt)
-                        ));
-                    }
+                            show(&self.resolve(rt)),
+                            show(&self.resolve(&bt))
+                        )
+                    })?;
                 }
             }
         }
 
-        // Exhaustiveness.
+        // Exhaustiveness. Keys on constructor names, so generics are unaffected.
         if !saw_wild {
-            match &s {
-                Ty::Named(tn) => {
-                    if let Some(variants) = self.types.get(tn) {
+            match self.prune(&s) {
+                Ty::Named(tn, _) => {
+                    if let Some((_, variants)) = self.types.get(&tn) {
                         let missing: Vec<String> = variants
                             .iter()
                             .filter(|v| !covered_ctors.contains(v))
@@ -354,13 +559,15 @@ impl Checker {
                 other => {
                     return Err(format!(
                         "non-exhaustive match on {}: add a wildcard `_` arm",
-                        show(other)
+                        show(&self.resolve(&other))
                     ));
                 }
             }
         }
 
-        result.ok_or_else(|| "match needs at least one arm".to_string())
+        result
+            .map(|t| self.resolve(&t))
+            .ok_or_else(|| "match needs at least one arm".to_string())
     }
 
     fn check_pattern(
@@ -375,93 +582,94 @@ impl Checker {
                 binds.insert(n.clone(), expected.clone());
                 Ok(())
             }
-            Pattern::Int(_) => {
-                if *expected == Ty::Int {
-                    Ok(())
-                } else {
-                    Err(format!("integer pattern matched against {}", show(expected)))
-                }
-            }
-            Pattern::Bool(_) => {
-                if *expected == Ty::Bool {
-                    Ok(())
-                } else {
-                    Err(format!("boolean pattern matched against {}", show(expected)))
-                }
-            }
+            Pattern::Int(_) => self
+                .unify(&Ty::Int, expected)
+                .map_err(|_| format!("integer pattern matched against {}", show(&self.resolve(expected)))),
+            Pattern::Bool(_) => self
+                .unify(&Ty::Bool, expected)
+                .map_err(|_| format!("boolean pattern matched against {}", show(&self.resolve(expected)))),
             Pattern::Ctor(name, subs) => {
-                let (fields, tyname) = self
+                let sig = self
                     .ctors
                     .get(name)
                     .cloned()
                     .ok_or_else(|| format!("unknown constructor `{}`", name))?;
-                match expected {
-                    Ty::Named(n) if *n == tyname => {}
-                    _ => {
-                        return Err(format!(
-                            "constructor pattern `{}` (of type {}) matched against {}",
-                            name,
-                            tyname,
-                            show(expected)
-                        ))
-                    }
-                }
-                if subs.len() != fields.len() {
+                // Instantiate the owning type's params, then unify the scrutinee
+                // type with `Name[fresh...]` so field patterns get refined types.
+                let map = self.instantiate_map(&sig.type_params);
+                let type_args: Vec<Ty> = sig
+                    .type_params
+                    .iter()
+                    .map(|p| map.get(p).cloned().unwrap())
+                    .collect();
+                let owner = Ty::Named(sig.tyname.clone(), type_args);
+                self.unify(&owner, expected).map_err(|_| {
+                    format!(
+                        "constructor pattern `{}` (of type {}) matched against {}",
+                        name,
+                        sig.tyname,
+                        show(&self.resolve(expected))
+                    )
+                })?;
+                if subs.len() != sig.fields.len() {
                     return Err(format!(
                         "constructor pattern `{}` expects {} field(s), got {}",
                         name,
-                        fields.len(),
+                        sig.fields.len(),
                         subs.len()
                     ));
                 }
-                for (sp, ft) in subs.iter().zip(fields.iter()) {
-                    self.check_pattern(sp, ft, binds)?;
+                for (sp, ft) in subs.iter().zip(sig.fields.iter()) {
+                    let fty = Self::apply_map(ft, &map);
+                    self.check_pattern(sp, &fty, binds)?;
                 }
                 Ok(())
             }
         }
     }
-}
 
-fn synth_binary(op: BinOp, lt: &Ty, rt: &Ty) -> Result<Ty, String> {
-    use BinOp::*;
-    let both = |t: &Ty| lt == t && rt == t;
-    match op {
-        And | Or => {
-            if both(&Ty::Bool) {
-                Ok(Ty::Bool)
-            } else {
-                Err(format!("`{:?}` needs Bool operands, got {} and {}", op, show(lt), show(rt)))
+    fn synth_binary(&self, op: BinOp, lt: &Ty, rt: &Ty) -> Result<Ty, String> {
+        use BinOp::*;
+        let lt = self.prune(lt);
+        let rt = self.prune(rt);
+        let both = |t: &Ty| lt == *t && rt == *t;
+        match op {
+            And | Or => {
+                if both(&Ty::Bool) {
+                    Ok(Ty::Bool)
+                } else {
+                    Err(format!("`{:?}` needs Bool operands, got {} and {}", op, show(&self.resolve(&lt)), show(&self.resolve(&rt))))
+                }
             }
-        }
-        Eq | Ne => {
-            if lt == rt {
-                Ok(Ty::Bool)
-            } else {
-                Err(format!("cannot compare {} and {}", show(lt), show(rt)))
+            Eq | Ne => {
+                if self.unify(&lt, &rt).is_ok() {
+                    Ok(Ty::Bool)
+                } else {
+                    Err(format!("cannot compare {} and {}", show(&self.resolve(&lt)), show(&self.resolve(&rt))))
+                }
             }
-        }
-        Lt | Le | Gt | Ge => {
-            if both(&Ty::Int) || both(&Ty::Float) {
-                Ok(Ty::Bool)
-            } else {
-                Err(format!("`{:?}` needs two Ints or two Floats, got {} and {}", op, show(lt), show(rt)))
+            Lt | Le | Gt | Ge => {
+                if both(&Ty::Int) || both(&Ty::Float) {
+                    Ok(Ty::Bool)
+                } else {
+                    Err(format!("`{:?}` needs two Ints or two Floats, got {} and {}", op, show(&self.resolve(&lt)), show(&self.resolve(&rt))))
+                }
             }
-        }
-        Mod => {
-            if both(&Ty::Int) {
-                Ok(Ty::Int)
-            } else {
-                Err(format!("`%` needs Int operands, got {} and {}", show(lt), show(rt)))
+            Mod => {
+                if both(&Ty::Int) {
+                    Ok(Ty::Int)
+                } else {
+                    Err(format!("`%` needs Int operands, got {} and {}", show(&self.resolve(&lt)), show(&self.resolve(&rt))))
+                }
             }
-        }
-        Add | Sub | Mul | Div => {
-            if both(&Ty::Int) {
-                Ok(Ty::Int)
-            } else if both(&Ty::Float) {
-                Ok(Ty::Float)
-            } else {
-                Err(format!("`{:?}` needs two Ints or two Floats, got {} and {}", op, show(lt), show(rt)))
+            Add | Sub | Mul | Div => {
+                if both(&Ty::Int) {
+                    Ok(Ty::Int)
+                } else if both(&Ty::Float) {
+                    Ok(Ty::Float)
+                } else {
+                    Err(format!("`{:?}` needs two Ints or two Floats, got {} and {}", op, show(&self.resolve(&lt)), show(&self.resolve(&rt))))
+                }
             }
         }
     }
@@ -538,5 +746,68 @@ mod tests {
         let src = "fn f() -> Int = 1 + true";
         let errs = check_src(src).unwrap_err();
         assert!(!errs.is_empty());
+    }
+
+    // ---- generics --------------------------------------------------------
+
+    #[test]
+    fn generic_adt_instantiates() {
+        // A generic List instantiated at Int should check, and main returns Int.
+        let src = r#"
+            type List[T] = | Nil | Cons(T, List[T])
+            fn main() -> Int = { let xs = Cons(1, Cons(2, Nil)); 0 }
+        "#;
+        assert!(check_src(src).is_ok());
+    }
+
+    #[test]
+    fn generic_type_argument_mismatch_caught() {
+        // Cons(1, ...) fixes T = Int, so Cons(true, Nil) must be rejected.
+        let src = r#"
+            type List[T] = | Nil | Cons(T, List[T])
+            fn main() -> Int = { let xs = Cons(1, Cons(true, Nil)); 0 }
+        "#;
+        let errs = check_src(src).unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains("expected") && e.contains("found")),
+            "got: {:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn generic_function_checks() {
+        let src = r#"
+            type Option[T] = | None | Some(T)
+            fn is_some[T](o: Option[T]) -> Bool =
+              match o { None => false, Some(_) => true, }
+            fn main() -> Bool = is_some(Some(5))
+        "#;
+        assert!(check_src(src).is_ok());
+    }
+
+    #[test]
+    fn exhaustiveness_fires_on_generic_type() {
+        let src = r#"
+            type Option[T] = | None | Some(T)
+            fn unwrap_or(o: Option[Int]) -> Int = match o { Some(x) => x, }
+        "#;
+        let errs = check_src(src).unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains("non-exhaustive") && e.contains("None")),
+            "got: {:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn generic_return_type_inferred() {
+        // A generic function returning Option[T] used at Int.
+        let src = r#"
+            type Option[T] = | None | Some(T)
+            fn wrap[T](x: T) -> Option[T] = Some(x)
+            fn main() -> Int = { let o = wrap(7); 0 }
+        "#;
+        assert!(check_src(src).is_ok());
     }
 }

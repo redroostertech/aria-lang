@@ -2,17 +2,17 @@
 -- Shows why exhaustive pattern matching makes generated code reliable:
 -- every case is named and the compiler can check none are missing.
 
-type List =
+type List[T] =
   | Nil
-  | Cons(Int, List)
+  | Cons(T, List[T])
 
-fn sum(xs: List) -> Int =
+fn sum(xs: List[Int]) -> Int =
   match xs {
     Nil          => 0,
     Cons(h, rest) => h + sum(rest),
   }
 
-fn length(xs: List) -> Int =
+fn length[T](xs: List[T]) -> Int =
   match xs {
     Nil          => 0,
     Cons(_, rest) => 1 + length(rest),

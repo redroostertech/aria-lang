@@ -1,0 +1,43 @@
+-- Parametric polymorphism (generics) in Aria.
+-- Type arguments are inferred via Hindley-Milner unification: the constructor
+-- uses below never spell out `[Int]`, yet the checker infers `Option[Int]` and
+-- `List[Int]` from the values flowing in.
+
+type Option[T] =
+  | None
+  | Some(T)
+
+type List[T] =
+  | Nil
+  | Cons(T, List[T])
+
+-- A generic function: works for any element type `T`.
+fn is_some[T](o: Option[T]) -> Bool =
+  match o {
+    None    => false,
+    Some(_) => true,
+  }
+
+-- Exhaustive match on a generic type, specialized to Int here.
+fn or_else(o: Option[Int], default: Int) -> Int =
+  match o {
+    None    => default,
+    Some(x) => x,
+  }
+
+fn sum(xs: List[Int]) -> Int =
+  match xs {
+    Nil           => 0,
+    Cons(h, rest) => h + sum(rest),
+  }
+
+fn main() -> Int = {
+  -- `Some(7)` infers Option[Int]; `Cons(1, ...)` infers List[Int].
+  let maybe = Some(7);
+  let xs = Cons(1, Cons(2, Cons(3, Nil)));
+  print_bool(is_some(maybe));
+  print_int(or_else(maybe, 0));
+  print_int(or_else(None, 99));
+  print_str(concat("sum = ", int_to_str(sum(xs))));
+  sum(xs)
+}
