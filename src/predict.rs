@@ -49,6 +49,11 @@ const NUM_MODELS: usize = 3;
 struct Logistic {
     // stretch[p] for p in 0..4096, clamped logit scaled by 256.
     stretch: Vec<i32>,
+    // squash[x + 2047] for x in -2047..=2047: the 12-bit logistic of a scaled
+    // logit. A precomputed table (NOT live f64) so the predict path is fully
+    // integer and bit-identical across platforms/libm — required so a stream
+    // compressed on one machine decompresses losslessly on another.
+    squash: Vec<u16>,
 }
 
 impl Logistic {
@@ -62,7 +67,17 @@ impl Logistic {
             let v = (logit * 256.0).round() as i32;
             *slot = v.clamp(-2047, 2047);
         }
-        Logistic { stretch }
+        // Precompute the squash table over the clamped logit domain so the
+        // runtime path performs no f64 arithmetic.
+        let mut squash = vec![0u16; 4095];
+        for (idx, slot) in squash.iter_mut().enumerate() {
+            let x = idx as i32 - 2047;
+            let xf = x as f64 / 256.0;
+            let p = 1.0 / (1.0 + (-xf).exp());
+            let pi = (p * PROB_ONE as f64).round() as i32;
+            *slot = pi.clamp(PROB_MIN as i32, PROB_MAX as i32) as u16;
+        }
+        Logistic { stretch, squash }
     }
 
     #[inline]
@@ -70,15 +85,13 @@ impl Logistic {
         self.stretch[p as usize]
     }
 
-    /// Inverse of `stretch`: map a scaled logit back to a 12-bit probability.
-    /// Computed directly (no table) but still deterministic.
+    /// Inverse of `stretch`: map a scaled logit back to a 12-bit probability via
+    /// a precomputed integer table (no runtime float), for cross-platform
+    /// determinism. `x` is clamped to the table's [-2047, 2047] domain.
     #[inline]
     fn squash(&self, x: i32) -> u16 {
         let x = x.clamp(-2047, 2047);
-        let xf = x as f64 / 256.0;
-        let p = 1.0 / (1.0 + (-xf).exp());
-        let pi = (p * PROB_ONE as f64).round() as i32;
-        pi.clamp(PROB_MIN as i32, PROB_MAX as i32) as u16
+        self.squash[(x + 2047) as usize]
     }
 }
 
@@ -200,7 +213,9 @@ impl Predictor {
         const LR_SHIFT: i32 = 10;
         for m in 0..NUM_MODELS {
             let dw = (self.st[m] * err) >> LR_SHIFT;
-            self.weights[m] += dw >> 6;
+            // Clamp (PAQ-style) so the accumulator can never overflow i32 on a
+            // long adversarial stream, and stays numerically stable.
+            self.weights[m] = (self.weights[m] + (dw >> 6)).clamp(-(1 << 20), 1 << 20);
         }
 
         // --- Train each context counter toward the observed bit. ---

@@ -45,7 +45,10 @@ impl ArithEncoder {
     /// Encode one bit. `prob_one` is the 12-bit probability that `bit == 1`,
     /// constrained to `1..=4095`. `bit` must be 0 or 1.
     pub fn encode_bit(&mut self, prob_one: u16, bit: u8) {
-        debug_assert!(prob_one >= 1 && prob_one <= (PROB_SCALE as u16 - 1));
+        // Always-on clamp (not just debug): an out-of-range probability from an
+        // external model would otherwise spin the renormalize loop forever
+        // (prob_one==0) or underflow `range` (prob_one>=4096) in release builds.
+        let prob_one = prob_one.clamp(1, PROB_SCALE as u16 - 1);
         debug_assert!(bit <= 1);
 
         // `r1` is the sub-range assigned to bit==1; it sits at the bottom of
@@ -143,7 +146,8 @@ impl<'a> ArithDecoder<'a> {
 
     /// Decode one bit using the same `prob_one` the encoder used at this step.
     pub fn decode_bit(&mut self, prob_one: u16) -> u8 {
-        debug_assert!(prob_one >= 1 && prob_one <= (PROB_SCALE as u16 - 1));
+        // Must clamp identically to encode_bit to stay in lockstep.
+        let prob_one = prob_one.clamp(1, PROB_SCALE as u16 - 1);
 
         let r1 = ((self.range as u64 * prob_one as u64) >> PROB_BITS) as u32;
         let bit;
@@ -233,18 +237,22 @@ pub fn compress_adaptive(data: &[u8]) -> Vec<u8> {
 
 /// Decompress a blob produced by `compress_adaptive`. The original length is
 /// read from the header (`out_len` is ignored; pass 0 if unknown). Lossless.
-pub fn decompress_adaptive(blob: &[u8], _out_len: usize) -> Vec<u8> {
-    assert!(blob.len() >= 12 && &blob[0..4] == MAGIC, "not an ARB1 stream");
+pub fn decompress_adaptive(blob: &[u8], _out_len: usize) -> Result<Vec<u8>, String> {
+    if blob.len() < 12 || &blob[0..4] != MAGIC {
+        return Err("not an ARB1 stream".into());
+    }
     let mut len_bytes = [0u8; 8];
     len_bytes.copy_from_slice(&blob[4..12]);
     let orig_len = u64::from_le_bytes(len_bytes) as usize;
     if orig_len == 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let mut model = BitModel::new();
     let mut dec = ArithDecoder::new(&blob[12..]);
-    let mut out = Vec::with_capacity(orig_len);
+    // Cap the up-front allocation so a crafted length header can't request an
+    // aborting allocation; the loop still produces exactly orig_len bytes.
+    let mut out = Vec::with_capacity(orig_len.min(1 << 20));
     for _ in 0..orig_len {
         let mut ctx = 1usize;
         let mut byte = 0u8;
@@ -258,7 +266,7 @@ pub fn decompress_adaptive(blob: &[u8], _out_len: usize) -> Vec<u8> {
         }
         out.push(byte);
     }
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -267,7 +275,7 @@ mod tests {
 
     fn round_trip(data: &[u8]) {
         let blob = compress_adaptive(data);
-        let back = decompress_adaptive(&blob, data.len());
+        let back = decompress_adaptive(&blob, data.len()).expect("decompress");
         assert_eq!(back, data, "round-trip mismatch (len {})", data.len());
     }
 
@@ -339,7 +347,7 @@ mod tests {
             blob.len()
         );
         // And it must still decode exactly.
-        let back = decompress_adaptive(&blob, data.len());
+        let back = decompress_adaptive(&blob, data.len()).expect("decompress");
         assert_eq!(back, data);
     }
 }

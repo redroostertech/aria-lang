@@ -138,11 +138,14 @@ pub fn quantize(x: &Tensor) -> QuantTensor {
     QuantTensor { shape: vec![m, n], data, scale }
 }
 
-/// INT8 matmul: (m,k) x (k,n) -> (m,n), accumulating in i32 then scaling to f32.
+/// INT8 matmul: (m,k) x (k,n) -> (m,n).
 ///
-/// `a` is quantized per-row (the natural layout). `b` is also `QuantTensor`, so
-/// its per-row scale corresponds to the *k* axis of the product; the i32 dot
-/// over the shared dimension is scaled by `a.scale[i] * b.scale[p]` per term.
+/// Each i8*i8 product is exact, but because `b` carries a *per-row* scale
+/// `b.scale[p]` that varies along the contraction axis `k`, the term scale
+/// `a.scale[i] * b.scale[p]` differs for every `p`. The reduction over `k`
+/// therefore accumulates in f32 (one scaled add per term), not in a single i32
+/// accumulator. To get a true rounded-once i32 dot product, `b` would need a
+/// single per-tensor (or per-column) scale; that is a deliberate future change.
 pub fn qmatmul(a: &QuantTensor, b: &QuantTensor) -> Tensor {
     let (m, k) = (a.rows(), a.cols());
     let (k2, n) = (b.rows(), b.cols());
@@ -160,9 +163,11 @@ pub fn qmatmul(a: &QuantTensor, b: &QuantTensor) -> Tensor {
             let row = &b.data[p * n..p * n + n];
             let dst = &mut out[i * n..i * n + n];
             for j in 0..n {
-                // i32 product accumulated as f32 after applying the per-term scale.
-                let acc = av * row[j] as i32;
-                dst[j] += acc as f32 * term_scale;
+                // Exact i8*i8 product, scaled by this term's scale and summed
+                // into the f32 accumulator (the scale varies along k, so the
+                // reduction is necessarily in f32 — see the function doc).
+                let prod = av * row[j] as i32;
+                dst[j] += prod as f32 * term_scale;
             }
         }
     }

@@ -91,6 +91,14 @@ pub fn decompress_columns(blob: &[u8]) -> Result<Vec<Vec<i64>>, String> {
         }
         let transformed = rans::decompress(&blob[p..p + len])?;
         p += len;
+        // `rows` is attacker-controlled; guard the multiply and verify the
+        // decompressed payload is large enough before decode_column indexes it.
+        let need = rows
+            .checked_mul(8)
+            .ok_or("columnar row count overflows")?;
+        if transformed.len() < need {
+            return Err("column shorter than declared row count".into());
+        }
         cols.push(decode_column(&transformed, rows));
     }
     Ok(cols)

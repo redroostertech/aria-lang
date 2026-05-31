@@ -9,6 +9,10 @@ use crate::lexer::{Tok, Token};
 pub struct Parser {
     toks: Vec<Token>,
     pos: usize,
+    /// Generic type parameters of the function currently being parsed, so that
+    /// type annotations inside its body (e.g. `let y: T = ...`) resolve `T` to a
+    /// type variable rather than a bogus nullary named type.
+    type_params: Vec<String>,
 }
 
 fn is_upper(name: &str) -> bool {
@@ -17,7 +21,7 @@ fn is_upper(name: &str) -> bool {
 
 impl Parser {
     pub fn new(toks: Vec<Token>) -> Self {
-        Parser { toks, pos: 0 }
+        Parser { toks, pos: 0, type_params: Vec::new() }
     }
 
     fn peek(&self) -> &Tok {
@@ -105,7 +109,10 @@ impl Parser {
         self.expect(&Tok::Arrow)?;
         let ret = self.parse_type(&type_params)?;
         self.expect(&Tok::Eq)?;
+        // Make the generics visible to annotations inside the body, then clear.
+        self.type_params = type_params.clone();
         let body = self.parse_expr(0)?;
+        self.type_params = Vec::new();
         Ok(FnDecl {
             name,
             type_params,
@@ -434,7 +441,8 @@ impl Parser {
                 let mut ann = None;
                 if *self.peek() == Tok::Colon {
                     self.advance();
-                    ann = Some(self.parse_type(&[])?);
+                    let tps = self.type_params.clone();
+                    ann = Some(self.parse_type(&tps)?);
                 }
                 self.expect(&Tok::Eq)?;
                 let value = self.parse_expr(0)?;

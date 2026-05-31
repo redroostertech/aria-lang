@@ -132,7 +132,16 @@ fn run_source(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match interp.run_main() {
+    // Run on a large-stack thread: the tree-walking interpreter uses native
+    // stack per Aria call, so deep (but finite) recursion won't overflow; the
+    // interpreter's own depth guard catches genuinely infinite recursion.
+    let result = std::thread::Builder::new()
+        .stack_size(1 << 30) // 1 GiB
+        .spawn(move || interp.run_main())
+        .expect("spawn interpreter thread")
+        .join()
+        .unwrap_or_else(|_| Err("interpreter thread panicked".into()));
+    match result {
         Ok(interp::Value::Int(n)) => ExitCode::from((n & 0xff) as u8),
         Ok(_) => ExitCode::SUCCESS,
         Err(e) => {

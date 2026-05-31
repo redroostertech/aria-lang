@@ -53,7 +53,15 @@ pub struct Interp {
     fns: HashMap<String, FnDecl>,
     /// constructor name -> arity
     ctors: HashMap<String, usize>,
+    /// Current Aria call-stack depth, to turn runaway recursion into a
+    /// catchable error instead of a native stack overflow.
+    depth: std::cell::Cell<usize>,
 }
+
+/// Maximum Aria function-call nesting. The interpreter runs on a large-stack
+/// thread (see main.rs), so this is generous; it exists to catch genuinely
+/// non-terminating recursion as an error rather than crashing the process.
+const MAX_CALL_DEPTH: usize = 100_000;
 
 impl Interp {
     pub fn new(program: &Program) -> Result<Self, String> {
@@ -75,7 +83,7 @@ impl Interp {
                 }
             }
         }
-        Ok(Interp { fns, ctors })
+        Ok(Interp { fns, ctors, depth: std::cell::Cell::new(0) })
     }
 
     pub fn run_main(&self) -> Result<Value, String> {
@@ -163,13 +171,25 @@ impl Interp {
                     frame.insert(p.name.clone(), v);
                 }
                 let mut call_scope: Scope = vec![frame];
-                self.eval(&f.body, &mut call_scope)
+                let d = self.depth.get() + 1;
+                if d > MAX_CALL_DEPTH {
+                    return Err(format!(
+                        "maximum recursion depth ({}) exceeded calling `{}`",
+                        MAX_CALL_DEPTH, name
+                    ));
+                }
+                self.depth.set(d);
+                let result = self.eval(&f.body, &mut call_scope);
+                self.depth.set(d - 1);
+                result
             }
 
             Expr::Unary(op, inner) => {
                 let v = self.eval(inner, scope)?;
                 match (op, v) {
-                    (UnOp::Neg, Value::Int(n)) => Ok(Value::Int(-n)),
+                    (UnOp::Neg, Value::Int(n)) => Ok(Value::Int(
+                        n.checked_neg().ok_or("integer overflow in unary `-`")?,
+                    )),
                     (UnOp::Neg, Value::Float(f)) => Ok(Value::Float(-f)),
                     (UnOp::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
                     (op, v) => Err(format!("cannot apply {:?} to {}", op, v.display())),
@@ -277,9 +297,11 @@ impl Interp {
 
 fn int_op(op: BinOp, a: i64, b: i64) -> Result<Value, String> {
     Ok(match op {
-        BinOp::Add => Value::Int(a + b),
-        BinOp::Sub => Value::Int(a - b),
-        BinOp::Mul => Value::Int(a * b),
+        // Checked arithmetic: overflow is a catchable runtime error, not a
+        // debug-build panic / release-build silent wrap.
+        BinOp::Add => Value::Int(a.checked_add(b).ok_or("integer overflow in `+`")?),
+        BinOp::Sub => Value::Int(a.checked_sub(b).ok_or("integer overflow in `-`")?),
+        BinOp::Mul => Value::Int(a.checked_mul(b).ok_or("integer overflow in `*`")?),
         BinOp::Div => {
             if b == 0 {
                 return Err("division by zero".into());
@@ -411,6 +433,19 @@ fn builtin(name: &str, args: &[Value]) -> Result<Option<Value>, String> {
             [Value::Int(r), Value::Int(c)] => {
                 if *r < 0 || *c < 0 {
                     return Err("tensor_zeros expects non-negative dimensions".into());
+                }
+                // Guard the element-count multiply against usize overflow and
+                // cap it so a runtime value can't request a process-aborting
+                // allocation (the type checker cannot bound these).
+                const MAX_TENSOR_ELEMS: usize = 64 * 1024 * 1024; // 256 MiB of f32
+                let n = (*r as usize)
+                    .checked_mul(*c as usize)
+                    .ok_or("tensor_zeros dimensions overflow")?;
+                if n > MAX_TENSOR_ELEMS {
+                    return Err(format!(
+                        "tensor_zeros: {}x{} exceeds the {}-element limit",
+                        r, c, MAX_TENSOR_ELEMS
+                    ));
                 }
                 let t = crate::tensor::Tensor::zeros(&[*r as usize, *c as usize]);
                 Ok(Some(Value::Tensor(t)))

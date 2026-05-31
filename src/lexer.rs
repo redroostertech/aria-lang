@@ -184,6 +184,13 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                     i += 1;
                 }
             }
+            // Reject a letter/underscore/dot glued to the number (e.g. `1e10`,
+            // `0x1F`, `1_000`, `1.`) instead of silently splitting into two
+            // tokens. Exponents/hex/separators are not part of the grammar.
+            if i < n && (chars[i].is_alphabetic() || chars[i] == '_' || chars[i] == '.') {
+                let bad: String = chars[start..=i].iter().collect();
+                return Err(format!("line {}: malformed number literal `{}`", line, bad));
+            }
             let text: String = chars[start..i].iter().collect();
             if is_float {
                 let f: f64 = text
@@ -199,10 +206,12 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             continue;
         }
 
-        // Identifier or keyword.
-        if c.is_alphabetic() || c == '_' {
+        // Identifier or keyword. Restricted to ASCII so the case-based rule
+        // (Uppercase = constructor/type, lowercase = value/function) is always
+        // well-defined; caseless scripts would otherwise be silently mis-classed.
+        if c.is_ascii_alphabetic() || c == '_' {
             let start = i;
-            while i < n && (chars[i].is_alphanumeric() || chars[i] == '_') {
+            while i < n && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
                 i += 1;
             }
             let word: String = chars[start..i].iter().collect();

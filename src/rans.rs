@@ -64,6 +64,15 @@ pub fn decompress(blob: &[u8]) -> Result<Vec<u8>, String> {
         freqs[i] = u16::from_le_bytes([blob[off], blob[off + 1]]) as u32;
     }
 
+    // The frequencies come from an untrusted blob. They MUST sum to exactly M
+    // (which also bounds every entry to <= M). Without this check a corrupt
+    // table would index past the slot2sym table and panic, or under-fill it and
+    // decode silently-wrong bytes. `sum == M` makes decompress total.
+    let sum: u64 = freqs.iter().map(|&f| f as u64).sum();
+    if sum != M as u64 {
+        return Err("invalid frequency table".into());
+    }
+
     let cum = build_cum(&freqs);
     let slot2sym = build_slot2sym(&freqs, &cum);
     let stream = &blob[table_end..];
@@ -249,4 +258,20 @@ mod tests {
         let data: Vec<u8> = (0..=255u8).cycle().take(10000).collect();
         roundtrip(&data);
     }
+
+    #[test]
+    fn corrupt_freq_table_errs_not_panics() {
+        // A blob whose frequency table does not sum to M must return Err, not
+        // panic with an out-of-bounds write in build_slot2sym.
+        let mut blob = Vec::new();
+        blob.extend_from_slice(MAGIC);
+        blob.extend_from_slice(&1u64.to_le_bytes()); // orig_len = 1
+        let mut table = vec![0u8; 512]; // 256 * u16
+        table[0..2].copy_from_slice(&4096u16.to_le_bytes());
+        table[2..4].copy_from_slice(&4096u16.to_le_bytes()); // sum 8192 != M
+        blob.extend_from_slice(&table);
+        blob.extend_from_slice(&[0, 0, 0, 0]);
+        assert!(decompress(&blob).is_err());
+    }
 }
+

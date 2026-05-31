@@ -45,6 +45,13 @@ pub fn show(t: &Ty) -> String {
 
 type Scope = Vec<HashMap<String, Ty>>;
 
+/// A type variable is a solvable unification variable iff its name starts with
+/// `?` (produced by `fresh`). Declared generic parameters keep their source
+/// name (e.g. `T`) and are therefore rigid — `unify` never binds them.
+fn is_fresh(name: &str) -> bool {
+    name.starts_with('?')
+}
+
 // A constructor's declared signature, retaining the owning type's generic
 // parameters so each use can be instantiated with fresh variables.
 #[derive(Clone)]
@@ -358,14 +365,19 @@ impl Checker {
             | (Ty::Str, Ty::Str)
             | (Ty::Unit, Ty::Unit) => Ok(()),
             (Ty::Var(x), Ty::Var(y)) if x == y => Ok(()),
-            (Ty::Var(x), _) => {
+            // Only FRESH unification variables (`?N`) may be bound. A declared
+            // generic parameter (e.g. `T`) is rigid/skolem: it unifies only with
+            // itself (the equal-name case above) or with a fresh variable. This
+            // keeps parametricity sound — a function body cannot silently
+            // constrain its own type parameter to a concrete type.
+            (Ty::Var(x), _) if is_fresh(x) => {
                 if self.occurs(x, &b) {
                     return Err(format!("infinite type: {} occurs in {}", x, show(&self.resolve(&b))));
                 }
                 self.subst.borrow_mut().insert(x.clone(), b.clone());
                 Ok(())
             }
-            (_, Ty::Var(y)) => {
+            (_, Ty::Var(y)) if is_fresh(y) => {
                 if self.occurs(y, &a) {
                     return Err(format!("infinite type: {} occurs in {}", y, show(&self.resolve(&a))));
                 }
@@ -778,6 +790,22 @@ mod tests {
         let src = "fn f() -> Int = 1 + true";
         let errs = check_src(src).unwrap_err();
         assert!(!errs.is_empty());
+    }
+
+    #[test]
+    fn generic_param_is_rigid() {
+        // A body that constrains its own type parameter to a concrete type must
+        // be rejected at definition time (parametricity / soundness). Without
+        // rigid type params this type-checked, then crashed at runtime.
+        let src = "fn bad[T](x: T) -> Int = { let y = x == 5; x + 1 }";
+        let errs = check_src(src).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("compare")));
+    }
+
+    #[test]
+    fn generic_identity_still_checks() {
+        // The legitimate fully-parametric case must still pass.
+        assert!(check_src("fn id[T](x: T) -> T = x").is_ok());
     }
 
     // ---- generics --------------------------------------------------------
