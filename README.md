@@ -123,6 +123,9 @@ Sample run (200k-row synthetic telemetry, 3 × i64 columns):
 | **Aria type-aware + rANS** | **406,180** | **8.5%** | **93 ms** |
 
 → **2.5× smaller than `gzip -9` and ~42× faster**, fully lossless (round-trip verified).
+*Caveat: this is a synthetic best-case for columnar data (monotonic/cyclic/slow-drifting
+integer columns) — exactly where delta+columnar beats a byte-blind tool. The codec is also a
+standalone Rust library today; it is not yet driven by an Aria program's own type information.*
 
 **Predictive (neural) codec** — a context-mixing predictor feeds a binary arithmetic coder
 (`model + entropy coder = optimal compression`, the "LLMs are compressors" architecture).
@@ -158,7 +161,7 @@ without touching the parser or AST.
 - [x] Transformer forward pass (inference) running on the tensor core
 - [x] Arithmetic coder + context-mixing predictor (predictive-compression building blocks)
 - [x] Native RAG primitives (embedding store + cosine top-k retrieval)
-- [x] Compile-time tensor shape checking (dimension mismatch = compile error)
+- [x] Compile-time tensor shape checking — *standalone prototype* (`src/shape.rs`, run via `aria demo shape`); not yet wired into the language's own type checker
 - [x] Wire predictor + arithmetic coder into an end-to-end neural codec (`aria npack`)
 - [ ] Add a match model / higher-order contexts (beat gzip), then a transformer predictor
 - [ ] Effect / capability system

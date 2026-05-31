@@ -353,6 +353,10 @@ fn values_equal(a: &Value, b: &Value) -> bool {
                 fields: f2,
             },
         ) => c1 == c2 && f1.len() == f2.len() && f1.iter().zip(f2).all(|(x, y)| values_equal(x, y)),
+        // Tensors compare structurally (shape + contents). Without this arm,
+        // `t == t` fell through to `false`, silently disagreeing with the type
+        // checker which accepts `==` on Tensor.
+        (Value::Tensor(a), Value::Tensor(b)) => a.shape == b.shape && a.data == b.data,
         _ => false,
     }
 }
@@ -570,6 +574,27 @@ mod tests {
             Value::Float(f) => assert!((f - 1.0).abs() < 1e-6, "got {f}"),
             v => panic!("expected Float, got {}", v.display()),
         }
+    }
+
+    #[test]
+    fn tensor_equality_is_structural() {
+        // A tensor must equal itself and differ from a different one (regression:
+        // previously `t == t` fell through to false).
+        let same = run(r#"
+            fn main() -> Bool = {
+                let a = tensor_set(tensor_zeros(2, 2), 0, 0, 1.0);
+                a == a
+            }
+        "#);
+        assert!(matches!(same, Value::Bool(true)));
+        let diff = run(r#"
+            fn main() -> Bool = {
+                let a = tensor_set(tensor_zeros(2, 2), 0, 0, 1.0);
+                let b = tensor_zeros(2, 2);
+                a == b
+            }
+        "#);
+        assert!(matches!(diff, Value::Bool(false)));
     }
 
     #[test]
