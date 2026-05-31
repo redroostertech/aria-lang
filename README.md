@@ -69,6 +69,27 @@ fn main() -> Int = {
 }
 ```
 
+## AI-native primitives (callable from Aria)
+
+LLM/numeric operations are exposed as language-runtime builtins — not a library
+bolted on — so you write them directly in typed Aria code:
+
+```aria
+fn main() -> Int = {
+  let a   = tensor_set(tensor_zeros(2, 2), 0, 0, 1.0);  -- opaque Tensor handles
+  let prod = matmul(a, a);
+  print_float(tensor_get(prod, 0, 0));
+  print_float(embed_similarity("cosine similarity", "vectors by cosine"));  -- RAG
+  print_int(compressed_size("abababababab"));                                -- compression
+  print_float(neural_bits_per_byte("the quick brown fox the quick"));        -- predictor
+  0
+}
+```
+
+Builtins: `tensor_zeros/set/get/rows/cols`, `matmul`, `transpose`, `softmax`,
+`relu` (typed `Tensor`); `embed_similarity` (RAG cosine); `compressed_size`
+(rANS); `neural_bits_per_byte` (predictive model). See `examples/ai.aria`.
+
 ## Compression engine (research focus)
 
 A core thesis of Aria: because the language knows the *shape* of data, it can

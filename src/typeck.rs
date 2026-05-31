@@ -135,6 +135,17 @@ pub fn check(program: &Program) -> Result<(), Vec<String>> {
         ctx: &str,
     ) {
         match t {
+            Ty::Named(n, args) if BUILTIN_TYPES.contains(&n.as_str()) => {
+                // Built-in nullary types (e.g. `Tensor`) take no arguments.
+                if !args.is_empty() {
+                    errs.push(format!(
+                        "{}: built-in type `{}` takes no type arguments, got {}",
+                        ctx,
+                        n,
+                        args.len()
+                    ));
+                }
+            }
             Ty::Named(n, args) => {
                 match types.get(n) {
                     None => errs.push(format!("{}: unknown type `{}`", ctx, n)),
@@ -236,8 +247,14 @@ pub fn check(program: &Program) -> Result<(), Vec<String>> {
     }
 }
 
+// Built-in nullary types that need no user declaration but must pass the
+// "unknown type" check in pass 2. `Tensor` is the opaque AI-runtime handle.
+const BUILTIN_TYPES: &[&str] = &["Tensor"];
+
 fn builtin_sig(name: &str) -> Option<(Vec<Ty>, Ty)> {
     use Ty::*;
+    // The opaque tensor handle, shared across all tensor builtins below.
+    let tensor = || Named("Tensor".to_string(), vec![]);
     Some(match name {
         "print_int" => (vec![Int], Unit),
         "print_float" => (vec![Float], Unit),
@@ -245,6 +262,21 @@ fn builtin_sig(name: &str) -> Option<(Vec<Ty>, Ty)> {
         "print_str" => (vec![Str], Unit),
         "concat" => (vec![Str, Str], Str),
         "int_to_str" => (vec![Int], Str),
+
+        // ---- AI runtime primitives ---------------------------------------
+        // Tensors are opaque values built and queried purely via builtins.
+        "tensor_zeros" => (vec![Int, Int], tensor()),
+        "tensor_set" => (vec![tensor(), Int, Int, Float], tensor()),
+        "tensor_get" => (vec![tensor(), Int, Int], Float),
+        "tensor_rows" => (vec![tensor()], Int),
+        "tensor_cols" => (vec![tensor()], Int),
+        "matmul" => (vec![tensor(), tensor()], tensor()),
+        "transpose" => (vec![tensor()], tensor()),
+        "softmax" => (vec![tensor()], tensor()),
+        "relu" => (vec![tensor()], tensor()),
+        "embed_similarity" => (vec![Str, Str], Float),
+        "compressed_size" => (vec![Str], Int),
+        "neural_bits_per_byte" => (vec![Str], Float),
         _ => return None,
     })
 }

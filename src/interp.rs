@@ -15,6 +15,8 @@ pub enum Value {
     Bool(bool),
     Str(String),
     Data { ctor: String, fields: Vec<Value> },
+    /// An opaque AI-runtime tensor handle, built and queried via builtins.
+    Tensor(crate::tensor::Tensor),
     Unit,
 }
 
@@ -25,6 +27,13 @@ impl Value {
             Value::Float(f) => format!("{}", f),
             Value::Bool(b) => b.to_string(),
             Value::Str(s) => s.clone(),
+            Value::Tensor(t) => {
+                if t.shape.len() == 2 {
+                    format!("Tensor({}x{})", t.shape[0], t.shape[1])
+                } else {
+                    format!("Tensor{:?}", t.shape)
+                }
+            }
             Value::Unit => "()".to_string(),
             Value::Data { ctor, fields } => {
                 if fields.is_empty() {
@@ -395,6 +404,150 @@ fn builtin(name: &str, args: &[Value]) -> Result<Option<Value>, String> {
             Value::Int(n) => Ok(Some(Value::Str(n.to_string()))),
             v => Err(format!("int_to_str expects Int, got {}", v.display())),
         },
+
+        // ---- AI runtime primitives -------------------------------------
+        // All tensor builtins are pure: mutating ones clone then modify.
+        "tensor_zeros" => match args {
+            [Value::Int(r), Value::Int(c)] => {
+                if *r < 0 || *c < 0 {
+                    return Err("tensor_zeros expects non-negative dimensions".into());
+                }
+                let t = crate::tensor::Tensor::zeros(&[*r as usize, *c as usize]);
+                Ok(Some(Value::Tensor(t)))
+            }
+            _ => Err("tensor_zeros expects (Int, Int)".into()),
+        },
+        "tensor_set" => match args {
+            [Value::Tensor(t), Value::Int(r), Value::Int(c), Value::Float(v)] => {
+                let (rows, cols) = (t.rows(), t.cols());
+                if *r < 0 || *c < 0 || *r as usize >= rows || *c as usize >= cols {
+                    return Err(format!(
+                        "tensor_set index ({}, {}) out of range for {}x{} tensor",
+                        r, c, rows, cols
+                    ));
+                }
+                let mut out = t.clone();
+                out.set(*r as usize, *c as usize, *v as f32);
+                Ok(Some(Value::Tensor(out)))
+            }
+            _ => Err("tensor_set expects (Tensor, Int, Int, Float)".into()),
+        },
+        "tensor_get" => match args {
+            [Value::Tensor(t), Value::Int(r), Value::Int(c)] => {
+                let (rows, cols) = (t.rows(), t.cols());
+                if *r < 0 || *c < 0 || *r as usize >= rows || *c as usize >= cols {
+                    return Err(format!(
+                        "tensor_get index ({}, {}) out of range for {}x{} tensor",
+                        r, c, rows, cols
+                    ));
+                }
+                Ok(Some(Value::Float(t.at(*r as usize, *c as usize) as f64)))
+            }
+            _ => Err("tensor_get expects (Tensor, Int, Int)".into()),
+        },
+        "tensor_rows" => match args {
+            [Value::Tensor(t)] => Ok(Some(Value::Int(t.rows() as i64))),
+            _ => Err("tensor_rows expects (Tensor)".into()),
+        },
+        "tensor_cols" => match args {
+            [Value::Tensor(t)] => Ok(Some(Value::Int(t.cols() as i64))),
+            _ => Err("tensor_cols expects (Tensor)".into()),
+        },
+        "matmul" => match args {
+            [Value::Tensor(a), Value::Tensor(b)] => {
+                if a.cols() != b.rows() {
+                    return Err(format!(
+                        "matmul shape mismatch: {}x{} times {}x{}",
+                        a.rows(),
+                        a.cols(),
+                        b.rows(),
+                        b.cols()
+                    ));
+                }
+                Ok(Some(Value::Tensor(a.matmul(b))))
+            }
+            _ => Err("matmul expects (Tensor, Tensor)".into()),
+        },
+        "transpose" => match args {
+            [Value::Tensor(t)] => Ok(Some(Value::Tensor(t.transpose()))),
+            _ => Err("transpose expects (Tensor)".into()),
+        },
+        "softmax" => match args {
+            [Value::Tensor(t)] => Ok(Some(Value::Tensor(t.softmax_rows()))),
+            _ => Err("softmax expects (Tensor)".into()),
+        },
+        "relu" => match args {
+            [Value::Tensor(t)] => Ok(Some(Value::Tensor(t.relu()))),
+            _ => Err("relu expects (Tensor)".into()),
+        },
+        "embed_similarity" => match args {
+            [Value::Str(a), Value::Str(b)] => {
+                let va = crate::rag::hash_embed(a, 64);
+                let vb = crate::rag::hash_embed(b, 64);
+                Ok(Some(Value::Float(crate::rag::cosine_similarity(&va, &vb) as f64)))
+            }
+            _ => Err("embed_similarity expects (String, String)".into()),
+        },
+        "compressed_size" => match args {
+            [Value::Str(s)] => {
+                let n = crate::rans::compress(s.as_bytes()).len();
+                Ok(Some(Value::Int(n as i64)))
+            }
+            _ => Err("compressed_size expects (String)".into()),
+        },
+        "neural_bits_per_byte" => match args {
+            [Value::Str(s)] => {
+                Ok(Some(Value::Float(crate::predict::eval_bits_per_byte(s.as_bytes()))))
+            }
+            _ => Err("neural_bits_per_byte expects (String)".into()),
+        },
         _ => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{lexer, parser, typeck};
+
+    // Lex -> parse -> typeck -> interp, returning the value of `main`.
+    fn run(src: &str) -> Value {
+        let toks = lexer::lex(src).expect("lex");
+        let prog = parser::parse(toks).expect("parse");
+        typeck::check(&prog).expect("typeck");
+        let interp = Interp::new(&prog).expect("interp::new");
+        interp.run_main().expect("run")
+    }
+
+    #[test]
+    fn tensor_builtins_end_to_end() {
+        // Build a 2x2 identity, multiply by itself, and read back element (1,1).
+        let src = r#"
+            fn main() -> Float = {
+                let i0 = tensor_zeros(2, 2);
+                let i1 = tensor_set(i0, 0, 0, 1.0);
+                let id = tensor_set(i1, 1, 1, 1.0);
+                let p = matmul(id, id);
+                tensor_get(p, 1, 1)
+            }
+        "#;
+        match run(src) {
+            Value::Float(f) => assert!((f - 1.0).abs() < 1e-6, "got {f}"),
+            v => panic!("expected Float, got {}", v.display()),
+        }
+    }
+
+    #[test]
+    fn embed_similarity_related_beats_unrelated() {
+        // Identical strings -> cosine ~1.0.
+        let src = r#"
+            fn main() -> Float =
+                embed_similarity("cosine similarity over vectors",
+                                 "cosine similarity over vectors")
+        "#;
+        match run(src) {
+            Value::Float(f) => assert!((f - 1.0).abs() < 1e-5, "identical text similarity was {f}"),
+            v => panic!("expected Float, got {}", v.display()),
+        }
     }
 }

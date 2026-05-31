@@ -1,0 +1,47 @@
+-- AI runtime primitives, callable straight from Aria.
+-- Demonstrates: opaque tensors, matmul, embeddings, and compression metrics —
+-- LLM/numeric operations exposed as language-runtime builtins.
+
+-- Build a 2x2 tensor [[1, 2], [3, 4]] purely through builtins (no list literals).
+fn make_a() -> Tensor = {
+  let t0 = tensor_zeros(2, 2);
+  let t1 = tensor_set(t0, 0, 0, 1.0);
+  let t2 = tensor_set(t1, 0, 1, 2.0);
+  let t3 = tensor_set(t2, 1, 0, 3.0);
+  tensor_set(t3, 1, 1, 4.0)
+}
+
+-- The 2x2 identity matrix.
+fn identity() -> Tensor = {
+  let i0 = tensor_zeros(2, 2);
+  let i1 = tensor_set(i0, 0, 0, 1.0);
+  tensor_set(i1, 1, 1, 1.0)
+}
+
+fn main() -> Int = {
+  let a = make_a();
+  let id = identity();
+
+  -- a * identity == a, so element (1, 1) should print 4.
+  let prod = matmul(a, id);
+  print_str("matmul(a, identity) element (1,1):");
+  print_float(tensor_get(prod, 1, 1));
+
+  -- Embedding similarity: related strings score higher than unrelated ones.
+  print_str("similarity (related):");
+  print_float(embed_similarity("cosine similarity over vectors",
+                               "vectors ranked by cosine similarity"));
+  print_str("similarity (unrelated):");
+  print_float(embed_similarity("cosine similarity over vectors",
+                               "a balanced breakfast of fruit and grains"));
+
+  -- Compression: rANS-coded size in bytes of a repetitive string.
+  print_str("compressed_size of repetitive text:");
+  print_int(compressed_size("ababababababababababababababababababab"));
+
+  -- Neural predictor: bits/byte (lower means more structure found).
+  print_str("neural_bits_per_byte of repetitive text:");
+  print_float(neural_bits_per_byte("the quick brown fox the quick brown fox the quick brown fox"));
+
+  0
+}
