@@ -69,8 +69,10 @@ compress far better than byte-blind tools like `.zip`. The engine is layered as
 
 ```sh
 cargo run --release -- bench          # benchmark vs gzip on synthetic telemetry
-cargo run --release -- pack   in out  # compress any file (rANS)
+cargo run --release -- pack   in out  # compress any file (rANS, order-0 entropy)
 cargo run --release -- unpack in out  # decompress
+cargo run --release -- npack  in out  # compress with the predictive (neural) codec
+cargo run --release -- nunpack in out # decompress
 cargo run --release -- demo           # run the AI-native runtime demos:
 cargo run --release -- demo transformer  # tiny transformer forward pass
 cargo run --release -- demo predict      # context-mixing predictor (bits/byte)
@@ -88,6 +90,13 @@ Sample run (200k-row synthetic telemetry, 3 × i64 columns):
 | **Aria type-aware + rANS** | **406,180** | **8.5%** | **93 ms** |
 
 → **2.5× smaller than `gzip -9` and ~42× faster**, fully lossless (round-trip verified).
+
+**Predictive (neural) codec** — a context-mixing predictor feeds a binary arithmetic coder
+(`model + entropy coder = optimal compression`, the "LLMs are compressors" architecture).
+On a mixed text corpus (repo prose + Rust source, 143 KB) it is **1.8× smaller than the
+order-0 rANS codec** and roughly on par with `gzip -9`, lossless. It doesn't yet beat gzip
+because the predictor lacks LZ-style long-match modeling — the next upgrade is a match model
+/ higher-order contexts, then a true neural (transformer) predictor.
 
 ## Architecture
 
@@ -116,7 +125,8 @@ without touching the parser or AST.
 - [x] Arithmetic coder + context-mixing predictor (predictive-compression building blocks)
 - [x] Native RAG primitives (embedding store + cosine top-k retrieval)
 - [x] Compile-time tensor shape checking (dimension mismatch = compile error)
-- [ ] Wire predictor + arithmetic coder into an end-to-end neural codec
+- [x] Wire predictor + arithmetic coder into an end-to-end neural codec (`aria npack`)
+- [ ] Add a match model / higher-order contexts (beat gzip), then a transformer predictor
 - [ ] Effect / capability system
 - [ ] WASM backend
 - [ ] Native backend (Cranelift or LLVM)

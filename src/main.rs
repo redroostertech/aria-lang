@@ -14,6 +14,7 @@ mod arith;
 mod ast;
 mod interp;
 mod lexer;
+mod neural_codec;
 mod pack;
 mod parser;
 mod predict;
@@ -29,14 +30,16 @@ use std::process::ExitCode;
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: aria <run|ast|pack|unpack|bench> [args...]");
+        eprintln!("usage: aria <run|ast|pack|unpack|npack|nunpack|bench|demo> [args...]");
         return ExitCode::from(2);
     }
 
     match args[1].as_str() {
         "run" | "ast" => run_source(&args),
-        "pack" => pack_file(&args, true),
-        "unpack" => pack_file(&args, false),
+        "pack" => pack_file(&args, Codec::Rans, true),
+        "unpack" => pack_file(&args, Codec::Rans, false),
+        "npack" => pack_file(&args, Codec::Neural, true),
+        "nunpack" => pack_file(&args, Codec::Neural, false),
         "bench" => {
             pack::bench();
             ExitCode::SUCCESS
@@ -124,7 +127,13 @@ fn run_source(args: &[String]) -> ExitCode {
     }
 }
 
-fn pack_file(args: &[String], compress: bool) -> ExitCode {
+#[derive(Clone, Copy)]
+enum Codec {
+    Rans,
+    Neural,
+}
+
+fn pack_file(args: &[String], codec: Codec, compress: bool) -> ExitCode {
     if args.len() < 4 {
         eprintln!("usage: aria {} <in> <out>", args[1]);
         return ExitCode::from(2);
@@ -136,15 +145,22 @@ fn pack_file(args: &[String], compress: bool) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let output = if compress {
-        rans::compress(&input)
+    let decompressed = if compress {
+        Ok(match codec {
+            Codec::Rans => rans::compress(&input),
+            Codec::Neural => neural_codec::compress(&input),
+        })
     } else {
-        match rans::decompress(&input) {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("error: {}", e);
-                return ExitCode::FAILURE;
-            }
+        match codec {
+            Codec::Rans => rans::decompress(&input),
+            Codec::Neural => neural_codec::decompress(&input),
+        }
+    };
+    let output = match decompressed {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            return ExitCode::FAILURE;
         }
     };
     if let Err(e) = std::fs::write(&args[3], &output) {
