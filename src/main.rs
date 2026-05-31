@@ -12,6 +12,7 @@
 
 mod arith;
 mod ast;
+mod builtins;
 mod interp;
 mod lexer;
 mod neural_codec;

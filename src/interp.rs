@@ -577,6 +577,73 @@ mod tests {
     }
 
     #[test]
+    fn every_declared_builtin_is_implemented() {
+        // Drift guard: every builtin the type checker knows about (from the
+        // shared `builtins` table) must be handled by the interpreter. Calling
+        // with no args returns Err for an implemented builtin (arg mismatch) but
+        // Ok(None) for an unknown name — so Ok(None) here means drift.
+        for name in crate::builtins::names() {
+            let r = builtin(name, &[]);
+            assert!(
+                !matches!(r, Ok(None)),
+                "builtin `{}` is declared in the shared table but not implemented in interp",
+                name
+            );
+        }
+    }
+
+    /// Substrings of runtime errors that the type checker is supposed to make
+    /// unreachable. A well-typed program must never produce one of these.
+    fn is_type_class_error(msg: &str) -> bool {
+        const NEEDLES: &[&str] = &[
+            "unbound variable",
+            "unknown function",
+            "unknown constructor",
+            "argument(s), got",
+            "field(s), got",
+            "no match arm",
+            "`if` condition",
+            "cannot apply",
+            "needs two Ints or two Floats",
+            "needs Bool",
+            "cannot compare",
+            "expects Int",
+            "expects Float",
+            "expects Bool",
+            "expects String",
+            "expects (",
+        ];
+        NEEDLES.iter().any(|n| msg.contains(n))
+    }
+
+    #[test]
+    fn well_typed_programs_never_hit_type_class_errors() {
+        // Differential/consistency harness: every program here type-checks, so
+        // running it must NOT produce a type-class runtime error (legitimate
+        // runtime errors like overflow/div-by-zero are fine and not exercised).
+        let programs = [
+            "type C = | R | G | B\nfn n(c: C) -> Int = match c { R => 0, G => 1, B => 2, }\nfn main() -> Int = n(B)",
+            "type L[T] = | Nil | Cons(T, L[T])\nfn len[T](xs: L[T]) -> Int = match xs { Nil => 0, Cons(_, r) => 1 + len(r), }\nfn main() -> Int = len(Cons(1, Cons(2, Nil)))",
+            "fn main() -> Float = tensor_get(matmul(tensor_set(tensor_zeros(2,2),0,0,2.0), tensor_set(tensor_zeros(2,2),0,0,3.0)), 0, 0)",
+            "fn main() -> Int = { let a = tensor_zeros(2,2); let b = tensor_zeros(2,2); if a == b { 1 } else { 0 } }",
+            "fn main() -> String = concat(\"x = \", int_to_str(6 * 7))",
+        ];
+        for src in programs {
+            let toks = lexer::lex(src).expect("lex");
+            let prog = parser::parse(toks).expect("parse");
+            typeck::check(&prog).expect("must type-check");
+            let interp = Interp::new(&prog).expect("interp::new");
+            if let Err(msg) = interp.run_main() {
+                assert!(
+                    !is_type_class_error(&msg),
+                    "well-typed program produced a type-class runtime error: {}\nprogram: {}",
+                    msg, src
+                );
+            }
+        }
+    }
+
+    #[test]
     fn tensor_equality_is_structural() {
         // A tensor must equal itself and differ from a different one (regression:
         // previously `t == t` fell through to false).
