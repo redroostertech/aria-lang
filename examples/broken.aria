@@ -1,0 +1,23 @@
+-- This file intentionally does NOT type-check. It exists to demonstrate the
+-- compiler catching the mistakes an AI (or human) most commonly makes.
+-- Run:  aria check examples/broken.aria
+
+type Color =
+  | Red
+  | Green
+  | Blue
+
+-- BUG 1: non-exhaustive match — `Blue` is never handled.
+fn code(c: Color) -> Int =
+  match c {
+    Red   => 0,
+    Green => 1,
+  }
+
+-- BUG 2: returns a Bool where an Int was declared.
+fn wrong_return() -> Int = true
+
+-- BUG 3: comparing values of different types.
+fn bad_compare(n: Int) -> Bool = n == "five"
+
+fn main() -> Int = code(Blue)

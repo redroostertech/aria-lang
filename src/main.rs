@@ -24,18 +24,19 @@ mod shape;
 mod tensor;
 mod tensor_ext;
 mod transformer;
+mod typeck;
 
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: aria <run|ast|pack|unpack|npack|nunpack|bench|demo> [args...]");
+        eprintln!("usage: aria <run|check|ast|pack|unpack|npack|nunpack|bench|demo> [args...]");
         return ExitCode::from(2);
     }
 
     match args[1].as_str() {
-        "run" | "ast" => run_source(&args),
+        "run" | "ast" | "check" => run_source(&args),
         "pack" => pack_file(&args, Codec::Rans, true),
         "unpack" => pack_file(&args, Codec::Rans, false),
         "npack" => pack_file(&args, Codec::Neural, true),
@@ -107,6 +108,20 @@ fn run_source(args: &[String]) -> ExitCode {
 
     if args[1] == "ast" {
         println!("{:#?}", program);
+        return ExitCode::SUCCESS;
+    }
+
+    // Type-check before running — the compiler is the correctness signal.
+    if let Err(errors) = typeck::check(&program) {
+        eprintln!("type error{} in {}:", if errors.len() == 1 { "" } else { "s" }, path);
+        for e in &errors {
+            eprintln!("  - {}", e);
+        }
+        return ExitCode::FAILURE;
+    }
+
+    if args[1] == "check" {
+        println!("{}: type-checks OK", path);
         return ExitCode::SUCCESS;
     }
 

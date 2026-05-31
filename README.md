@@ -32,9 +32,21 @@ Requires a Rust toolchain.
 
 ```sh
 cargo build --release
-./target/release/aria run examples/intro.aria
-./target/release/aria run examples/list.aria
-./target/release/aria ast examples/intro.aria   # dump the parsed AST
+./target/release/aria run   examples/intro.aria
+./target/release/aria run   examples/list.aria
+./target/release/aria check examples/broken.aria  # see the type checker reject bad code
+./target/release/aria ast   examples/intro.aria   # dump the parsed AST
+```
+
+`aria run` type-checks before executing. `aria check` type-checks only. The
+checker catches type mismatches, arity/field errors, unbound variables, and
+**non-exhaustive `match`** — e.g. on the intentionally-broken example:
+
+```
+type errors in examples/broken.aria:
+  - function `code`: non-exhaustive match on Color: missing case(s) Blue
+  - function `wrong_return`: body has type Bool but return type is Int
+  - function `bad_compare`: cannot compare Int and String
 ```
 
 ## A taste
@@ -117,8 +129,9 @@ without touching the parser or AST.
 
 - [x] Lexer, parser, AST
 - [x] Tree-walking interpreter (functions, recursion, ADTs, pattern matching, blocks)
-- [ ] Static type checker (Hindley–Milner-style inference)
-- [ ] Exhaustiveness checking for `match`
+- [x] Static type checker (bottom-up synthesis + checking against annotations)
+- [x] Exhaustiveness checking for `match`
+- [ ] Type inference for `let`-generalization / generics (polymorphism)
 - [x] rANS entropy coder + type-aware compression (beats gzip on structured data)
 - [x] Shaped-tensor runtime (matmul/softmax/layernorm) + INT8 quantization
 - [x] Transformer forward pass (inference) running on the tensor core
