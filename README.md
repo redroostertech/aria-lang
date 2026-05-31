@@ -18,12 +18,12 @@ optimized for *machines* (dense, low-level, explicit) are both poorly suited to
 
 | Design rule | Why it's AI-native |
 |---|---|
-| **One canonical form** — no optional syntax, `;` terminates statements, single comment style (`--`) | Removes stylistic degrees of freedom that cause inconsistent generation |
+| **One canonical form** — `;` terminates statements, single comment style (`--`), a required leading `\|` on sum types (no optional spellings) | Removes stylistic degrees of freedom that cause inconsistent generation. *(Full canonicalization — e.g. trailing commas — is being formalized in the spec.)* |
 | **Case = meaning** — `Uppercase` is always a type/constructor, `lowercase` always a value/function | Zero-ambiguity identifier resolution; friendly to grammar-constrained decoding |
 | **Everything is an expression** — `if`, `match`, blocks all return values | Uniform reasoning; no statement/expression split to track |
 | **Immutable `let` only** | Local reasoning — line N never depends on hidden mutation |
 | **Algebraic data types + exhaustive `match`** | The highest-leverage feature for correct code generation |
-| **Regular, LL(1)-ish grammar** | Can drive a GBNF grammar so a model *cannot* emit a syntax error |
+| **Regular, LL(1)-ish grammar** | *Designed* to drive a GBNF grammar for constrained decoding (so a model could not emit a syntax error). GBNF export is planned, not yet built. |
 | **Zero-dependency, fast compile** | Tight feedback loop; efficient compiling/bundling from day one |
 
 ## Quick start
@@ -113,16 +113,19 @@ cargo run --release -- demo shape        # compile-time tensor shape checking
 cargo run --release -- demo rag          # native retrieval (embedding top-k)
 ```
 
-Sample run (200k-row synthetic telemetry, 3 × i64 columns):
+Sample run (200k-row synthetic telemetry, 3 × i64 columns). Sizes are
+deterministic; times are from one representative run and vary by machine/load:
 
-| method | size | ratio | time |
+| method | size | ratio | time (representative) |
 |---|---:|---:|---:|
 | raw (i64 row-major) | 4,800,000 | 100.0% | – |
-| gzip -9 (zip-class) | 1,021,751 | 21.3% | 3946 ms |
-| Aria rANS (entropy only) | 1,685,558 | 35.1% | 98 ms |
-| **Aria type-aware + rANS** | **406,180** | **8.5%** | **93 ms** |
+| gzip -9 (zip-class) | 1,021,751 | 21.3% | several seconds |
+| Aria rANS (entropy only) | 1,685,558 | 35.1% | sub-second |
+| **Aria type-aware + rANS** | **406,180** | **8.5%** | sub-second |
 
-→ **2.5× smaller than `gzip -9` and ~42× faster**, fully lossless (round-trip verified).
+→ **2.5× smaller than `gzip -9`** (deterministic; reproduced across runs) **and much faster**
+— sub-second vs gzip's multiple seconds on this dataset (the exact speed multiple, ~25–40×,
+varies by machine/load, so we don't pin a single number). Fully lossless (round-trip verified).
 *Caveat: this is a synthetic best-case for columnar data (monotonic/cyclic/slow-drifting
 integer columns) — exactly where delta+columnar beats a byte-blind tool. The codec is also a
 standalone Rust library today; it is not yet driven by an Aria program's own type information.*

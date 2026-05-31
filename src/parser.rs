@@ -147,10 +147,9 @@ impl Parser {
         let name = self.expect_ident()?;
         let params = self.parse_type_params()?;
         self.expect(&Tok::Eq)?;
-        // Optional leading pipe.
-        if *self.peek() == Tok::Pipe {
-            self.advance();
-        }
+        // Canonical form: the first variant must be preceded by `|`, so a sum
+        // type has exactly one spelling (no optional leading pipe).
+        self.expect(&Tok::Pipe)?;
         let mut variants = Vec::new();
         loop {
             let vname = self.expect_ident()?;
