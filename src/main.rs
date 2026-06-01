@@ -219,7 +219,8 @@ fn run_wasm_run(args: &[String]) -> ExitCode {
          try{{const b=fs.readFileSync({:?});\
          WebAssembly.instantiate(b).then(r=>{{\
          try{{process.stdout.write(String(r.instance.exports.main()));\
-         if(r.instance.exports.__live){{process.stderr.write('__live='+String(r.instance.exports.__live()));}}}}\
+         if(r.instance.exports.__live){{process.stderr.write('__live='+String(r.instance.exports.__live()));}}\
+         if(r.instance.exports.__reuses){{process.stderr.write(' __reuses='+String(r.instance.exports.__reuses()));}}}}\
          catch(e){{process.stdout.write('TRAP');}}\
          }}).catch(e=>{{process.stdout.write('TRAP');}});}}\
          catch(e){{process.stdout.write('TRAP');}}",

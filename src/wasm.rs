@@ -18,9 +18,16 @@
 //!     8-byte slots: `[p+0]=rc`, `[p+8]=tag`, `[p+16+8*i]=field i`. `__drop`'s
 //!     per-tag Ref-field knowledge is compiled in from the typed AST.
 //!
+//! In-place cell REUSE (FBIP): the rc pass emits same-arity `DropReuse`/
+//! `CtorReuse` pairs; codegen exploits them. `__drop_reuse(ptr)` decrements rc
+//! and, if the cell becomes unique-and-dead, releases its Ref CHILDREN but
+//! RETAINS the slot, returning the pointer as a reuse token (else 0).
+//! `CtorReuse` overwrites that retained slot in place (no `__alloc`, no `__live`
+//! change, `__reuses`++); a null token falls back to a fresh `__alloc`. This
+//! matches the IR interpreter exactly and preserves garbage-freeness.
+//!
 //! DEFERRED (clean `Err`, never a panic): Float / String / Unit, ADT fields of
-//! those types, generic ADTs, in-place reuse (`CtorReuse`/`DropReuse` are
-//! desugared to fresh `Ctor`/`Drop`), structural ADT `==`/`!=`, builtin calls.
+//! those types, generic ADTs, structural ADT `==`/`!=`, builtin calls.
 //!
 //! Value types (i64 vs i32) come from two places:
 //!   * Function signatures: read directly off the typed AST `Program`
@@ -166,9 +173,11 @@ impl CtorTable {
 //
 // We reserve a small bookkeeping region at the very start of linear memory:
 //   [0]  bump pointer (i32): next never-yet-allocated address.
-//   [4]  live-cell counter (i64): incremented on a fresh alloc, decremented on
+//   [8]  live-cell counter (i64): incremented on a fresh alloc, decremented on
 //        free. Exported via `__live`.
-//   [16] free-list heads, one i32 per arity 0..=max_arity (segregated by size).
+//   [16] reuse counter (i64): incremented on each in-place cell reuse (FBIP).
+//        Exported via `__reuses`.
+//   [24] free-list heads, one i32 per arity 0..=max_arity (segregated by size).
 // Cells are allocated above `HEAP_BASE` (after the free-list array).
 //
 // A cell at pointer `p` uses 8-byte slots:
@@ -181,7 +190,8 @@ impl CtorTable {
 const MEM_PAGES: u64 = 256;
 const BUMP_PTR_ADDR: u64 = 0; // i32
 const LIVE_ADDR: u64 = 8; // i64 (8-aligned)
-const FREELIST_BASE: u64 = 16; // i32 per arity, 4 bytes each
+const REUSES_ADDR: u64 = 16; // i64 (8-aligned): in-place reuse counter (FBIP)
+const FREELIST_BASE: u64 = 24; // i32 per arity, 4 bytes each
 const CELL_HEADER: u64 = 16; // rc(8) + tag(8)
 const SLOT: u64 = 8;
 
@@ -228,20 +238,24 @@ impl OvfHelper {
 /// `heap_base + offset`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HeapHelper {
-    Alloc, // (nfields:i32) -> ptr:i32
-    Free,  // (ptr:i32, nfields:i32) -> ()  [we give it an i32 dummy return]
-    Dup,   // (ptr:i32) -> ()
-    Drop,  // (ptr:i32) -> ()
-    Live,  // () -> i64
+    Alloc,     // (nfields:i32) -> ptr:i32
+    Free,      // (ptr:i32, nfields:i32) -> ()  [we give it an i32 dummy return]
+    Dup,       // (ptr:i32) -> ()
+    Drop,      // (ptr:i32) -> ()
+    Live,      // () -> i64
+    DropReuse, // (ptr:i32) -> token:i32  (the cell ptr if unique-and-dead, else 0)
+    Reuses,    // () -> i64  (in-place reuse counter)
 }
 
 impl HeapHelper {
-    const ALL: [HeapHelper; 5] = [
+    const ALL: [HeapHelper; 7] = [
         HeapHelper::Alloc,
         HeapHelper::Free,
         HeapHelper::Dup,
         HeapHelper::Drop,
         HeapHelper::Live,
+        HeapHelper::DropReuse,
+        HeapHelper::Reuses,
     ];
 
     fn offset(self) -> u32 {
@@ -251,6 +265,8 @@ impl HeapHelper {
             HeapHelper::Dup => 2,
             HeapHelper::Drop => 3,
             HeapHelper::Live => 4,
+            HeapHelper::DropReuse => 5,
+            HeapHelper::Reuses => 6,
         }
     }
 
@@ -264,6 +280,8 @@ impl HeapHelper {
             HeapHelper::Dup => (vec![WType::I32], WType::I32),
             HeapHelper::Drop => (vec![WType::I32], WType::I32),
             HeapHelper::Live => (vec![], WType::I64),
+            HeapHelper::DropReuse => (vec![WType::I32], WType::I32),
+            HeapHelper::Reuses => (vec![], WType::I64),
         }
     }
 }
@@ -476,10 +494,11 @@ fn bind_type(bind: &Bind, env: &LocalEnv) -> Result<WType, String> {
             env.ctors.get(name)?;
             Ok(WType::Ref)
         }
-        Bind::CtorReuse(..) => Err(
-            "wasm backend: in-place constructor reuse (`CtorReuse`) is outside the 2b subset (deferred)"
-                .into(),
-        ),
+        Bind::CtorReuse(_tok, name, _) => {
+            // Validate the constructor exists; a (possibly reused) cell is a Ref.
+            env.ctors.get(name)?;
+            Ok(WType::Ref)
+        }
         Bind::Match(scrut, arms) => match_type(scrut, arms, env),
     }
 }
@@ -578,9 +597,23 @@ fn iexpr_type(e: &IExpr, env: &LocalEnv) -> Result<WType, String> {
         }
         // dup/drop don't introduce bindings; the type is the body's type.
         IExpr::Dup(_, body) | IExpr::Drop(_, body) => iexpr_type(body, env),
-        IExpr::DropReuse(_, _, _) => Err(
-            "wasm backend: reuse tokens (`DropReuse`) are outside the 2b subset (deferred)".into(),
-        ),
+        // DropReuse binds the reuse token (an i32) for the body to reference.
+        IExpr::DropReuse(_scrut, tok, body) => {
+            let mut types = env.types.clone();
+            types.insert(tok.clone(), WType::I32);
+            let probe = LocalEnv {
+                types,
+                index: env.index.clone(),
+                locals: env.locals.clone(),
+                n_params: env.n_params,
+                sigs: env.sigs,
+                ovf_base: env.ovf_base,
+                heap_base: env.heap_base,
+                ctors: env.ctors,
+                scratch_ptr: env.scratch_ptr,
+            };
+            iexpr_type(body, &probe)
+        }
     }
 }
 
@@ -726,10 +759,7 @@ fn emit_bind(bind: &Bind, env: &mut LocalEnv, code: &mut Vec<u8>) -> Result<WTyp
             Ok(result_ty)
         }
         Bind::Ctor(name, fields) => emit_ctor(name, fields, env, code),
-        Bind::CtorReuse(..) => Err(
-            "wasm backend: in-place constructor reuse (`CtorReuse`) is outside the 2b subset (deferred)"
-                .into(),
-        ),
+        Bind::CtorReuse(tok, name, fields) => emit_ctor_reuse(tok, name, fields, env, code),
         Bind::Match(scrut, arms) => emit_match(scrut, arms, env, code),
     }
 }
@@ -745,14 +775,12 @@ fn emit_atom_as_slot(a: &Atom, env: &LocalEnv, code: &mut Vec<u8>) -> Result<(),
     Ok(())
 }
 
-/// Emit a `Bind::Ctor`: allocate a cell, store its tag and fields, yield the
-/// pointer (an i32 Ref) on the stack.
-fn emit_ctor(
+/// Validate a constructor's name/arity, returning its (cloned) `CtorInfo`.
+fn ctor_info_checked(
     name: &str,
     fields: &[Atom],
-    env: &mut LocalEnv,
-    code: &mut Vec<u8>,
-) -> Result<WType, String> {
+    env: &LocalEnv,
+) -> Result<CtorInfo, String> {
     let info = env.ctors.get(name)?.clone();
     if fields.len() != info.arity() {
         return Err(format!(
@@ -762,15 +790,21 @@ fn emit_ctor(
             info.arity()
         ));
     }
-    let scratch = env.scratch();
-    let alloc = env.heap_index(HeapHelper::Alloc);
-    // ptr = __alloc(nfields)
-    code.push(0x41); // i32.const nfields
-    leb_s(info.arity() as i64, code);
-    code.push(0x10); // call __alloc
-    leb_u(alloc as u64, code);
-    code.push(0x21); // local.set scratch  (ptr)
-    leb_u(scratch as u64, code);
+    Ok(info)
+}
+
+/// Write a constructor cell's tag + fields into the cell whose pointer is held
+/// in the `scratch` local. The cell's slot must already exist (freshly
+/// allocated, or a reused slot); rc is set by the caller (`__alloc` for a fresh
+/// cell, or explicitly for a reused one). Used by both `Ctor` and `CtorReuse`.
+fn emit_store_cell_fields(
+    name: &str,
+    info: &CtorInfo,
+    fields: &[Atom],
+    scratch: u32,
+    env: &mut LocalEnv,
+    code: &mut Vec<u8>,
+) -> Result<(), String> {
     // store tag at [ptr+8]
     code.push(0x20); // local.get scratch
     leb_u(scratch as u64, code);
@@ -796,9 +830,98 @@ fn emit_ctor(
         let off = CELL_HEADER + SLOT * i as u64;
         i64_store(off, code);
     }
+    Ok(())
+}
+
+/// Emit a `Bind::Ctor`: allocate a cell, store its tag and fields, yield the
+/// pointer (an i32 Ref) on the stack.
+fn emit_ctor(
+    name: &str,
+    fields: &[Atom],
+    env: &mut LocalEnv,
+    code: &mut Vec<u8>,
+) -> Result<WType, String> {
+    let info = ctor_info_checked(name, fields, env)?;
+    let scratch = env.scratch();
+    let alloc = env.heap_index(HeapHelper::Alloc);
+    // ptr = __alloc(nfields)  (sets rc=1, live++)
+    code.push(0x41); // i32.const nfields
+    leb_s(info.arity() as i64, code);
+    code.push(0x10); // call __alloc
+    leb_u(alloc as u64, code);
+    code.push(0x21); // local.set scratch  (ptr)
+    leb_u(scratch as u64, code);
+    emit_store_cell_fields(name, &info, fields, scratch, env, code)?;
     // result = ptr
     code.push(0x20); // local.get scratch
     leb_u(scratch as u64, code);
+    Ok(WType::Ref)
+}
+
+/// Emit a `Bind::CtorReuse(tok, name, fields)`: if the reuse token `tok` (an i32
+/// local) is non-zero it is a retained cell slot of the right arity — overwrite
+/// it in place (set rc=1, write tag + fields), bump the `__reuses` counter, and
+/// do NOT call `__alloc` or touch `__live` (the slot was kept, not freed). If
+/// `tok == 0` (cell was shared, or scrutinee wasn't a Ref), allocate fresh —
+/// exactly the empty-token fallback of the IR interpreter. Mirrors the IR
+/// interpreter's `Bind::CtorReuse` handler.
+fn emit_ctor_reuse(
+    tok: &str,
+    name: &str,
+    fields: &[Atom],
+    env: &mut LocalEnv,
+    code: &mut Vec<u8>,
+) -> Result<WType, String> {
+    let info = ctor_info_checked(name, fields, env)?;
+    let tok_idx = env.var_index(tok)?;
+    if env.var_type(tok)? != WType::I32 {
+        return Err("wasm backend: reuse token must be an i32".into());
+    }
+    let scratch = env.scratch();
+    let alloc = env.heap_index(HeapHelper::Alloc);
+    // if (result i32)  tok != 0  { reuse in place }  else  { alloc fresh }
+    code.push(0x20); // local.get tok
+    leb_u(tok_idx as u64, code);
+    code.push(0x45); // i32.eqz
+    code.push(0x45); // i32.eqz  (tok != 0)
+    code.push(0x04); // if
+    code.push(WType::Ref.byte()); // blocktype = i32 (the resulting Ref)
+    // --- reuse branch: scratch = tok; rc = 1; __reuses++ ---
+    code.push(0x20); // local.get tok
+    leb_u(tok_idx as u64, code);
+    code.push(0x21); // local.set scratch
+    leb_u(scratch as u64, code);
+    // rc = 1 at [scratch]
+    code.push(0x20); // local.get scratch
+    leb_u(scratch as u64, code);
+    code.push(0x42); // i64.const 1
+    leb_s(1, code);
+    i64_store(0, code);
+    // __reuses++  (LIVE accounting unchanged: reuse is net 0)
+    code.push(0x41); // i32.const REUSES_ADDR
+    leb_s(REUSES_ADDR as i64, code);
+    code.push(0x41); // i32.const REUSES_ADDR
+    leb_s(REUSES_ADDR as i64, code);
+    i64_load(0, code);
+    code.push(0x42); // i64.const 1
+    leb_s(1, code);
+    code.push(0x7C); // i64.add
+    i64_store(0, code);
+    emit_store_cell_fields(name, &info, fields, scratch, env, code)?;
+    code.push(0x20); // local.get scratch  (result)
+    leb_u(scratch as u64, code);
+    code.push(0x05); // else
+    // --- fresh branch: scratch = __alloc(nfields) (sets rc=1, live++) ---
+    code.push(0x41); // i32.const nfields
+    leb_s(info.arity() as i64, code);
+    code.push(0x10); // call __alloc
+    leb_u(alloc as u64, code);
+    code.push(0x21); // local.set scratch
+    leb_u(scratch as u64, code);
+    emit_store_cell_fields(name, &info, fields, scratch, env, code)?;
+    code.push(0x20); // local.get scratch  (result)
+    leb_u(scratch as u64, code);
+    code.push(0x0B); // end
     Ok(WType::Ref)
 }
 
@@ -1004,9 +1127,25 @@ fn emit_iexpr(e: &IExpr, env: &mut LocalEnv, code: &mut Vec<u8>) -> Result<WType
             }
             emit_iexpr(body, env, code)
         }
-        IExpr::DropReuse(_, _, _) => Err(
-            "wasm backend: reuse tokens (`DropReuse`) are outside the 2b subset (deferred)".into(),
-        ),
+        IExpr::DropReuse(scrut, tok, body) => {
+            // Bind a fresh i32 local for the reuse token. If `scrut` is a Ref,
+            // `tok = __drop_reuse(scrut)` (the cell ptr if unique-and-dead, else
+            // 0). For a non-Ref scrutinee the cell can't be reused: tok = 0.
+            env.add_local(tok, WType::I32);
+            let tok_idx = env.var_index(tok)?;
+            if env.var_type(scrut)? == WType::Ref {
+                code.push(0x20); // local.get scrut
+                leb_u(env.var_index(scrut)? as u64, code);
+                code.push(0x10); // call __drop_reuse
+                leb_u(env.heap_index(HeapHelper::DropReuse) as u64, code);
+            } else {
+                code.push(0x41); // i32.const 0 (no reusable cell)
+                leb_s(0, code);
+            }
+            code.push(0x21); // local.set tok
+            leb_u(tok_idx as u64, code);
+            emit_iexpr(body, env, code)
+        }
     }
 }
 
@@ -1463,6 +1602,69 @@ fn emit_heap_helper(h: HeapHelper, ctors: &CtorTable, heap_base: u32) -> Vec<u8>
             i64_load(0, &mut body);
             helper_entry(&[], body)
         }
+        HeapHelper::DropReuse => {
+            // params: ptr(0). local: rc(1, i64).
+            // rc = i64.load[ptr] - 1; store back.
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body); // ptr (address)
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body); // ptr
+            i64_load(0, &mut body);
+            body.push(I64_CONST);
+            leb_s(1, &mut body);
+            body.push(I64_SUB);
+            body.push(LOCAL_TEE);
+            leb_u(1, &mut body); // rc (leave on stack for the store)
+            i64_store(0, &mut body);
+            // if rc == 0 { drop ref CHILDREN (per tag), KEEP this slot; return ptr }
+            // else { return 0 }.
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body); // rc
+            body.push(I64_EQZ);
+            body.push(IF);
+            body.push(0x7F); // blocktype result = i32 (the returned token)
+            // Per-tag dispatch: recursively drop each Ref child (reusing __drop's
+            // per-tag Ref-field knowledge), but DO NOT free or decrement __live
+            // for THIS cell — its slot is retained for reuse.
+            for info in ctor_infos_sorted(ctors) {
+                if info.ref_fields().is_empty() {
+                    continue; // no children to release for this tag
+                }
+                body.push(LOCAL_GET);
+                leb_u(0, &mut body); // ptr
+                i64_load(8, &mut body); // tag
+                body.push(I64_CONST);
+                leb_s(info.tag, &mut body);
+                body.push(I64_EQ);
+                body.push(IF);
+                body.push(BT_VOID);
+                for fi in info.ref_fields() {
+                    body.push(LOCAL_GET);
+                    leb_u(0, &mut body); // ptr
+                    i64_load(CELL_HEADER + SLOT * fi as u64, &mut body);
+                    body.push(I32_WRAP_I64); // child address
+                    body.push(CALL);
+                    leb_u(drop_idx as u64, &mut body);
+                    body.push(DROP); // dummy result
+                }
+                body.push(END); // end if tag==T
+            }
+            // token = ptr (slot retained for reuse)
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body); // ptr
+            body.push(ELSE);
+            // shared cell: just decremented; no reusable slot.
+            body.push(I32_CONST);
+            leb_s(0, &mut body); // token = 0 (null)
+            body.push(END); // end if rc==0
+            helper_entry(&[WType::I64], body)
+        }
+        HeapHelper::Reuses => {
+            body.push(I32_CONST);
+            leb_s(REUSES_ADDR as i64, &mut body);
+            i64_load(0, &mut body);
+            helper_entry(&[], body)
+        }
     }
 }
 
@@ -1477,49 +1679,6 @@ fn ctor_infos_sorted(ctors: &CtorTable) -> Vec<CtorInfo> {
 /// to avoid colliding with a same-named local variable.
 fn fn_index_key(name: &str) -> String {
     format!("\u{1}fn:{}", name)
-}
-
-/// Rewrite the (compiler-internal) in-place-reuse IR nodes into their
-/// allocation-based equivalents, so the 2b backend never sees them:
-///   * `DropReuse(scrut, _tok, body)` -> `Drop(scrut, body)` (the token is
-///     unused once reuse is disabled).
-///   * `CtorReuse(_tok, name, fields)` -> `Ctor(name, fields)` (always allocate
-///     fresh — exactly the empty-token fallback of the IR interpreter).
-/// Semantics are preserved (reuse is an optimization); only allocations differ.
-fn desugar_reuse(e: &IExpr) -> IExpr {
-    match e {
-        IExpr::Ret(a) => IExpr::Ret(a.clone()),
-        IExpr::Dup(v, b) => IExpr::Dup(v.clone(), Box::new(desugar_reuse(b))),
-        IExpr::Drop(v, b) => IExpr::Drop(v.clone(), Box::new(desugar_reuse(b))),
-        IExpr::DropReuse(scrut, _tok, b) => {
-            IExpr::Drop(scrut.clone(), Box::new(desugar_reuse(b)))
-        }
-        IExpr::Let(x, bind, body) => {
-            IExpr::Let(x.clone(), desugar_reuse_bind(bind), Box::new(desugar_reuse(body)))
-        }
-    }
-}
-
-fn desugar_reuse_bind(bind: &Bind) -> Bind {
-    match bind {
-        Bind::CtorReuse(_tok, name, fields) => Bind::Ctor(name.clone(), fields.clone()),
-        Bind::If(c, t, e) => Bind::If(
-            c.clone(),
-            Box::new(desugar_reuse(t)),
-            Box::new(desugar_reuse(e)),
-        ),
-        Bind::Match(s, arms) => Bind::Match(
-            s.clone(),
-            arms.iter()
-                .map(|a| ir::IArm {
-                    ctor: a.ctor.clone(),
-                    binders: a.binders.clone(),
-                    body: desugar_reuse(&a.body),
-                })
-                .collect(),
-        ),
-        other => other.clone(),
-    }
 }
 
 // ---- top-level driver ----------------------------------------------------
@@ -1566,24 +1725,13 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
     //    operations (Phase 2b: the compiled module manages a real heap, so it
     //    needs the dup/drop the IR interpreter relies on for garbage-freeness).
     let lowered: HashMap<String, IFn> = ir::lower_program(program)?;
-    let rced: HashMap<String, IFn> = crate::rc::insert_rc(&lowered);
-    // In-place cell reuse (`CtorReuse`/`DropReuse`, FBIP) is a later phase. The
-    // rc pass emits it opportunistically, but it is *semantically optional*:
-    // `DropReuse` degrades to a plain `Drop` and `CtorReuse` to a fresh `Ctor`
-    // (its empty-token fallback). Desugar them away so 2b stays correct and
-    // garbage-free without the in-place optimization.
-    let fns: HashMap<String, IFn> = rced
-        .into_iter()
-        .map(|(n, f)| {
-            (
-                n,
-                IFn {
-                    params: f.params,
-                    body: desugar_reuse(&f.body),
-                },
-            )
-        })
-        .collect();
+    // In-place cell reuse (FBIP): the rc pass opportunistically emits
+    // `DropReuse`/`CtorReuse` pairs (always same-arity ctors), and codegen now
+    // exploits them — a `match` that consumes a UNIQUE cell and rebuilds a
+    // same-arity constructor reuses that cell's memory in place, matching the IR
+    // interpreter. A shared cell yields a null token, so `CtorReuse` falls back
+    // to a fresh allocation; either way the heap stays garbage-free.
+    let fns: HashMap<String, IFn> = crate::rc::insert_rc(&lowered);
 
     // Helper function indices come after every user function:
     //   [user fns...] [overflow helpers x4] [heap helpers x5]
@@ -1729,12 +1877,13 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
         section(5, &content, &mut out);
     }
 
-    // Export section (id 7): `main`, `__live`, and `memory`.
+    // Export section (id 7): `main`, `__live`, `__reuses`, and `memory`.
     {
         let main_idx = fn_index["main"];
         let live_idx = heap_base + HeapHelper::Live.offset();
+        let reuses_idx = heap_base + HeapHelper::Reuses.offset();
         let mut content = Vec::new();
-        leb_u(3, &mut content); // three exports
+        leb_u(4, &mut content); // four exports
         // main (func)
         let n = b"main";
         leb_u(n.len() as u64, &mut content);
@@ -1747,6 +1896,12 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
         content.extend_from_slice(n);
         content.push(0x00);
         leb_u(live_idx as u64, &mut content);
+        // __reuses (func)
+        let n = b"__reuses";
+        leb_u(n.len() as u64, &mut content);
+        content.extend_from_slice(n);
+        content.push(0x00);
+        leb_u(reuses_idx as u64, &mut content);
         // memory (mem index 0)
         let n = b"memory";
         leb_u(n.len() as u64, &mut content);
@@ -2147,5 +2302,112 @@ mod tests {
              fn pick(b: Bool, xs: L) -> Int = if b { match xs { Nil => 0, Cons(h, r) => h, } } else { 99 }\n\
              fn main() -> Int = pick(false, Cons(5, Cons(6, Nil)))",
         );
+    }
+
+    // ---- Phase 2c: in-place cell REUSE (FBIP) ---------------------------
+
+    /// Run the compiled wasm under Node, returning `(main_result, live, reuses)`
+    /// from the exported `main`/`__live`/`__reuses`.
+    fn run_wasm_reuses(bytes: &[u8]) -> Result<(String, i64, i64), String> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "aria_wasm_reuse_{}_{}.wasm",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
+        let script = format!(
+            "const fs=require('fs');\
+             const b=fs.readFileSync({:?});\
+             WebAssembly.instantiate(b).then(r=>{{\
+             const m=String(r.instance.exports.main());\
+             const l=String(r.instance.exports.__live());\
+             const u=String(r.instance.exports.__reuses());\
+             process.stdout.write(m+'|'+l+'|'+u);\
+             }}).catch(e=>process.stdout.write('TRAP|0|0'));",
+            path.to_string_lossy()
+        );
+        let out = Command::new("node")
+            .arg("-e")
+            .arg(&script)
+            .output()
+            .map_err(|e| e.to_string())?;
+        let _ = std::fs::remove_file(&path);
+        let s = String::from_utf8_lossy(&out.stdout).to_string();
+        let mut it = s.splitn(3, '|');
+        let res = it.next().ok_or("bad harness output")?.to_string();
+        let live = it.next().and_then(|x| x.parse::<i64>().ok()).unwrap_or(-1);
+        let reuses = it.next().and_then(|x| x.parse::<i64>().ok()).unwrap_or(-1);
+        Ok((res, live, reuses))
+    }
+
+    #[test]
+    fn reuse_unique_list_map_reuses_cells_in_place() {
+        // A unique list mapped element-wise (`inc`): the `match`/rebuild reuses
+        // each consumed Cons cell in place. With a 30-element list, `inc` must
+        // reuse >= 30 cells, the wasm result must equal the interpreter, and the
+        // heap must end garbage-free (`__live == 0`).
+        let src = "type L = | Nil | Cons(Int, L)\n\
+                   fn rng(n: Int, a: L) -> L = if n == 0 { a } else { rng(n - 1, Cons(n, a)) }\n\
+                   fn inc(xs: L) -> L = match xs { Nil => Nil, Cons(h, r) => Cons(h + 1, inc(r)), }\n\
+                   fn sum(xs: L) -> Int = match xs { Nil => 0, Cons(h, r) => h + sum(r), }\n\
+                   fn main() -> Int = sum(inc(rng(30, Nil)))";
+        let interp = interp_result(src).expect("interpreter should succeed");
+        let bytes = compile_src(src).expect("compile should succeed");
+        if !node_available() {
+            return;
+        }
+        let (wasm, live, reuses) = run_wasm_reuses(&bytes).expect("running wasm");
+        assert_eq!(interp, wasm, "wasm != interpreter for unique-list map");
+        assert_eq!(live, 0, "leak: {} live cell(s) after unique-list map", live);
+        assert!(
+            reuses >= 30,
+            "expected >= 30 in-place reuses (list length), got {}",
+            reuses
+        );
+    }
+
+    #[test]
+    fn reuse_shared_list_does_not_wrongly_reuse() {
+        // `xs` is consumed twice (by `inc` AND `len`), so it is shared: the rc
+        // pass dups it, `__drop_reuse` returns null while it is still referenced,
+        // and `CtorReuse` must allocate fresh. The result must still match the
+        // interpreter and the heap must end garbage-free.
+        let src = "type L = | Nil | Cons(Int, L)\n\
+                   fn rng(n: Int, a: L) -> L = if n == 0 { a } else { rng(n - 1, Cons(n, a)) }\n\
+                   fn inc(xs: L) -> L = match xs { Nil => Nil, Cons(h, r) => Cons(h + 1, inc(r)), }\n\
+                   fn len(xs: L) -> Int = match xs { Nil => 0, Cons(h, r) => 1 + len(r), }\n\
+                   fn sum(xs: L) -> Int = match xs { Nil => 0, Cons(h, r) => h + sum(r), }\n\
+                   fn use_shared(xs: L) -> Int = sum(inc(xs)) + len(xs)\n\
+                   fn main() -> Int = use_shared(rng(10, Nil))";
+        let interp = interp_result(src).expect("interpreter should succeed");
+        let bytes = compile_src(src).expect("compile should succeed");
+        if !node_available() {
+            return;
+        }
+        let (wasm, live, _reuses) = run_wasm_reuses(&bytes).expect("running wasm");
+        assert_eq!(interp, wasm, "wasm != interpreter for shared list");
+        assert_eq!(live, 0, "leak: {} live cell(s) after shared-list use", live);
+    }
+
+    #[test]
+    fn reuse_tree_map_is_garbage_free() {
+        // A unique binary tree rebuilt node-for-node (same-arity `Node` reuse):
+        // reuses fire for the interior nodes and the heap ends garbage-free.
+        let src = "type T = | Leaf | Node(T, Int, T)\n\
+                   fn build(n: Int) -> T = if n == 0 { Leaf } else { Node(build(n - 1), n, build(n - 1)) }\n\
+                   fn inc(t: T) -> T = match t { Leaf => Leaf, Node(l, v, r) => Node(inc(l), v + 1, inc(r)), }\n\
+                   fn total(t: T) -> Int = match t { Leaf => 0, Node(l, v, r) => total(l) + v + total(r), }\n\
+                   fn main() -> Int = total(inc(build(4)))";
+        let interp = interp_result(src).expect("interpreter should succeed");
+        let bytes = compile_src(src).expect("compile should succeed");
+        if !node_available() {
+            return;
+        }
+        let (wasm, live, reuses) = run_wasm_reuses(&bytes).expect("running wasm");
+        assert_eq!(interp, wasm, "wasm != interpreter for unique-tree map");
+        assert_eq!(live, 0, "leak: {} live cell(s) after unique-tree map", live);
+        assert!(reuses > 0, "expected in-place node reuse, got {}", reuses);
     }
 }
