@@ -13,7 +13,7 @@
 
 #![cfg(test)]
 
-use crate::{interp, ir, lexer, parser, rc, typeck};
+use crate::{interp, ir, lexer, parser, rc, typeck, wasm};
 
 // ---------------------------------------------------------------------------
 // Tiny deterministic PRNG (a 64-bit linear congruential generator).
@@ -78,11 +78,19 @@ struct Gen<'a> {
     scope: Vec<(String, Ty)>,
     /// Monotonic counter for fresh variable names.
     fresh: usize,
+    /// When true, the generator stays within the wasm 2a/2b subset: only
+    /// Int/Bool/IntList types are introduced (no Float/String). Used by the
+    /// compiled-backend differential fuzz so most seeds actually reach codegen.
+    wasm_subset: bool,
 }
 
 impl<'a> Gen<'a> {
     fn new(rng: &'a mut Lcg) -> Self {
-        Gen { rng, scope: Vec::new(), fresh: 0 }
+        Gen { rng, scope: Vec::new(), fresh: 0, wasm_subset: false }
+    }
+
+    fn new_wasm(rng: &'a mut Lcg) -> Self {
+        Gen { rng, scope: Vec::new(), fresh: 0, wasm_subset: true }
     }
 
     fn fresh_name(&mut self) -> String {
@@ -177,6 +185,15 @@ impl<'a> Gen<'a> {
     }
 
     fn random_ty(&mut self) -> Ty {
+        if self.wasm_subset {
+            // Restricted universe: no Float/String so generated programs stay
+            // inside the wasm backend's compilable subset.
+            return match self.rng.below(3) {
+                0 => Ty::Int,
+                1 => Ty::Bool,
+                _ => Ty::List,
+            };
+        }
         match self.rng.below(5) {
             0 => Ty::Int,
             1 => Ty::Bool,
@@ -315,6 +332,16 @@ impl<'a> Gen<'a> {
 fn gen_program(seed: u64) -> String {
     let mut rng = Lcg::new(seed);
     let mut g = Gen::new(&mut rng);
+    let body = g.expr(Ty::Int, 4);
+    format!("{}fn main() -> Int = {}\n", PRELUDE, body)
+}
+
+/// Like [`gen_program`] but restricted to the wasm backend's compilable subset
+/// (Int/Bool/IntList only — no Float/String), so a large fraction of seeds
+/// actually reach codegen instead of being rejected as out-of-subset.
+fn gen_program_wasm(seed: u64) -> String {
+    let mut rng = Lcg::new(seed);
+    let mut g = Gen::new_wasm(&mut rng);
     let body = g.expr(Ty::Int, 4);
     format!("{}fn main() -> Int = {}\n", PRELUDE, body)
 }
@@ -608,4 +635,136 @@ fn codec_fuzz_roundtrip_and_no_panic() {
 
     std::panic::set_hook(prev_hook);
     assert!(failures.is_empty(), "codec fuzz failures:\n{}", failures.join("\n"));
+}
+
+// ---------------------------------------------------------------------------
+// 6) Compiled-backend differential: WASM (via Node) vs. interpreter (oracle).
+// ---------------------------------------------------------------------------
+
+/// True iff `node --version` succeeds; mirrors the gate in `wasm.rs` tests so
+/// the suite skips gracefully (never fails) when Node is unavailable.
+fn node_available() -> bool {
+    std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Run compiled wasm under Node, returning `(main_result, live_cells)`.
+/// `live` is the value of the exported `__live()` after `main` returns; a TRAP
+/// (e.g. an overflow `unreachable`) surfaces as `("TRAP", _)`. Mirrors the
+/// minimal Node invocation used by the `wasm.rs` tests' `run_wasm_live`.
+fn run_wasm_live(bytes: &[u8]) -> Result<(String, i64), String> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let path = std::env::temp_dir().join(format!(
+        "aria_proptest_wasm_{}_{}.wasm",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
+    let script = format!(
+        "const fs=require('fs');\
+         const b=fs.readFileSync({:?});\
+         WebAssembly.instantiate(b).then(r=>{{\
+         const m=String(r.instance.exports.main());\
+         const l=String(r.instance.exports.__live());\
+         process.stdout.write(m+'|'+l);\
+         }}).catch(e=>process.stdout.write('TRAP|0'));",
+        path.to_string_lossy()
+    );
+    let out = std::process::Command::new("node")
+        .arg("-e")
+        .arg(&script)
+        .output()
+        .map_err(|e| e.to_string())?;
+    let _ = std::fs::remove_file(&path);
+    let s = String::from_utf8_lossy(&out.stdout).to_string();
+    let (res, live) = s.split_once('|').ok_or("bad harness output")?;
+    Ok((res.to_string(), live.parse::<i64>().unwrap_or(-1)))
+}
+
+#[test]
+fn wasm_matches_interpreter_fuzz() {
+    // Node-gated: skip the whole test gracefully if Node is missing.
+    if !node_available() {
+        return;
+    }
+
+    // Keep it fast: each compiled seed shells out to Node, so we sample a
+    // bounded number of seeds. The wasm-subset generator keeps most of them
+    // compilable.
+    const SEEDS: u64 = 120;
+    let mut skipped = 0u64; // not well-typed, or out-of-wasm-subset
+    let mut overflow = 0u64; // interpreter overflow -> wasm traps (expected)
+    let mut checked = 0u64; // actually exercised through wasm + compared
+
+    for seed in 0..SEEDS {
+        let src = gen_program_wasm(seed);
+        if !well_typed(&src) {
+            skipped += 1;
+            continue;
+        }
+
+        let bytes = match wasm::compile(
+            &parser::parse(lexer::lex(&src).expect("lex")).expect("parse"),
+        ) {
+            Ok(b) => b,
+            // Out-of-subset (Float/String/etc.) is expected, not a failure.
+            Err(_) => {
+                skipped += 1;
+                continue;
+            }
+        };
+
+        // Oracle: the tree-walking interpreter. Overflow is a *defined error*
+        // in Aria; the interpreter returns Err while wasm traps. When the
+        // interpreter errors we can't meaningfully compare a value, so we skip
+        // (but still confirm wasm trapped rather than producing a bogus value).
+        let interp = ast_run(&src);
+        let (wasm_res, live) = run_wasm_live(&bytes)
+            .unwrap_or_else(|e| panic!("seed {}: node runner failed: {}\n{}", seed, e, src));
+
+        match interp {
+            Ok(expected) => {
+                assert_eq!(
+                    expected, wasm_res,
+                    "seed {}: wasm != interpreter\n--- program ---\n{}\n--- interp={:?} wasm={:?}",
+                    seed, src, expected, wasm_res
+                );
+                assert_eq!(
+                    live, 0,
+                    "seed {}: wasm leaked {} live cell(s)\n--- program ---\n{}",
+                    seed, live, src
+                );
+                checked += 1;
+            }
+            Err(_) => {
+                // Interpreter errored (overflow). Wasm must trap, not silently
+                // return a wrapped value.
+                assert_eq!(
+                    wasm_res, "TRAP",
+                    "seed {}: interpreter errored but wasm did not trap (={:?})\n{}",
+                    seed, wasm_res, src
+                );
+                overflow += 1;
+            }
+        }
+    }
+
+    eprintln!(
+        "wasm_matches_interpreter_fuzz: {} seeds -> {} checked, {} overflow-trap, {} skipped",
+        SEEDS, checked, overflow, skipped
+    );
+
+    // Guard against vacuous success: a healthy number of seeds must have run
+    // all the way through wasm and agreed with the interpreter.
+    assert!(
+        checked >= 20,
+        "too few programs exercised through wasm: {} (skipped {}, overflow {})",
+        checked,
+        skipped,
+        overflow
+    );
 }
