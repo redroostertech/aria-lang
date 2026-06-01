@@ -7,10 +7,12 @@
 //! (an ADT constructor) and every intermediate value is named, so later passes
 //! can insert `dup`/`drop` reference-count operations and reuse analysis.
 //!
-//! Scope of this stage: the *functional subset* — `Int`, `Bool`, algebraic data
-//! types, `let`, `if`, `match`, calls, and arithmetic. Only ADT cells are
-//! heap-allocated; `Int`/`Bool`/`Unit` are unboxed. Strings/floats/tensors are
-//! out of scope for the memory POC (they don't change the RC story).
+//! Scope of this stage: the *functional subset* — `Int`, `Bool`, `Float`,
+//! `String`, algebraic data types, `let`, `if`, `match`, calls, and arithmetic.
+//! Only ADT cells are heap-allocated and reference-counted; `Int`/`Bool`/
+//! `Float`/`String`/`Unit` are unboxed value types and so are never `dup`/
+//! `drop`ed (a `String` in an ADT field is freed by Rust when its cell is).
+//! Tensors/RAG remain out of scope (they involve the opaque Tensor type).
 //!
 //! Stage 1 (this module today): lowering + an IR interpreter that is
 //! differentially checked against the tree-walker, plus heap-allocation
@@ -25,7 +27,9 @@ use crate::ast::{BinOp, Expr, Item, Pattern, Program, Stmt, UnOp};
 pub enum Atom {
     Var(String),
     Int(i64),
+    Float(f64),
     Bool(bool),
+    Str(String),
     Unit,
 }
 
@@ -110,12 +114,11 @@ impl Lowerer {
     fn lower(&mut self, e: &Expr, stmts: &mut Vec<(String, Bind)>) -> Result<Atom, LowerError> {
         match e {
             Expr::Int(n) => Ok(Atom::Int(*n)),
+            Expr::Float(f) => Ok(Atom::Float(*f)),
             Expr::Bool(b) => Ok(Atom::Bool(*b)),
+            Expr::Str(s) => Ok(Atom::Str(s.clone())),
             Expr::Unit => Ok(Atom::Unit),
             Expr::Var(n) => Ok(Atom::Var(n.clone())),
-            Expr::Float(_) | Expr::Str(_) => Err(LowerError(
-                "IR subset is Int/Bool/ADT only (no Float/String yet)".into(),
-            )),
 
             Expr::Binary(op, l, r) => {
                 // Short-circuit `&&` / `||` must NOT evaluate the rhs eagerly —
@@ -309,7 +312,9 @@ pub fn lower_program(program: &Program) -> Result<HashMap<String, IFn>, String> 
 #[derive(Debug, Clone)]
 pub enum IValue {
     Int(i64),
+    Float(f64),
     Bool(bool),
+    Str(String),
     Unit,
     /// A heap reference to an ADT cell.
     Ref(usize),
@@ -375,7 +380,10 @@ impl IrInterp {
     pub fn render(&self, v: &IValue) -> String {
         match v {
             IValue::Int(n) => n.to_string(),
+            // Match interp::Value::display exactly so the cross-check passes.
+            IValue::Float(f) => format!("{}", f),
             IValue::Bool(b) => b.to_string(),
+            IValue::Str(s) => s.clone(),
             IValue::Unit => "()".to_string(),
             IValue::Token(_) => "<token>".to_string(), // never a program result
             IValue::Ref(a) => {
@@ -393,7 +401,9 @@ impl IrInterp {
     fn atom(&self, a: &Atom, env: &Env) -> Result<IValue, String> {
         Ok(match a {
             Atom::Int(n) => IValue::Int(*n),
+            Atom::Float(f) => IValue::Float(*f),
             Atom::Bool(b) => IValue::Bool(*b),
+            Atom::Str(s) => IValue::Str(s.clone()),
             Atom::Unit => IValue::Unit,
             Atom::Var(n) => env.get(n).cloned().ok_or_else(|| format!("ir: unbound {}", n))?,
         })
@@ -619,6 +629,35 @@ impl IrInterp {
                 }
                 _ => Err("ir: print_int expects Int".into()),
             },
+            "print_float" => match args {
+                [IValue::Float(f)] => {
+                    println!("{}", f);
+                    Ok(Some(IValue::Unit))
+                }
+                _ => Err("ir: print_float expects Float".into()),
+            },
+            "print_bool" => match args {
+                [IValue::Bool(b)] => {
+                    println!("{}", b);
+                    Ok(Some(IValue::Unit))
+                }
+                _ => Err("ir: print_bool expects Bool".into()),
+            },
+            "print_str" => match args {
+                [IValue::Str(s)] => {
+                    println!("{}", s);
+                    Ok(Some(IValue::Unit))
+                }
+                _ => Err("ir: print_str expects String".into()),
+            },
+            "concat" => match args {
+                [IValue::Str(a), IValue::Str(b)] => Ok(Some(IValue::Str(format!("{}{}", a, b)))),
+                _ => Err("ir: concat expects two Strings".into()),
+            },
+            "int_to_str" => match args {
+                [IValue::Int(n)] => Ok(Some(IValue::Str(n.to_string()))),
+                _ => Err("ir: int_to_str expects Int".into()),
+            },
             _ => Ok(None),
         }
     }
@@ -652,12 +691,33 @@ fn prim(op: BinOp, x: IValue, y: IValue) -> Result<IValue, String> {
             Ge => Bool(a >= b),
             And | Or => return Err("ir: logical op on Int".into()),
         }),
+        // Float arithmetic mirrors interp::float_op: Div by 0.0 yields
+        // infinity/NaN (NOT an error), and there is no float `Mod`.
+        (Float(a), Float(b)) => Ok(match op {
+            Add => Float(a + b),
+            Sub => Float(a - b),
+            Mul => Float(a * b),
+            Div => Float(a / b),
+            Eq => Bool(a == b),
+            Ne => Bool(a != b),
+            Lt => Bool(a < b),
+            Le => Bool(a <= b),
+            Gt => Bool(a > b),
+            Ge => Bool(a >= b),
+            Mod | And | Or => return Err("ir: bad float op".into()),
+        }),
         (Bool(a), Bool(b)) => Ok(match op {
             And => Bool(a && b),
             Or => Bool(a || b),
             Eq => Bool(a == b),
             Ne => Bool(a != b),
             _ => return Err("ir: bad bool op".into()),
+        }),
+        // Strings support only equality (matching interp::values_equal).
+        (Str(a), Str(b)) => Ok(match op {
+            Eq => Bool(a == b),
+            Ne => Bool(a != b),
+            _ => return Err("ir: bad string op".into()),
         }),
         _ => Err("ir: prim type mismatch".into()),
     }
@@ -770,6 +830,36 @@ mod tests {
     #[test]
     fn add_overflow_errors_in_both() {
         differential("fn main() -> Int = 9223372036854775807 + 1");
+    }
+
+    // ---- Float / String subset -----------------------------------------
+
+    #[test]
+    fn float_arithmetic_matches_interpreter() {
+        // Float add/mul/div + a comparison; IR result must equal the interp's.
+        differential("fn area(r: Float) -> Float = 3.14159 * r * r\nfn main() -> Float = area(2.0) / 2.0");
+    }
+
+    #[test]
+    fn string_concat_and_int_to_str_matches_interpreter() {
+        differential("fn main() -> String = concat(\"x = \", int_to_str(6 * 7))");
+    }
+
+    #[test]
+    fn adt_with_string_fields_is_garbage_free() {
+        // A list of records carrying String fields: after the run returns an
+        // Int, every ADT cell (including those holding Strings) must be freed.
+        let src = "type Rec = | R(String, Int)\n\
+                   type L = | Nil | Cons(Rec, L)\n\
+                   fn count(xs: L) -> Int = match xs { Nil => 0, Cons(_, r) => 1 + count(r), }\n\
+                   fn main() -> Int = count(Cons(R(\"a\", 1), Cons(R(\"b\", 2), Nil)))";
+        differential(src);
+        let prog = parser::parse(lexer::lex(src).unwrap()).unwrap();
+        typeck::check(&prog).unwrap();
+        let fns = crate::rc::insert_rc(&lower_program(&prog).unwrap());
+        let mut ir = IrInterp::new(fns);
+        ir.run_main().unwrap();
+        assert_eq!(ir.metrics.live, 0, "all String-carrying ADT cells must be freed");
     }
 
     #[test]
