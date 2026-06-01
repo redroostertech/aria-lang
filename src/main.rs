@@ -211,11 +211,15 @@ fn run_wasm_run(args: &[String]) -> ExitCode {
         eprintln!("error: cannot write temp wasm: {}", e);
         return ExitCode::FAILURE;
     }
+    // Run `main`, print its result to stdout, and (for Phase 2b heap programs
+    // that export `__live`) report the live-cell count on stderr so leaks are
+    // visible. A wasm trap surfaces as `TRAP`, matching the interpreter's `Err`.
     let script = format!(
         "const fs=require('fs');\
          try{{const b=fs.readFileSync({:?});\
          WebAssembly.instantiate(b).then(r=>{{\
-         try{{process.stdout.write(String(r.instance.exports.main()));}}\
+         try{{process.stdout.write(String(r.instance.exports.main()));\
+         if(r.instance.exports.__live){{process.stderr.write('__live='+String(r.instance.exports.__live()));}}}}\
          catch(e){{process.stdout.write('TRAP');}}\
          }}).catch(e=>{{process.stdout.write('TRAP');}});}}\
          catch(e){{process.stdout.write('TRAP');}}",
@@ -228,6 +232,10 @@ fn run_wasm_run(args: &[String]) -> ExitCode {
             use std::io::Write;
             let _ = std::io::stdout().write_all(&o.stdout);
             println!();
+            // Forward the `__live=` diagnostic (if any) to stderr.
+            if !o.stderr.is_empty() {
+                eprintln!("{}", String::from_utf8_lossy(&o.stderr));
+            }
             ExitCode::SUCCESS
         }
         Ok(o) => {
