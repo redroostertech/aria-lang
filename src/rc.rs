@@ -240,11 +240,15 @@ fn rc(e: &IExpr, live: &HashSet<String>) -> IExpr {
                             .collect();
                         let mut ab = rc(&arm.body, &after);
                         ab = with_drops(drop_set, ab);
-                        // Is the scrutinee still owned/needed after the match?
-                        // If so we BORROW it (keep it alive); otherwise we CONSUME
-                        // it (release the matched cell here).
-                        let scrut_live_after =
-                            sname.as_ref().map_or(false, |s| after.contains(s));
+                        // Is the scrutinee still owned/needed after the match, OR
+                        // re-used inside this very arm body (e.g. a nested `match
+                        // v { .. }` or `f(v)` on the same variable)? If so we
+                        // BORROW it (keep it alive); otherwise we CONSUME it
+                        // (release the matched cell here). Failing to account for
+                        // an in-arm re-use would free a cell the body still reads.
+                        let scrut_live_after = sname
+                            .as_ref()
+                            .map_or(false, |s| after.contains(s) || arm_body_fv.contains(s));
                         match &arm.ctor {
                             Some(_) => {
                                 if !scrut_live_after {

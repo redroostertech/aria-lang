@@ -20,6 +20,8 @@ mod neural_codec;
 mod pack;
 mod parser;
 mod predict;
+#[cfg(test)]
+mod proptest;
 mod rag;
 mod rc;
 mod rans;
