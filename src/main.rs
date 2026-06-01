@@ -6,6 +6,8 @@
 //!   aria pack  <in> <out>           compress any file (rANS entropy coder)
 //!   aria unpack <in> <out>          decompress an Aria-packed file
 //!   aria bench                      run the compression benchmark
+//!   aria wasm   <file.aria> <out>   compile the pure Int/Bool subset to wasm
+//!   aria wasm-run <file.aria>       compile to wasm and run it via Node
 
 // Many runtime modules expose library-style APIs not all wired into the CLI yet.
 #![allow(dead_code)]
@@ -30,13 +32,14 @@ mod tensor;
 mod tensor_ext;
 mod transformer;
 mod typeck;
+mod wasm;
 
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: aria <run|check|ast|pack|unpack|npack|nunpack|bench|demo|mem> [args...]");
+        eprintln!("usage: aria <run|check|ast|pack|unpack|npack|nunpack|bench|demo|mem|wasm|wasm-run> [args...]");
         return ExitCode::from(2);
     }
 
@@ -52,6 +55,8 @@ fn main() -> ExitCode {
         }
         "demo" => run_demo(args.get(2).map(|s| s.as_str())),
         "mem" => run_mem(&args),
+        "wasm" => run_wasm_compile(&args),
+        "wasm-run" => run_wasm_run(&args),
         other => {
             eprintln!("unknown command `{}`", other);
             ExitCode::from(2)
@@ -153,6 +158,84 @@ fn run_mem(args: &[String]) -> ExitCode {
         }
         (Ok(_), Err(e)) => {
             eprintln!("interpreter error (ir succeeded): {}", e);
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Parse + type-check a file and compile it to a WebAssembly binary (subset 2a).
+fn compile_to_wasm(path: &str) -> Result<Vec<u8>, String> {
+    let src = std::fs::read_to_string(path).map_err(|e| format!("cannot read {}: {}", path, e))?;
+    let prog = lexer::lex(&src).and_then(parser::parse)?;
+    typeck::check(&prog).map_err(|errs| errs.join("; "))?;
+    wasm::compile(&prog)
+}
+
+/// `aria wasm <file.aria> <out.wasm>`: compile and write the wasm binary.
+fn run_wasm_compile(args: &[String]) -> ExitCode {
+    if args.len() < 4 {
+        eprintln!("usage: aria wasm <file.aria> <out.wasm>");
+        return ExitCode::from(2);
+    }
+    let bytes = match compile_to_wasm(&args[2]) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(e) = std::fs::write(&args[3], &bytes) {
+        eprintln!("error: cannot write {}: {}", args[3], e);
+        return ExitCode::FAILURE;
+    }
+    eprintln!("wrote {} ({} bytes)", args[3], bytes.len());
+    ExitCode::SUCCESS
+}
+
+/// `aria wasm-run <file.aria>`: compile to a temp .wasm, run it under Node, and
+/// print `main`'s result (or `TRAP` on a wasm trap such as div-by-zero).
+fn run_wasm_run(args: &[String]) -> ExitCode {
+    if args.len() < 3 {
+        eprintln!("usage: aria wasm-run <file.aria>");
+        return ExitCode::from(2);
+    }
+    let bytes = match compile_to_wasm(&args[2]) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+    let path = std::env::temp_dir().join(format!("aria_{}.wasm", std::process::id()));
+    if let Err(e) = std::fs::write(&path, &bytes) {
+        eprintln!("error: cannot write temp wasm: {}", e);
+        return ExitCode::FAILURE;
+    }
+    let script = format!(
+        "const fs=require('fs');\
+         try{{const b=fs.readFileSync({:?});\
+         WebAssembly.instantiate(b).then(r=>{{\
+         try{{process.stdout.write(String(r.instance.exports.main()));}}\
+         catch(e){{process.stdout.write('TRAP');}}\
+         }}).catch(e=>{{process.stdout.write('TRAP');}});}}\
+         catch(e){{process.stdout.write('TRAP');}}",
+        path.to_string_lossy()
+    );
+    let out = std::process::Command::new("node").arg("-e").arg(&script).output();
+    let _ = std::fs::remove_file(&path);
+    match out {
+        Ok(o) if o.status.success() => {
+            use std::io::Write;
+            let _ = std::io::stdout().write_all(&o.stdout);
+            println!();
+            ExitCode::SUCCESS
+        }
+        Ok(o) => {
+            eprintln!("node error: {}", String::from_utf8_lossy(&o.stderr));
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("error: could not run node (is it installed?): {}", e);
             ExitCode::FAILURE
         }
     }

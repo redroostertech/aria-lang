@@ -179,8 +179,9 @@ without touching the parser or AST.
 - [x] Compile-time tensor shape checking — *standalone prototype* (`src/shape.rs`, run via `aria demo shape`); not yet wired into the language's own type checker
 - [x] Wire predictor + arithmetic coder into an end-to-end neural codec (`aria npack`)
 - [ ] Add a match model / higher-order contexts (beat gzip), then a transformer predictor
+- [x] **WASM backend (Phase 2a)** — compiles the pure Int/Bool/function subset to a real `.wasm` binary (hand-emitted), runs via Node, differentially tested vs the interpreter (`aria wasm` / `aria wasm-run`)
+- [ ] WASM Phase 2b — heap data (ADTs/strings) on linear memory, lowering the Perceus memory model
 - [ ] Effect / capability system
-- [ ] WASM backend
 - [ ] Native backend (Cranelift or LLVM)
 - [ ] GBNF grammar export for constrained decoding
 - [ ] Structured, machine-parseable compiler diagnostics
