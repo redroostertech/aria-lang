@@ -116,16 +116,28 @@ fn run_mem(args: &[String]) -> ExitCode {
     let (ir_res, ast_res, m) = outcome;
     match (&ir_res, &ast_res) {
         (Ok(ir), Ok(ast)) if ir == ast => {
+            let gross = m.allocations + m.reuses;
             eprintln!("ir == interpreter: {} (agree)", ir);
-            eprintln!("allocations: {}  frees: {}  peak live: {}  (dups: {}, drops: {})",
-                m.allocations, m.frees, m.peak_live, m.dups, m.drops);
-            // Result is a non-heap value iff every cell was freed; then we can
-            // assert garbage-freeness directly.
-            let leaked = m.allocations - m.frees;
-            if leaked == 0 {
-                eprintln!("garbage-free: yes (all {} cells freed, no leaks)", m.allocations);
+            eprintln!(
+                "fresh allocations: {}  in-place reuses: {}  gross (no reuse): {}",
+                m.allocations, m.reuses, gross
+            );
+            eprintln!(
+                "frees: {}  peak live: {}  (dups: {}, drops: {})",
+                m.frees, m.peak_live, m.dups, m.drops
+            );
+            if m.live == 0 {
+                eprintln!("garbage-free: yes (no cells live at exit)");
+                if m.reuses > 0 && gross > 0 {
+                    eprintln!(
+                        "reuse eliminated {:.1}% of allocations ({} of {})",
+                        100.0 * m.reuses as f64 / gross as f64,
+                        m.reuses,
+                        gross
+                    );
+                }
             } else {
-                eprintln!("{} cell(s) still live (reachable from the result)", leaked);
+                eprintln!("{} cell(s) still live (reachable from the result)", m.live);
             }
             ExitCode::SUCCESS
         }

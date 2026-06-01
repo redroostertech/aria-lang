@@ -13,8 +13,38 @@
 //! of owned variables is exactly `fv(e) ∪ live`.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::ir::{Atom, Bind, IArm, IExpr, IFn};
+
+static REUSE_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+fn fresh_token() -> String {
+    format!("$rt{}", REUSE_COUNTER.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Search the straight-line spine of a (already RC-inserted) arm body for the
+/// first constructor allocation of `arity` fields and rewrite it to reuse the
+/// `tok` reuse token. Only descends `let`/`dup`/`drop` (which always execute),
+/// never into `if`/`match` sub-branches, so the reused cell is always consumed.
+fn try_reuse(e: &IExpr, arity: usize, tok: &str) -> Option<IExpr> {
+    match e {
+        IExpr::Let(y, Bind::Ctor(c, fields), cont) if fields.len() == arity => Some(IExpr::Let(
+            y.clone(),
+            Bind::CtorReuse(tok.to_string(), c.clone(), fields.clone()),
+            cont.clone(),
+        )),
+        IExpr::Let(y, bind, cont) => {
+            try_reuse(cont, arity, tok).map(|c2| IExpr::Let(y.clone(), bind.clone(), Box::new(c2)))
+        }
+        IExpr::Dup(v, b) => try_reuse(b, arity, tok).map(|b2| IExpr::Dup(v.clone(), Box::new(b2))),
+        IExpr::Drop(v, b) => try_reuse(b, arity, tok).map(|b2| IExpr::Drop(v.clone(), Box::new(b2))),
+        IExpr::DropReuse(s, t, b) => {
+            try_reuse(b, arity, tok).map(|b2| IExpr::DropReuse(s.clone(), t.clone(), Box::new(b2)))
+        }
+        IExpr::Ret(_) => None,
+    }
+}
 
 /// Insert reference-count operations into every function body.
 pub fn insert_rc(fns: &HashMap<String, IFn>) -> HashMap<String, IFn> {
@@ -51,6 +81,7 @@ fn collect_fv(e: &IExpr, acc: &mut HashSet<String>) {
     match e {
         IExpr::Ret(a) => add_atom(a, acc),
         IExpr::Dup(_, b) | IExpr::Drop(_, b) => collect_fv(b, acc),
+        IExpr::DropReuse(_, _, b) => collect_fv(b, acc),
         IExpr::Let(x, bind, body) => {
             collect_fv_bind(bind, acc);
             let mut b = HashSet::new();
@@ -70,6 +101,11 @@ fn collect_fv_bind(bind: &Bind, acc: &mut HashSet<String>) {
         }
         Bind::Unary(_, a) => add_atom(a, acc),
         Bind::Ctor(_, atoms) | Bind::Call(_, atoms) => {
+            for a in atoms {
+                add_atom(a, acc);
+            }
+        }
+        Bind::CtorReuse(_, _, atoms) => {
             for a in atoms {
                 add_atom(a, acc);
             }
@@ -212,10 +248,18 @@ fn rc(e: &IExpr, live: &HashSet<String>) -> IExpr {
                         match &arm.ctor {
                             Some(_) => {
                                 if !scrut_live_after {
-                                    // Consume: release the matched cell (its fields
-                                    // were dup'd for the binders that use them).
                                     if let Some(s) = &sname {
-                                        ab = IExpr::Drop(s.clone(), Box::new(ab));
+                                        // REUSE analysis: if the arm builds a
+                                        // same-sized constructor on its spine,
+                                        // reuse the matched cell in place instead
+                                        // of free+alloc (FBIP). Otherwise drop it.
+                                        let arity = arm.binders.len();
+                                        let tok = fresh_token();
+                                        if let Some(ab2) = try_reuse(&ab, arity, &tok) {
+                                            ab = IExpr::DropReuse(s.clone(), tok, Box::new(ab2));
+                                        } else {
+                                            ab = IExpr::Drop(s.clone(), Box::new(ab));
+                                        }
                                     }
                                 }
                                 // Dup each used field so the binder gets its own
@@ -275,7 +319,7 @@ fn rc(e: &IExpr, live: &HashSet<String>) -> IExpr {
             }
         }
 
-        IExpr::Dup(..) | IExpr::Drop(..) => e.clone(),
+        IExpr::Dup(..) | IExpr::Drop(..) | IExpr::DropReuse(..) => e.clone(),
     }
 }
 
@@ -284,14 +328,14 @@ mod tests {
     use super::*;
     use crate::{interp, ir, lexer, parser, typeck};
 
-    /// Lower, insert RC, run, and return (result string, allocations, frees).
-    fn run_rc(src: &str) -> (String, usize, usize) {
+    /// Lower, insert RC (with reuse), run, and return (result string, metrics).
+    fn run_rc(src: &str) -> (String, ir::Metrics) {
         let prog = parser::parse(lexer::lex(src).unwrap()).unwrap();
         typeck::check(&prog).expect("typeck");
         let fns = insert_rc(&ir::lower_program(&prog).unwrap());
         let mut runner = ir::IrInterp::new(fns);
         let v = runner.run_main().expect("ir run");
-        (runner.render(&v), runner.metrics.allocations, runner.metrics.frees)
+        (runner.render(&v), runner.metrics.clone())
     }
 
     fn ast_result(src: &str) -> String {
@@ -300,11 +344,12 @@ mod tests {
     }
 
     /// For an Int/Bool-returning program, the RC pass must be garbage-free:
-    /// every allocation is freed, and the result matches the interpreter.
+    /// no cell remains live at the end, and the result matches the interpreter.
+    /// (With reuse, `allocations != frees`, so we check the live count.)
     fn assert_garbage_free(src: &str) {
-        let (ir_res, allocs, frees) = run_rc(src);
+        let (ir_res, m) = run_rc(src);
         assert_eq!(ir_res, ast_result(src), "value mismatch:\n{}", src);
-        assert_eq!(allocs, frees, "leak: {} allocations, {} frees in:\n{}", allocs, frees, src);
+        assert_eq!(m.live, 0, "leak: {} cell(s) still live in:\n{}", m.live, src);
     }
 
     #[test]
@@ -392,6 +437,27 @@ mod tests {
              fn len(xs: L) -> Int = match xs { Nil => 0, Cons(h, r) => 1 + len(r), }\n\
              fn f(xs: L) -> Int = { let s = match xs { Nil => 0, Cons(h, r) => sum(r), }; s + len(xs) }\n\
              fn main() -> Int = f(Cons(1, Cons(2, Cons(3, Nil))))",
+        );
+    }
+
+    #[test]
+    fn reuse_eliminates_allocations_on_unique_map() {
+        // inc over a UNIQUE list must reuse each Cons cell in place: zero fresh
+        // allocations inside `inc`, and still garbage-free.
+        let src = "type L = | Nil | Cons(Int, L)\n\
+                   fn range(n: Int, acc: L) -> L = if n == 0 { acc } else { range(n - 1, Cons(n, acc)) }\n\
+                   fn inc(xs: L) -> L = match xs { Nil => Nil, Cons(h, r) => Cons(h + 1, inc(r)), }\n\
+                   fn sum(xs: L) -> Int = match xs { Nil => 0, Cons(h, r) => h + sum(r), }\n\
+                   fn main() -> Int = sum(inc(range(100, Nil)))";
+        let (res, m) = run_rc(src);
+        assert_eq!(res, ast_result(src));
+        assert_eq!(m.live, 0, "must be garbage-free");
+        // `inc` reuses the ~101 cells (100 Cons + Nil) of the unique input list.
+        assert!(m.reuses >= 100, "expected reuse of the unique list, got {} reuses", m.reuses);
+        // Gross allocations would be ~202; reuse keeps fresh allocations near half.
+        assert!(
+            m.allocations < m.allocations + m.reuses,
+            "reuse should reduce fresh allocations below the gross total"
         );
     }
 

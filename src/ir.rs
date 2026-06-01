@@ -39,6 +39,10 @@ pub enum Bind {
     Ctor(String, Vec<Atom>),
     /// Function or builtin call with named argument atoms.
     Call(String, Vec<Atom>),
+    /// Constructor that may REUSE a freed cell in place: the first arg names a
+    /// reuse token (from `DropReuse`). If the token holds an address, the cell
+    /// is overwritten (no allocation); otherwise a fresh cell is allocated.
+    CtorReuse(String, String, Vec<Atom>),
     If(Atom, Box<IExpr>, Box<IExpr>),
     /// Match on an ADT scrutinee. Arms are keyed by constructor; an arm with
     /// `ctor == None` is a catch-all (binds the whole scrutinee).
@@ -63,6 +67,10 @@ pub enum IExpr {
     Dup(String, Box<IExpr>),
     /// Decrement the refcount of `var` (freeing recursively at 0), then the body.
     Drop(String, Box<IExpr>),
+    /// Drop `scrut` but, if it becomes unique-and-dead, hand its cell address to
+    /// the reuse `token` (binding it for a later `CtorReuse`) instead of fully
+    /// freeing it. The token is "empty" when the cell was shared.
+    DropReuse(String, String, Box<IExpr>),
 }
 
 #[derive(Debug, Clone)]
@@ -305,6 +313,9 @@ pub enum IValue {
     Unit,
     /// A heap reference to an ADT cell.
     Ref(usize),
+    /// A reuse token: `Some(addr)` if a freed cell is available for in-place
+    /// reuse, `None` otherwise. Compiler-internal; never user-visible.
+    Token(Option<usize>),
 }
 
 #[derive(Debug, Clone)]
@@ -321,6 +332,8 @@ pub struct Metrics {
     pub allocations: usize,
     /// Cells freed by `drop` reaching refcount 0.
     pub frees: usize,
+    /// Cells reused in place by `CtorReuse` (avoided a fresh allocation).
+    pub reuses: usize,
     pub dups: usize,
     pub drops: usize,
     /// Currently-live cells (allocations - frees so far).
@@ -364,6 +377,7 @@ impl IrInterp {
             IValue::Int(n) => n.to_string(),
             IValue::Bool(b) => b.to_string(),
             IValue::Unit => "()".to_string(),
+            IValue::Token(_) => "<token>".to_string(), // never a program result
             IValue::Ref(a) => {
                 let c = self.heap[*a].as_ref().expect("render: freed cell escaped");
                 if c.fields.is_empty() {
@@ -414,7 +428,47 @@ impl IrInterp {
                     }
                     e = body;
                 }
+                IExpr::DropReuse(scrut, tok, body) => {
+                    let token = match self.atom(&Atom::Var(scrut.clone()), &env)? {
+                        IValue::Ref(a) => {
+                            self.metrics.drops += 1;
+                            self.drop_for_reuse(a)?
+                        }
+                        // Non-heap scrutinee can't be reused.
+                        _ => IValue::Token(None),
+                    };
+                    env.insert(tok.clone(), token);
+                    e = body;
+                }
             }
+        }
+    }
+
+    /// Like `drop_cell`, but when the cell becomes unique-and-dead we KEEP its
+    /// slot (releasing only its children) and return a reuse token holding the
+    /// address, so a subsequent `CtorReuse` can overwrite it in place.
+    fn drop_for_reuse(&mut self, addr: usize) -> Result<IValue, String> {
+        let reached_zero = match &mut self.heap[addr] {
+            Some(cell) => {
+                if cell.rc == 0 {
+                    return Err("ir: drop of cell with refcount 0 (double free)".into());
+                }
+                cell.rc -= 1;
+                cell.rc == 0
+            }
+            None => return Err("ir: drop of already-freed cell".into()),
+        };
+        if reached_zero {
+            // Release the children but retain the slot for reuse.
+            let fields = std::mem::take(&mut self.heap[addr].as_mut().unwrap().fields);
+            for f in &fields {
+                if let IValue::Ref(a) = f {
+                    self.drop_cell(*a)?;
+                }
+            }
+            Ok(IValue::Token(Some(addr)))
+        } else {
+            Ok(IValue::Token(None))
         }
     }
 
@@ -470,6 +524,26 @@ impl IrInterp {
                 self.metrics.peak_live = self.metrics.peak_live.max(self.metrics.live);
                 self.heap.push(Some(Cell { ctor: name.clone(), fields, rc: 1 }));
                 Ok(IValue::Ref(self.heap.len() - 1))
+            }
+            Bind::CtorReuse(tok, name, args) => {
+                let fields: Vec<IValue> =
+                    args.iter().map(|a| self.atom(a, env)).collect::<Result<_, _>>()?;
+                match self.atom(&Atom::Var(tok.clone()), env)? {
+                    IValue::Token(Some(addr)) => {
+                        // Reuse the freed slot in place — no allocation.
+                        self.metrics.reuses += 1;
+                        self.heap[addr] = Some(Cell { ctor: name.clone(), fields, rc: 1 });
+                        Ok(IValue::Ref(addr))
+                    }
+                    _ => {
+                        // Token empty (cell was shared): allocate fresh.
+                        self.metrics.allocations += 1;
+                        self.metrics.live += 1;
+                        self.metrics.peak_live = self.metrics.peak_live.max(self.metrics.live);
+                        self.heap.push(Some(Cell { ctor: name.clone(), fields, rc: 1 }));
+                        Ok(IValue::Ref(self.heap.len() - 1))
+                    }
+                }
             }
             Bind::Call(name, args) => {
                 let vals: Vec<IValue> =
