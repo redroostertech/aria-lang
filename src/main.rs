@@ -14,6 +14,7 @@ mod arith;
 mod ast;
 mod builtins;
 mod interp;
+mod ir;
 mod lexer;
 mod neural_codec;
 mod pack;
@@ -47,9 +48,60 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         "demo" => run_demo(args.get(2).map(|s| s.as_str())),
+        "mem" => run_mem(&args),
         other => {
             eprintln!("unknown command `{}`", other);
             ExitCode::from(2)
+        }
+    }
+}
+
+/// Lower a program to the IR, run the IR interpreter, and report heap-allocation
+/// metrics. (Stage 1 of the memory-model work — dup/drop + reuse come next.)
+fn run_mem(args: &[String]) -> ExitCode {
+    if args.len() < 3 {
+        eprintln!("usage: aria mem <file.aria>");
+        return ExitCode::from(2);
+    }
+    let src = match std::fs::read_to_string(&args[2]) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: cannot read {}: {}", args[2], e);
+            return ExitCode::from(2);
+        }
+    };
+    let prog = match lexer::lex(&src).and_then(parser::parse) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(errs) = typeck::check(&prog) {
+        for e in errs {
+            eprintln!("type error: {}", e);
+        }
+        return ExitCode::FAILURE;
+    }
+    let fns = match ir::lower_program(&prog) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("lowering error: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut runner = ir::IrInterp::new(fns);
+    match runner.run_main() {
+        Ok(v) => {
+            eprintln!(
+                "ir ok: result {:?} | heap allocations: {}",
+                v, runner.metrics.allocations
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("ir runtime error: {}", e);
+            ExitCode::FAILURE
         }
     }
 }

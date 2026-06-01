@@ -1,0 +1,38 @@
+-- Memory-model benchmark (functional subset: Int + ADTs only).
+-- `aria mem examples/mem_bench.aria` lowers this to the IR and reports how many
+-- ADT cells are allocated. Today that's the naive baseline; the upcoming reuse
+-- analysis should let `map`-style functions reuse a unique list's cells in place
+-- (driving fresh allocations toward zero).
+
+type List =
+  | Nil
+  | Cons(Int, List)
+
+-- Build [0, 1, ..., n-1] (allocates n Cons cells).
+fn range(n: Int, acc: List) -> List =
+  if n == 0 {
+    acc
+  } else {
+    range(n - 1, Cons(n - 1, acc))
+  }
+
+-- Functional map (+1): allocates a fresh Cons per element under naive RC;
+-- the reuse analysis should make this allocate ~0 fresh cells for a unique list.
+fn inc_all(xs: List) -> List =
+  match xs {
+    Nil          => Nil,
+    Cons(h, rest) => Cons(h + 1, inc_all(rest)),
+  }
+
+fn sum(xs: List) -> Int =
+  match xs {
+    Nil          => 0,
+    Cons(h, rest) => h + sum(rest),
+  }
+
+fn main() -> Int = {
+  let xs = range(1000, Nil);
+  let ys = inc_all(xs);
+  print_int(sum(ys));
+  0
+}
