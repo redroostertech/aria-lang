@@ -115,9 +115,11 @@ cargo run --release -- mem    file.aria  # lower the Int/Bool/ADT subset to IR,
                                          # cross-check vs interpreter, count ADT allocations
 ```
 
-> `aria mem` is stage 1 of the memory-model work: it counts *gross* ADT
-> constructions (no `dup`/`drop`, reuse, or frees yet). The reuse analysis that
-> drives that number down is the upcoming stage.
+> `aria mem` inserts precise Perceus-style `dup`/`drop` and reports allocations,
+> frees, and peak live cells. It verifies **garbage-freeness** (every cell freed
+> exactly once, no annotations) and cross-checks the result against the
+> interpreter. The reuse analysis that drives the *gross* allocation count down
+> (by mutating unique cells in place) is the upcoming stage.
 
 Sample run (200k-row synthetic telemetry, 3 × i64 columns). Sizes are
 deterministic; times are from one representative run and vary by machine/load:
@@ -165,6 +167,9 @@ without touching the parser or AST.
 - [x] Static type checker (bottom-up synthesis + checking against annotations)
 - [x] Exhaustiveness checking for `match`
 - [ ] Type inference for `let`-generalization / generics (polymorphism)
+- [x] Typed ANF IR + IR interpreter (differentially checked vs the tree-walker)
+- [x] Precise Perceus-style reference counting (zero-annotation, garbage-free verified)
+- [ ] Reuse analysis (in-place mutation of unique cells) — the de-risking measurement
 - [x] rANS entropy coder + type-aware compression (beats gzip on structured data)
 - [x] Shaped-tensor runtime (matmul/softmax/layernorm) + INT8 quantization
 - [x] Transformer forward pass (inference) running on the tensor core

@@ -53,10 +53,16 @@ pub struct IArm {
 }
 
 /// An IR expression: a (possibly empty) sequence of `let`s ending in a return.
+/// `Dup`/`Drop` are reference-count operations inserted by the `rc` pass; they
+/// are absent in freshly-lowered IR and no-ops on unboxed (non-`Ref`) values.
 #[derive(Debug, Clone)]
 pub enum IExpr {
     Let(String, Bind, Box<IExpr>),
     Ret(Atom),
+    /// Increment the refcount of `var`, then run the body.
+    Dup(String, Box<IExpr>),
+    /// Decrement the refcount of `var` (freeing recursively at 0), then the body.
+    Drop(String, Box<IExpr>),
 }
 
 #[derive(Debug, Clone)]
@@ -305,12 +311,22 @@ pub enum IValue {
 struct Cell {
     ctor: String,
     fields: Vec<IValue>,
+    rc: u32,
 }
 
 /// Metrics gathered while interpreting the IR.
 #[derive(Debug, Default, Clone)]
 pub struct Metrics {
+    /// Total ADT cells constructed (gross allocations).
     pub allocations: usize,
+    /// Cells freed by `drop` reaching refcount 0.
+    pub frees: usize,
+    pub dups: usize,
+    pub drops: usize,
+    /// Currently-live cells (allocations - frees so far).
+    pub live: usize,
+    /// Maximum simultaneously-live cells during the run.
+    pub peak_live: usize,
 }
 
 /// Max IR call-nesting before a catchable error. The IR interpreter, like the
@@ -320,7 +336,8 @@ const MAX_IR_CALL_DEPTH: usize = 100_000;
 
 pub struct IrInterp {
     fns: HashMap<String, IFn>,
-    heap: Vec<Cell>,
+    /// `None` = a freed slot (used to detect use-after-free).
+    heap: Vec<Option<Cell>>,
     depth: usize,
     pub metrics: Metrics,
 }
@@ -348,7 +365,7 @@ impl IrInterp {
             IValue::Bool(b) => b.to_string(),
             IValue::Unit => "()".to_string(),
             IValue::Ref(a) => {
-                let c = &self.heap[*a];
+                let c = self.heap[*a].as_ref().expect("render: freed cell escaped");
                 if c.fields.is_empty() {
                     c.ctor.clone()
                 } else {
@@ -380,8 +397,52 @@ impl IrInterp {
                     env.insert(x.clone(), v);
                     e = body;
                 }
+                IExpr::Dup(v, body) => {
+                    if let IValue::Ref(a) = self.atom(&Atom::Var(v.clone()), &env)? {
+                        match &mut self.heap[a] {
+                            Some(cell) => cell.rc += 1,
+                            None => return Err(format!("ir: dup of freed cell `{}`", v)),
+                        }
+                        self.metrics.dups += 1;
+                    }
+                    e = body;
+                }
+                IExpr::Drop(v, body) => {
+                    if let IValue::Ref(a) = self.atom(&Atom::Var(v.clone()), &env)? {
+                        self.metrics.drops += 1;
+                        self.drop_cell(a)?;
+                    }
+                    e = body;
+                }
             }
         }
+    }
+
+    /// Decrement a cell's refcount; at zero, free it and recursively drop its
+    /// `Ref` fields. This is the runtime side of Perceus reference counting.
+    fn drop_cell(&mut self, addr: usize) -> Result<(), String> {
+        let reached_zero = match &mut self.heap[addr] {
+            Some(cell) => {
+                if cell.rc == 0 {
+                    return Err("ir: drop of cell with refcount 0 (double free)".into());
+                }
+                cell.rc -= 1;
+                cell.rc == 0
+            }
+            None => return Err("ir: drop of already-freed cell".into()),
+        };
+        if reached_zero {
+            // Take the cell out, free the slot, then drop child references.
+            let cell = self.heap[addr].take().unwrap();
+            self.metrics.frees += 1;
+            self.metrics.live -= 1;
+            for f in &cell.fields {
+                if let IValue::Ref(a) = f {
+                    self.drop_cell(*a)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn eval_bind(&mut self, bind: &Bind, env: &Env) -> Result<IValue, String> {
@@ -405,7 +466,9 @@ impl IrInterp {
             Bind::Ctor(name, args) => {
                 let fields = args.iter().map(|a| self.atom(a, env)).collect::<Result<_, _>>()?;
                 self.metrics.allocations += 1;
-                self.heap.push(Cell { ctor: name.clone(), fields });
+                self.metrics.live += 1;
+                self.metrics.peak_live = self.metrics.peak_live.max(self.metrics.live);
+                self.heap.push(Some(Cell { ctor: name.clone(), fields, rc: 1 }));
                 Ok(IValue::Ref(self.heap.len() - 1))
             }
             Bind::Call(name, args) => {
@@ -447,7 +510,10 @@ impl IrInterp {
                     IValue::Ref(a) => a,
                     _ => return Err("ir: match on non-data".into()),
                 };
-                let cell = self.heap[addr].clone();
+                let cell = self
+                    .heap[addr]
+                    .clone()
+                    .ok_or("ir: use-after-free in match")?;
                 for arm in arms {
                     let matches = match &arm.ctor {
                         Some(c) => *c == cell.ctor,

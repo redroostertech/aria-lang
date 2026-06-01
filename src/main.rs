@@ -21,6 +21,7 @@ mod pack;
 mod parser;
 mod predict;
 mod rag;
+mod rc;
 mod rans;
 mod shape;
 mod tensor;
@@ -90,6 +91,8 @@ fn run_mem(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // Insert precise reference-count operations (Stage 2).
+    let fns = rc::insert_rc(&fns);
 
     // Run both the IR and the tree-walking interpreter on a large-stack thread
     // and cross-check them, so `aria mem` can never silently report a result the
@@ -99,25 +102,31 @@ fn run_mem(args: &[String]) -> ExitCode {
         .spawn(move || {
             let mut runner = ir::IrInterp::new(fns);
             let ir_res = runner.run_main().map(|v| runner.render(&v));
-            let allocs = runner.metrics.allocations;
+            let metrics = runner.metrics.clone();
             let ast_res = match interp::Interp::new(&prog) {
                 Ok(it) => it.run_main().map(|v| v.display()),
                 Err(e) => Err(e),
             };
-            (ir_res, ast_res, allocs)
+            (ir_res, ast_res, metrics)
         })
         .expect("spawn mem thread")
         .join()
-        .unwrap_or_else(|_| (Err("ir thread panicked".into()), Err("".into()), 0));
+        .unwrap_or_else(|_| (Err("ir thread panicked".into()), Err("".into()), ir::Metrics::default()));
 
-    let (ir_res, ast_res, allocs) = outcome;
+    let (ir_res, ast_res, m) = outcome;
     match (&ir_res, &ast_res) {
         (Ok(ir), Ok(ast)) if ir == ast => {
             eprintln!("ir == interpreter: {} (agree)", ir);
-            eprintln!(
-                "gross ADT constructions (no frees/reuse yet): {}",
-                allocs
-            );
+            eprintln!("allocations: {}  frees: {}  peak live: {}  (dups: {}, drops: {})",
+                m.allocations, m.frees, m.peak_live, m.dups, m.drops);
+            // Result is a non-heap value iff every cell was freed; then we can
+            // assert garbage-freeness directly.
+            let leaked = m.allocations - m.frees;
+            if leaked == 0 {
+                eprintln!("garbage-free: yes (all {} cells freed, no leaks)", m.allocations);
+            } else {
+                eprintln!("{} cell(s) still live (reachable from the result)", leaked);
+            }
             ExitCode::SUCCESS
         }
         (Ok(ir), Ok(ast)) => {
