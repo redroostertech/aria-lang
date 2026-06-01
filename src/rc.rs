@@ -204,13 +204,23 @@ fn rc(e: &IExpr, live: &HashSet<String>) -> IExpr {
                             .collect();
                         let mut ab = rc(&arm.body, &after);
                         ab = with_drops(drop_set, ab);
+                        // Is the scrutinee still owned/needed after the match?
+                        // If so we BORROW it (keep it alive); otherwise we CONSUME
+                        // it (release the matched cell here).
+                        let scrut_live_after =
+                            sname.as_ref().map_or(false, |s| after.contains(s));
                         match &arm.ctor {
                             Some(_) => {
-                                // Release the matched cell (its fields were dup'd
-                                // for the binders that use them).
-                                if let Some(s) = &sname {
-                                    ab = IExpr::Drop(s.clone(), Box::new(ab));
+                                if !scrut_live_after {
+                                    // Consume: release the matched cell (its fields
+                                    // were dup'd for the binders that use them).
+                                    if let Some(s) = &sname {
+                                        ab = IExpr::Drop(s.clone(), Box::new(ab));
+                                    }
                                 }
+                                // Dup each used field so the binder gets its own
+                                // reference (correct whether the cell is freed here
+                                // or stays alive for a later use of the scrutinee).
                                 for b in &arm.binders {
                                     if arm_body_fv.contains(b) {
                                         ab = IExpr::Dup(b.clone(), Box::new(ab));
@@ -218,10 +228,17 @@ fn rc(e: &IExpr, live: &HashSet<String>) -> IExpr {
                                 }
                             }
                             None => {
-                                // Catch-all binder aliases the scrutinee; drop it
-                                // (releasing the cell) only if the body never uses it.
+                                // Catch-all binder aliases the scrutinee.
                                 if let Some(b) = arm.binders.first() {
-                                    if !arm_body_fv.contains(b) {
+                                    let used = arm_body_fv.contains(b);
+                                    if scrut_live_after {
+                                        // The scrutinee is also needed later, so if
+                                        // the alias is used it needs its own ref.
+                                        if used {
+                                            ab = IExpr::Dup(b.clone(), Box::new(ab));
+                                        }
+                                    } else if !used {
+                                        // Dead alias of a now-dead cell: release it.
                                         ab = IExpr::Drop(b.clone(), Box::new(ab));
                                     }
                                 }
@@ -340,6 +357,50 @@ mod tests {
             "type L = | Nil | Cons(Int, L)\n\
              fn pick(b: Bool, xs: L) -> Int = if b { match xs { Nil => 0, Cons(h, r) => h, } } else { 99 }\n\
              fn main() -> Int = pick(false, Cons(5, Nil))",
+        );
+    }
+
+    #[test]
+    fn scrutinee_used_after_match_ctor() {
+        // Regression: the scrutinee is matched AND used again afterward, so the
+        // match must borrow (not free) it. Previously this was a use-after-free.
+        assert_garbage_free(
+            "type L = | Nil | Cons(Int, L)\n\
+             fn len(xs: L) -> Int = match xs { Nil => 0, Cons(h, r) => 1 + len(r), }\n\
+             fn f(xs: L) -> Int = { let n = match xs { Nil => 0, Cons(h, r) => h, }; n + len(xs) }\n\
+             fn main() -> Int = f(Cons(7, Cons(8, Nil)))",
+        );
+    }
+
+    #[test]
+    fn scrutinee_used_after_catchall() {
+        assert_garbage_free(
+            "type L = | Nil | Cons(Int, L)\n\
+             fn len(xs: L) -> Int = match xs { Nil => 0, Cons(h, r) => 1 + len(r), }\n\
+             fn f(xs: L) -> Int = { let n = match xs { other => 1, }; n + len(xs) }\n\
+             fn main() -> Int = f(Cons(1, Nil))",
+        );
+    }
+
+    #[test]
+    fn heap_field_used_after_borrowed_match() {
+        // Borrow mode where the bound field is itself a heap value used in the
+        // arm, AND the scrutinee is used again afterward.
+        assert_garbage_free(
+            "type L = | Nil | Cons(Int, L)\n\
+             fn sum(xs: L) -> Int = match xs { Nil => 0, Cons(h, r) => h + sum(r), }\n\
+             fn len(xs: L) -> Int = match xs { Nil => 0, Cons(h, r) => 1 + len(r), }\n\
+             fn f(xs: L) -> Int = { let s = match xs { Nil => 0, Cons(h, r) => sum(r), }; s + len(xs) }\n\
+             fn main() -> Int = f(Cons(1, Cons(2, Cons(3, Nil))))",
+        );
+    }
+
+    #[test]
+    fn binary_tree_is_garbage_free() {
+        assert_garbage_free(
+            "type T = | Leaf | Node(T, Int, T)\n\
+             fn total(t: T) -> Int = match t { Leaf => 0, Node(l, v, r) => total(l) + v + total(r), }\n\
+             fn main() -> Int = total(Node(Node(Leaf, 1, Leaf), 2, Node(Leaf, 3, Leaf)))",
         );
     }
 
