@@ -104,6 +104,20 @@ impl Lowerer {
             )),
 
             Expr::Binary(op, l, r) => {
+                // Short-circuit `&&` / `||` must NOT evaluate the rhs eagerly —
+                // lower to control flow so the rhs runs only in the taken branch
+                // (matching the interpreter's short-circuit semantics).
+                if matches!(op, BinOp::And | BinOp::Or) {
+                    let la = self.lower(l, stmts)?;
+                    let rhs = self.lower_block(r)?;
+                    let (then, els) = match op {
+                        BinOp::And => (rhs, IExpr::Ret(Atom::Bool(false))),
+                        _ => (IExpr::Ret(Atom::Bool(true)), rhs), // Or
+                    };
+                    let t = self.fresh();
+                    stmts.push((t.clone(), Bind::If(la, Box::new(then), Box::new(els))));
+                    return Ok(Atom::Var(t));
+                }
                 let la = self.lower(l, stmts)?;
                 let ra = self.lower(r, stmts)?;
                 let t = self.fresh();
@@ -206,36 +220,38 @@ impl Lowerer {
             }
             Ok(Bind::Match(scrut, iarms))
         } else {
-            // Literal (Int/Bool) match -> nested if-chain, built back to front.
-            // A Var/Wild arm is the catch-all `else`.
-            let mut else_branch: Option<IExpr> = None;
-            let mut literal_arms: Vec<(&crate::ast::Arm,)> = Vec::new();
-            for arm in arms {
+            // Literal (Int/Bool) match -> if-chain in SOURCE ORDER, preserving
+            // the interpreter's first-match-wins semantics. Fold arms
+            // back-to-front: a catch-all (Var/Wild) REPLACES the accumulator (so
+            // any later arms become unreachable, exactly as the interpreter
+            // treats arms after a catch-all); a literal arm wraps the
+            // accumulator in `if scrut == lit { body } else { acc }`. Folding the
+            // first catch-all last makes it dominate later arms correctly.
+            let mut chain = IExpr::Ret(Atom::Unit); // exhaustiveness => unreachable
+            for arm in arms.iter().rev() {
                 match &arm.pat {
                     Pattern::Var(_) | Pattern::Wild => {
-                        else_branch = Some(self.lower_catchall(&scrut, arm)?);
+                        chain = self.lower_catchall(&scrut, arm)?;
                     }
-                    _ => literal_arms.push((arm,)),
+                    Pattern::Int(_) | Pattern::Bool(_) => {
+                        let cond = self.lit_cond(&scrut, &arm.pat)?;
+                        let then = self.lower_block(&arm.body)?;
+                        let c = self.fresh();
+                        let t = self.fresh();
+                        let if_bind =
+                            Bind::If(Atom::Var(c.clone()), Box::new(then), Box::new(chain));
+                        let inner =
+                            IExpr::Let(t.clone(), if_bind, Box::new(IExpr::Ret(Atom::Var(t))));
+                        chain = IExpr::Let(c, cond, Box::new(inner));
+                    }
+                    _ => {
+                        return Err(LowerError(
+                            "mixed literal/constructor patterns not supported in IR yet".into(),
+                        ))
+                    }
                 }
             }
-            let mut chain = else_branch.unwrap_or(IExpr::Ret(Atom::Unit));
-            for (arm,) in literal_arms.into_iter().rev() {
-                let cond = self.lit_cond(&scrut, &arm.pat)?;
-                let then = self.lower_block(&arm.body)?;
-                // Bind the comparison then branch on it.
-                let c = self.fresh();
-                let mut s = Vec::new();
-                s.push((c.clone(), cond));
-                let bind = Bind::If(Atom::Var(c), Box::new(then), Box::new(chain));
-                let t = self.fresh();
-                s.push((t.clone(), bind));
-                let mut acc = IExpr::Ret(Atom::Var(t));
-                for (name, b) in s.into_iter().rev() {
-                    acc = IExpr::Let(name, b, Box::new(acc));
-                }
-                chain = acc;
-            }
-            // Wrap the chain as a single bind via an identity if(true).
+            // lower_match returns a Bind; wrap the chain in an identity `if true`.
             Ok(Bind::If(Atom::Bool(true), Box::new(chain), Box::new(IExpr::Ret(Atom::Unit))))
         }
     }
@@ -297,9 +313,15 @@ pub struct Metrics {
     pub allocations: usize,
 }
 
+/// Max IR call-nesting before a catchable error. The IR interpreter, like the
+/// AST one, is run on a large-stack thread (see main.rs), so this is generous;
+/// it exists to turn non-terminating recursion into an error, not a crash.
+const MAX_IR_CALL_DEPTH: usize = 100_000;
+
 pub struct IrInterp {
     fns: HashMap<String, IFn>,
     heap: Vec<Cell>,
+    depth: usize,
     pub metrics: Metrics,
 }
 
@@ -307,7 +329,7 @@ type Env = HashMap<String, IValue>;
 
 impl IrInterp {
     pub fn new(fns: HashMap<String, IFn>) -> Self {
-        IrInterp { fns, heap: Vec::new(), metrics: Metrics::default() }
+        IrInterp { fns, heap: Vec::new(), depth: 0, metrics: Metrics::default() }
     }
 
     /// Run `main` and return its value (plus collected metrics in `self`).
@@ -315,6 +337,26 @@ impl IrInterp {
         let main = self.fns.get("main").ok_or("no `main`")?.clone();
         let env = Env::new();
         self.eval(&main.body, env)
+    }
+
+    /// Render an IR value into the same textual form as `interp::Value::display`
+    /// (recursively reading ADT cells from the heap), so IR and interpreter
+    /// results can be compared structurally rather than by ad-hoc digit soup.
+    pub fn render(&self, v: &IValue) -> String {
+        match v {
+            IValue::Int(n) => n.to_string(),
+            IValue::Bool(b) => b.to_string(),
+            IValue::Unit => "()".to_string(),
+            IValue::Ref(a) => {
+                let c = &self.heap[*a];
+                if c.fields.is_empty() {
+                    c.ctor.clone()
+                } else {
+                    let inner: Vec<String> = c.fields.iter().map(|f| self.render(f)).collect();
+                    format!("{}({})", c.ctor, inner.join(", "))
+                }
+            }
+        }
     }
 
     fn atom(&self, a: &Atom, env: &Env) -> Result<IValue, String> {
@@ -327,14 +369,16 @@ impl IrInterp {
     }
 
     fn eval(&mut self, e: &IExpr, mut env: Env) -> Result<IValue, String> {
+        // Real trampoline over the `let`-chain: iterate instead of recursing, so
+        // a long sequence of bindings does not grow the native stack.
+        let mut e = e;
         loop {
             match e {
                 IExpr::Ret(a) => return self.atom(a, &env),
                 IExpr::Let(x, bind, body) => {
                     let v = self.eval_bind(bind, &env)?;
                     env.insert(x.clone(), v);
-                    // tail-loop into body without growing the Rust stack per let
-                    return self.eval(body, env);
+                    e = body;
                 }
             }
         }
@@ -371,11 +415,26 @@ impl IrInterp {
                     return Ok(v);
                 }
                 let f = self.fns.get(name).cloned().ok_or_else(|| format!("ir: unknown fn {}", name))?;
+                if f.params.len() != vals.len() {
+                    return Err(format!(
+                        "ir: function `{}` expects {} argument(s), got {}",
+                        name,
+                        f.params.len(),
+                        vals.len()
+                    ));
+                }
+                let d = self.depth + 1;
+                if d > MAX_IR_CALL_DEPTH {
+                    return Err(format!("ir: maximum recursion depth ({}) exceeded", MAX_IR_CALL_DEPTH));
+                }
+                self.depth = d;
                 let mut frame = Env::new();
                 for (p, v) in f.params.iter().zip(vals.into_iter()) {
                     frame.insert(p.clone(), v);
                 }
-                self.eval(&f.body, frame)
+                let result = self.eval(&f.body, frame);
+                self.depth = d - 1;
+                result
             }
             Bind::If(c, then, els) => match self.atom(c, env)? {
                 IValue::Bool(true) => self.eval(then, env.clone()),
@@ -433,8 +492,18 @@ fn prim(op: BinOp, x: IValue, y: IValue) -> Result<IValue, String> {
             Add => Int(a.checked_add(b).ok_or("ir: + overflow")?),
             Sub => Int(a.checked_sub(b).ok_or("ir: - overflow")?),
             Mul => Int(a.checked_mul(b).ok_or("ir: * overflow")?),
-            Div => Int(a.checked_div(b).ok_or("ir: div by zero")?),
-            Mod => Int(a.checked_rem(b).ok_or("ir: mod by zero")?),
+            Div => {
+                if b == 0 {
+                    return Err("division by zero".into());
+                }
+                Int(a.checked_div(b).ok_or("integer overflow in `/`")?)
+            }
+            Mod => {
+                if b == 0 {
+                    return Err("modulo by zero".into());
+                }
+                Int(a.checked_rem(b).ok_or("integer overflow in `%`")?)
+            }
             Eq => Bool(a == b),
             Ne => Bool(a != b),
             Lt => Bool(a < b),
@@ -459,39 +528,42 @@ mod tests {
     use super::*;
     use crate::{interp, lexer, parser, typeck};
 
-    // Lower + run through the IR interpreter, returning a display string.
+    // Lower + run through the IR interpreter, returning a STRUCTURAL string
+    // identical to interp::Value::display (so Data/Bool/Unit compare faithfully).
     fn ir_run(src: &str) -> Result<String, String> {
-        let toks = lexer::lex(src).map_err(|e| e)?;
-        let prog = parser::parse(toks).map_err(|e| e)?;
+        let toks = lexer::lex(src)?;
+        let prog = parser::parse(toks)?;
         typeck::check(&prog).map_err(|e| e.join("; "))?;
         let fns = lower_program(&prog)?;
         let mut ir = IrInterp::new(fns);
         let v = ir.run_main()?;
-        Ok(format!("{:?}", v))
+        Ok(ir.render(&v))
     }
 
     // The tree-walker's result, for differential comparison.
-    fn ast_run(src: &str) -> String {
-        let toks = lexer::lex(src).unwrap();
-        let prog = parser::parse(toks).unwrap();
-        let it = interp::Interp::new(&prog).unwrap();
-        format!("{:?}", it.run_main().unwrap())
+    fn ast_run(src: &str) -> Result<String, String> {
+        let toks = lexer::lex(src)?;
+        let prog = parser::parse(toks)?;
+        let it = interp::Interp::new(&prog)?;
+        it.run_main().map(|v| v.display())
     }
 
-    // Compare semantics by exit value: both must agree on the final Int/Bool.
+    // The IR and interpreter must agree on the Ok/Err SHAPE and, when Ok, on the
+    // exact structural value. (Both erroring counts as agreement; messages may
+    // differ.)
     fn differential(src: &str) {
-        let ir = ir_run(src).expect("ir run");
+        let ir = ir_run(src);
         let ast = ast_run(src);
-        // Normalize: IR Int(n) vs interp Int(n); compare the trailing integer.
-        let ir_n: String = ir.chars().filter(|c| c.is_ascii_digit() || *c == '-').collect();
-        let ast_n: String = ast.chars().filter(|c| c.is_ascii_digit() || *c == '-').collect();
-        assert_eq!(ir_n, ast_n, "IR vs interp mismatch for:\n{}\n  ir={} ast={}", src, ir, ast);
+        match (&ir, &ast) {
+            (Ok(a), Ok(b)) => assert_eq!(a, b, "value mismatch for:\n{}", src),
+            (Err(_), Err(_)) => {}
+            _ => panic!("Ok/Err shape mismatch for:\n{}\n  ir={:?}\n  ast={:?}", src, ir, ast),
+        }
     }
 
     #[test]
     fn factorial_matches_interpreter() {
-        let src = "fn fac(n: Int) -> Int = match n { 0 => 1, _ => n * fac(n - 1), }\nfn main() -> Int = fac(6)";
-        differential(src); // 720
+        differential("fn fac(n: Int) -> Int = match n { 0 => 1, _ => n * fac(n - 1), }\nfn main() -> Int = fac(6)");
     }
 
     #[test]
@@ -499,19 +571,85 @@ mod tests {
         let src = "type L = | Nil | Cons(Int, L)\n\
                    fn sum(xs: L) -> Int = match xs { Nil => 0, Cons(h, r) => h + sum(r), }\n\
                    fn main() -> Int = sum(Cons(1, Cons(2, Cons(3, Nil))))";
-        differential(src); // 6
-        // And the IR interpreter should have allocated 4 cells (3 Cons + 1 Nil).
-        let toks = lexer::lex(src).unwrap();
-        let prog = parser::parse(toks).unwrap();
-        let fns = lower_program(&prog).unwrap();
-        let mut ir = IrInterp::new(fns);
+        differential(src);
+        let prog = parser::parse(lexer::lex(src).unwrap()).unwrap();
+        let mut ir = IrInterp::new(lower_program(&prog).unwrap());
         ir.run_main().unwrap();
         assert_eq!(ir.metrics.allocations, 4, "expected 4 ADT allocations");
     }
 
     #[test]
+    fn returns_constructed_value_structurally() {
+        // main returns a Data value; render must match interp's display exactly.
+        let src = "type P = | Pair(Int, Int)\nfn main() -> P = Pair(1, 2)";
+        let ir = ir_run(src).unwrap();
+        let ast = ast_run(src).unwrap();
+        assert_eq!(ir, ast);
+        assert_eq!(ir, "Pair(1, 2)");
+    }
+
+    #[test]
     fn if_and_bool_match() {
-        let src = "fn classify(n: Int) -> Int = if n < 0 { 0 } else { 1 }\nfn main() -> Int = classify(5)";
-        differential(src);
+        differential("fn classify(n: Int) -> Int = if n < 0 { 0 } else { 1 }\nfn main() -> Int = classify(5)");
+    }
+
+    // ---- regression tests for the adversarial-review findings ------------
+
+    #[test]
+    fn catchall_before_literal_first_match_wins() {
+        // Interp takes the first (catch-all) arm; IR must too (not the literal).
+        differential("fn f(n: Int) -> Int = match n { _ => 0, 1 => 99, }\nfn main() -> Int = f(1)");
+    }
+
+    #[test]
+    fn literal_after_catchall_is_dead() {
+        differential("fn f(n: Int) -> Int = match n { 1 => 10, x => 100, 2 => 20, }\nfn main() -> Int = f(2)");
+    }
+
+    #[test]
+    fn first_of_two_catchalls_wins() {
+        differential("fn f(n: Int) -> Int = match n { x => x, y => y + 1000, }\nfn main() -> Int = f(5)");
+    }
+
+    #[test]
+    fn short_circuit_and_does_not_eval_rhs() {
+        // false && (1/0 == 0): interp short-circuits to false (no div error); IR must too.
+        differential("fn main() -> Int = { let b = false && (1 / 0 == 0); if b { 1 } else { 0 } }");
+    }
+
+    #[test]
+    fn short_circuit_or_does_not_eval_rhs() {
+        differential("fn main() -> Int = { let b = true || (1 / 0 == 0); if b { 1 } else { 0 } }");
+    }
+
+    #[test]
+    fn div_by_zero_errors_in_both() {
+        differential("fn main() -> Int = 1 / 0");
+    }
+
+    #[test]
+    fn add_overflow_errors_in_both() {
+        differential("fn main() -> Int = 9223372036854775807 + 1");
+    }
+
+    #[test]
+    fn deep_recursion_does_not_abort() {
+        // Run on a large-stack thread (as the CLI does) and confirm a depth-3000
+        // recursion returns the correct value rather than overflowing the stack.
+        let src = "fn count(n: Int) -> Int = if n == 0 { 0 } else { count(n - 1) + 1 }\nfn main() -> Int = count(3000)";
+        let out = std::thread::Builder::new()
+            .stack_size(1 << 30)
+            .spawn(move || {
+                let prog = parser::parse(lexer::lex(src).unwrap()).unwrap();
+                let mut ir = IrInterp::new(lower_program(&prog).unwrap());
+                let v = ir.run_main().expect("ir run");
+                ir.render(&v)
+            })
+            .unwrap()
+            .join()
+            .expect("ir thread must not abort");
+        assert_eq!(out, "3000");
     }
 }
+
+

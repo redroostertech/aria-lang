@@ -33,7 +33,7 @@ use std::process::ExitCode;
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: aria <run|check|ast|pack|unpack|npack|nunpack|bench|demo> [args...]");
+        eprintln!("usage: aria <run|check|ast|pack|unpack|npack|nunpack|bench|demo|mem> [args...]");
         return ExitCode::from(2);
     }
 
@@ -90,17 +90,46 @@ fn run_mem(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let mut runner = ir::IrInterp::new(fns);
-    match runner.run_main() {
-        Ok(v) => {
+
+    // Run both the IR and the tree-walking interpreter on a large-stack thread
+    // and cross-check them, so `aria mem` can never silently report a result the
+    // two backends disagree on.
+    let outcome = std::thread::Builder::new()
+        .stack_size(1 << 30)
+        .spawn(move || {
+            let mut runner = ir::IrInterp::new(fns);
+            let ir_res = runner.run_main().map(|v| runner.render(&v));
+            let allocs = runner.metrics.allocations;
+            let ast_res = match interp::Interp::new(&prog) {
+                Ok(it) => it.run_main().map(|v| v.display()),
+                Err(e) => Err(e),
+            };
+            (ir_res, ast_res, allocs)
+        })
+        .expect("spawn mem thread")
+        .join()
+        .unwrap_or_else(|_| (Err("ir thread panicked".into()), Err("".into()), 0));
+
+    let (ir_res, ast_res, allocs) = outcome;
+    match (&ir_res, &ast_res) {
+        (Ok(ir), Ok(ast)) if ir == ast => {
+            eprintln!("ir == interpreter: {} (agree)", ir);
             eprintln!(
-                "ir ok: result {:?} | heap allocations: {}",
-                v, runner.metrics.allocations
+                "gross ADT constructions (no frees/reuse yet): {}",
+                allocs
             );
             ExitCode::SUCCESS
         }
-        Err(e) => {
+        (Ok(ir), Ok(ast)) => {
+            eprintln!("DIVERGENCE: ir result {:?} != interpreter result {:?}", ir, ast);
+            ExitCode::FAILURE
+        }
+        (Err(e), _) => {
             eprintln!("ir runtime error: {}", e);
+            ExitCode::FAILURE
+        }
+        (Ok(_), Err(e)) => {
+            eprintln!("interpreter error (ir succeeded): {}", e);
             ExitCode::FAILURE
         }
     }

@@ -111,7 +111,13 @@ cargo run --release -- demo transformer  # tiny transformer forward pass
 cargo run --release -- demo predict      # context-mixing predictor (bits/byte)
 cargo run --release -- demo shape        # compile-time tensor shape checking
 cargo run --release -- demo rag          # native retrieval (embedding top-k)
+cargo run --release -- mem    file.aria  # lower the Int/Bool/ADT subset to IR,
+                                         # cross-check vs interpreter, count ADT allocations
 ```
+
+> `aria mem` is stage 1 of the memory-model work: it counts *gross* ADT
+> constructions (no `dup`/`drop`, reuse, or frees yet). The reuse analysis that
+> drives that number down is the upcoming stage.
 
 Sample run (200k-row synthetic telemetry, 3 × i64 columns). Sizes are
 deterministic; times are from one representative run and vary by machine/load:

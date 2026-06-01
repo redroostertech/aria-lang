@@ -36,6 +36,7 @@ Re-run the checks with `cargo test`, `aria bench`, and the probes noted below.
 | **Compile-time tensor shape checking** | `src/shape.rs` is a standalone demo IR, reachable only via `aria demo shape`; it is *not* wired into the language type checker | 🔧 README marks it a prototype |
 | **Memory model (Perceus-RC) "decided"** | researched + documented in `docs/MEMORY.md`, but **not implemented**; whole-program ownership inference is an explicit unproven bet | ⚠️ Honest in MEMORY.md; remains the project's biggest open risk |
 | **"compiled" language** | runs on a tree-walking interpreter; no compiled backend yet | ✅ README does not claim "compiled" — it says compiler is the next milestone |
+| **`aria mem` / memory POC** | lowers the Int/Bool/ADT subset to ANF IR, runs an IR interpreter (cross-checked against the tree-walker), and reports **gross ADT constructions** | ✅ Honest: it does **not** yet do `dup`/`drop`, reuse, frees, or peak-live tracking — so the figure is a baseline, not optimized memory use. Those land in the next stages. |
 
 ## Net
 

@@ -306,13 +306,13 @@ fn int_op(op: BinOp, a: i64, b: i64) -> Result<Value, String> {
             if b == 0 {
                 return Err("division by zero".into());
             }
-            Value::Int(a / b)
+            Value::Int(a.checked_div(b).ok_or("integer overflow in `/`")?)
         }
         BinOp::Mod => {
             if b == 0 {
                 return Err("modulo by zero".into());
             }
-            Value::Int(a % b)
+            Value::Int(a.checked_rem(b).ok_or("integer overflow in `%`")?)
         }
         BinOp::Lt => Value::Bool(a < b),
         BinOp::Le => Value::Bool(a <= b),
@@ -356,7 +356,13 @@ fn values_equal(a: &Value, b: &Value) -> bool {
         // Tensors compare structurally (shape + contents). Without this arm,
         // `t == t` fell through to `false`, silently disagreeing with the type
         // checker which accepts `==` on Tensor.
-        (Value::Tensor(a), Value::Tensor(b)) => a.shape == b.shape && a.data == b.data,
+        (Value::Tensor(a), Value::Tensor(b)) => {
+            // Reflexive even with NaN elements (NaN != NaN in IEEE, but `t == t`
+            // should hold): treat two NaNs as equal.
+            a.shape == b.shape
+                && a.data.len() == b.data.len()
+                && a.data.iter().zip(&b.data).all(|(x, y)| x == y || (x.is_nan() && y.is_nan()))
+        }
         _ => false,
     }
 }
@@ -576,19 +582,56 @@ mod tests {
         }
     }
 
+    // A representative value of a declared parameter/return type, for driving
+    // builtins in the drift test.
+    fn dummy(ty: &crate::ast::Ty) -> Value {
+        use crate::ast::Ty::*;
+        match ty {
+            Int => Value::Int(0),
+            Float => Value::Float(0.0),
+            Bool => Value::Bool(false),
+            Str => Value::Str(String::new()),
+            Unit => Value::Unit,
+            Named(n, _) if n == "Tensor" => Value::Tensor(crate::tensor::Tensor::zeros(&[1, 1])),
+            other => panic!("drift test has no dummy for {}", crate::typeck::show(other)),
+        }
+    }
+
+    // Map a runtime value back to its type, to check a builtin's declared return.
+    fn value_ty(v: &Value) -> crate::ast::Ty {
+        use crate::ast::Ty::*;
+        match v {
+            Value::Int(_) => Int,
+            Value::Float(_) => Float,
+            Value::Bool(_) => Bool,
+            Value::Str(_) => Str,
+            Value::Unit => Unit,
+            Value::Tensor(_) => Named("Tensor".into(), vec![]),
+            Value::Data { ctor, .. } => Named(ctor.clone(), vec![]),
+        }
+    }
+
     #[test]
-    fn every_declared_builtin_is_implemented() {
-        // Drift guard: every builtin the type checker knows about (from the
-        // shared `builtins` table) must be handled by the interpreter. Calling
-        // with no args returns Err for an implemented builtin (arg mismatch) but
-        // Ok(None) for an unknown name — so Ok(None) here means drift.
-        for name in crate::builtins::names() {
-            let r = builtin(name, &[]);
-            assert!(
-                !matches!(r, Ok(None)),
-                "builtin `{}` is declared in the shared table but not implemented in interp",
-                name
-            );
+    fn declared_builtins_implemented_with_matching_signature() {
+        // Drift guard, both directions: every builtin in the shared table must
+        // be implemented AND return a value of its declared type when driven
+        // with correctly-typed arguments.
+        for (name, params, ret) in crate::builtins::signatures() {
+            let args: Vec<Value> = params.iter().map(dummy).collect();
+            match builtin(name, &args) {
+                Ok(Some(v)) => {
+                    assert_eq!(
+                        value_ty(&v),
+                        ret,
+                        "builtin `{}` returned {:?}, declared {}",
+                        name,
+                        v.display(),
+                        crate::typeck::show(&ret)
+                    );
+                }
+                Ok(None) => panic!("builtin `{}` is declared but not implemented in interp", name),
+                Err(e) => panic!("builtin `{}` errored on valid dummy args: {}", name, e),
+            }
         }
     }
 
@@ -662,6 +705,19 @@ mod tests {
             }
         "#);
         assert!(matches!(diff, Value::Bool(false)));
+    }
+
+    #[test]
+    fn tensor_equality_is_reflexive_with_nan() {
+        // A NaN-containing tensor must still equal itself (`==` is reflexive even
+        // though NaN != NaN in IEEE).
+        let same = run(r#"
+            fn main() -> Bool = {
+                let a = tensor_set(tensor_zeros(1, 1), 0, 0, 0.0 / 0.0);
+                a == a
+            }
+        "#);
+        assert!(matches!(same, Value::Bool(true)));
     }
 
     #[test]
