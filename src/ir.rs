@@ -85,6 +85,17 @@ pub struct IFn {
 
 pub struct LowerError(pub String);
 
+/// Builtins the IR interpreter implements. Other declared builtins (tensor/RAG/
+/// compression) are outside the IR subset and rejected at lowering.
+const IR_BUILTINS: &[&str] = &[
+    "print_int",
+    "print_float",
+    "print_bool",
+    "print_str",
+    "concat",
+    "int_to_str",
+];
+
 // ---- lowering (typed AST -> ANF IR) -------------------------------------
 
 struct Lowerer {
@@ -154,6 +165,15 @@ impl Lowerer {
                 Ok(Atom::Var(t))
             }
             Expr::Call(name, args) => {
+                // Builtins the IR doesn't implement (tensors/RAG/compression) are
+                // outside the IR subset — reject at lowering with a clear message
+                // rather than failing confusingly at run time.
+                if crate::builtins::lookup(name).is_some() && !IR_BUILTINS.contains(&name.as_str()) {
+                    return Err(LowerError(format!(
+                        "builtin `{}` is outside the IR subset (tensors/RAG not supported)",
+                        name
+                    )));
+                }
                 let atoms = self.lower_all(args, stmts)?;
                 let t = self.fresh();
                 stmts.push((t.clone(), Bind::Call(name.clone(), atoms)));
@@ -482,6 +502,27 @@ impl IrInterp {
         }
     }
 
+    /// Structural equality matching `interp::values_equal`: scalars by value
+    /// (`NaN != NaN`), ADT cells by constructor + fields read from the heap.
+    fn ir_equal(&self, a: &IValue, b: &IValue) -> bool {
+        match (a, b) {
+            (IValue::Int(x), IValue::Int(y)) => x == y,
+            (IValue::Float(x), IValue::Float(y)) => x == y,
+            (IValue::Bool(x), IValue::Bool(y)) => x == y,
+            (IValue::Str(x), IValue::Str(y)) => x == y,
+            (IValue::Unit, IValue::Unit) => true,
+            (IValue::Ref(x), IValue::Ref(y)) => match (&self.heap[*x], &self.heap[*y]) {
+                (Some(cx), Some(cy)) => {
+                    cx.ctor == cy.ctor
+                        && cx.fields.len() == cy.fields.len()
+                        && cx.fields.iter().zip(&cy.fields).all(|(p, q)| self.ir_equal(p, q))
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
     /// Decrement a cell's refcount; at zero, free it and recursively drop its
     /// `Ref` fields. This is the runtime side of Perceus reference counting.
     fn drop_cell(&mut self, addr: usize) -> Result<(), String> {
@@ -518,6 +559,7 @@ impl IrInterp {
                     (UnOp::Neg, IValue::Int(n)) => {
                         Ok(IValue::Int(n.checked_neg().ok_or("ir: neg overflow")?))
                     }
+                    (UnOp::Neg, IValue::Float(f)) => Ok(IValue::Float(-f)),
                     (UnOp::Not, IValue::Bool(b)) => Ok(IValue::Bool(!b)),
                     _ => Err("ir: bad unary".into()),
                 }
@@ -525,7 +567,14 @@ impl IrInterp {
             Bind::Prim(op, a, b) => {
                 let x = self.atom(a, env)?;
                 let y = self.atom(b, env)?;
-                prim(*op, x, y)
+                // Eq/Ne work on ADTs too (typeck allows it); compare structurally
+                // via the heap, exactly like interp::values_equal. prim() handles
+                // the arithmetic/ordering operators on scalars.
+                match op {
+                    BinOp::Eq => Ok(IValue::Bool(self.ir_equal(&x, &y))),
+                    BinOp::Ne => Ok(IValue::Bool(!self.ir_equal(&x, &y))),
+                    _ => prim(*op, x, y),
+                }
             }
             Bind::Ctor(name, args) => {
                 let fields = args.iter().map(|a| self.atom(a, env)).collect::<Result<_, _>>()?;
@@ -791,6 +840,26 @@ mod tests {
     #[test]
     fn if_and_bool_match() {
         differential("fn classify(n: Int) -> Int = if n < 0 { 0 } else { 1 }\nfn main() -> Int = classify(5)");
+    }
+
+    #[test]
+    fn float_negation_matches_interpreter() {
+        differential("fn main() -> Float = -2.5");
+        differential("fn neg(x: Float) -> Float = -x\nfn main() -> Float = neg(3.5)");
+    }
+
+    #[test]
+    fn adt_equality_matches_interpreter() {
+        differential("type P = | P(Int, Int)\nfn main() -> Bool = P(1, 2) == P(1, 2)");
+        differential("type P = | P(Int, Int)\nfn main() -> Bool = P(1, 2) == P(1, 9)");
+        // structural over String fields too
+        differential("type R = | R(String, Int)\nfn main() -> Bool = R(\"a\", 1) == R(\"a\", 1)");
+    }
+
+    #[test]
+    fn tensor_builtin_rejected_at_lowering() {
+        let prog = parser::parse(lexer::lex("fn main() -> Int = { let t = tensor_zeros(2, 2); 0 }").unwrap()).unwrap();
+        assert!(lower_program(&prog).is_err(), "tensor builtins must be rejected by IR lowering");
     }
 
     // ---- regression tests for the adversarial-review findings ------------
