@@ -38,6 +38,13 @@ Re-run the checks with `cargo test`, `aria bench`, and the probes noted below.
 | **"compiled" language** | runs on a tree-walking interpreter; no compiled backend yet | ✅ README does not claim "compiled" — it says compiler is the next milestone |
 | **`aria mem` / memory POC** | lowers the Int/Bool/ADT subset to ANF IR, inserts precise Perceus-style `dup`/`drop` **+ reuse analysis**, runs it (cross-checked against the tree-walker), and reports fresh allocations / reuses / frees / peak-live | ✅ Garbage-free (no cell live at exit, zero annotations) verified across list-sum, map-then-sum, shared refs, unused values, branch-only-use, scrutinee-used-after-match, heap-field-after-borrow, and trees. **Reuse eliminates 50% of allocations** on the map benchmark (unique cells mutated in place). Scope: the functional subset + an IR interpreter — *not* the whole language or a native backend yet. |
 
+## Compiled backend (WASM, Phase 2a)
+
+| Claim | Reality | Verdict |
+|---|---|---|
+| **Aria compiles to WebAssembly** | `src/wasm.rs` hand-emits a real `.wasm` for the pure Int/Bool/function subset (arithmetic, comparisons, `if`, integer `match`, recursion, short-circuit `&&`/`\|\|`); runs via Node | ✅ Differentially tested vs the interpreter oracle; unsupported features (ADTs/strings/floats/builtins) rejected with a clean error, not a panic. Heap data is Phase 2b. |
+| **Compiled and interpreted Aria agree** | verified across a curated battery + adversarial edge cases (LEB128 limits, multi-byte section lengths, many functions/locals, negatives, large i64) | ✅ Integer overflow is a *defined error*: wasm **traps** on `+`/`-`/`*`/negation overflow and div/rem-by-zero (and `MIN/-1`), matching the interpreter's checked-error semantics. No silent-wrap divergence. |
+
 ## Net
 
 The core *language-property* claims (immutability, expressions, case rule,

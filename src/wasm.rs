@@ -20,9 +20,14 @@
 //! testing*: the compiled module is run under Node's built-in `WebAssembly` and
 //! its result must equal the tree-walking interpreter's (the reference oracle).
 //!
-//! Overflow caveat: wasm i64 arithmetic WRAPS, whereas the IR interpreter does
-//! *checked* arithmetic (overflow -> `Err`). The differential battery therefore
-//! stays inside non-overflowing ranges; this is a deliberate, documented gap.
+//! Overflow semantics: integer overflow is a *defined error* in Aria. The IR
+//! interpreter does checked arithmetic (overflow -> `Err`); to match it, this
+//! backend routes `Add`/`Sub`/`Mul` and unary `Neg` (on `Int`) through emitted
+//! helper functions (`__add_ovf` etc.) that detect signed-i64 overflow and
+//! execute `unreachable` (a wasm trap) on overflow. A trap surfaces in Node as a
+//! thrown error, which `aria wasm-run` reports as `TRAP` — i.e. agreement with
+//! the interpreter's `Err`. Division/remainder already trap natively in wasm on
+//! `/0` and `i64::MIN / -1`, matching the interpreter, so they are left as-is.
 
 use std::collections::HashMap;
 
@@ -62,6 +67,46 @@ struct FnSig {
     params: Vec<WType>,
     ret: WType,
 }
+
+/// The emitted checked-arithmetic helper functions. Each detects signed-i64
+/// overflow and executes `unreachable` (a wasm trap) on overflow; otherwise it
+/// returns the wrapped result. They are appended to the module after all user
+/// functions, in this fixed order, so their function indices are
+/// `n_user_fns + (helper as offset)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OvfHelper {
+    Add,
+    Sub,
+    Mul,
+    Neg,
+}
+
+impl OvfHelper {
+    /// Fixed order in which helpers are appended after user functions.
+    const ALL: [OvfHelper; 4] = [OvfHelper::Add, OvfHelper::Sub, OvfHelper::Mul, OvfHelper::Neg];
+
+    /// Slot offset of this helper relative to the first helper index.
+    fn offset(self) -> u32 {
+        match self {
+            OvfHelper::Add => 0,
+            OvfHelper::Sub => 1,
+            OvfHelper::Mul => 2,
+            OvfHelper::Neg => 3,
+        }
+    }
+
+    /// `(params, ret)` wasm signature of the helper.
+    fn sig(self) -> (Vec<WType>, WType) {
+        match self {
+            OvfHelper::Add | OvfHelper::Sub | OvfHelper::Mul => {
+                (vec![WType::I64, WType::I64], WType::I64)
+            }
+            OvfHelper::Neg => (vec![WType::I64], WType::I64),
+        }
+    }
+}
+
+const I64_MIN: i64 = -9223372036854775808;
 
 // ---- LEB128 (implemented by hand, no deps) ------------------------------
 
@@ -118,9 +163,16 @@ struct LocalEnv<'a> {
     locals: Vec<WType>,
     n_params: u32,
     sigs: &'a HashMap<String, FnSig>,
+    /// Function index of the first overflow helper (`OvfHelper::Add`).
+    ovf_base: u32,
 }
 
 impl<'a> LocalEnv<'a> {
+    /// The function index of an overflow helper.
+    fn ovf_index(&self, h: OvfHelper) -> u32 {
+        self.ovf_base + h.offset()
+    }
+
     fn var_type(&self, name: &str) -> Result<WType, String> {
         self.types
             .get(name)
@@ -236,6 +288,7 @@ fn iexpr_type(e: &IExpr, env: &LocalEnv) -> Result<WType, String> {
                 locals: env.locals.clone(),
                 n_params: env.n_params,
                 sigs: env.sigs,
+                ovf_base: env.ovf_base,
             };
             iexpr_type(body, &probe)
         }
@@ -278,18 +331,38 @@ fn emit_bind(bind: &Bind, env: &mut LocalEnv, code: &mut Vec<u8>) -> Result<WTyp
         Bind::Prim(op, l, r) => {
             let lt = emit_atom(l, env, code)?;
             let rt = emit_atom(r, env, code)?;
-            emit_prim(*op, lt, rt, code)
+            // Add/Sub/Mul on Int are checked: route through an emitted helper
+            // that traps (`unreachable`) on signed-i64 overflow, matching the
+            // interpreter. Everything else (Div/Mod/comparisons/logical) stays
+            // inline. Div/Mod already trap natively on /0 and MIN/-1.
+            match op {
+                BinOp::Add | BinOp::Sub | BinOp::Mul => {
+                    if lt != WType::I64 || rt != WType::I64 {
+                        return Err("wasm backend: arithmetic expects Int operands".into());
+                    }
+                    let helper = match op {
+                        BinOp::Add => OvfHelper::Add,
+                        BinOp::Sub => OvfHelper::Sub,
+                        BinOp::Mul => OvfHelper::Mul,
+                        _ => unreachable!(),
+                    };
+                    code.push(0x10); // call
+                    leb_u(env.ovf_index(helper) as u64, code);
+                    Ok(WType::I64)
+                }
+                _ => emit_prim(*op, lt, rt, code),
+            }
         }
         Bind::Unary(op, a) => match op {
             UnOp::Neg => {
                 let t = atom_type(a, env)?;
                 match t {
                     WType::I64 => {
-                        // i64: 0 - operand
-                        code.push(0x42); // i64.const
-                        leb_s(0, code);
+                        // i64 negation is checked: traps on `-i64::MIN`, which
+                        // overflows, matching the interpreter.
                         emit_atom(a, env, code)?;
-                        code.push(0x7D); // i64.sub
+                        code.push(0x10); // call __neg_ovf
+                        leb_u(env.ovf_index(OvfHelper::Neg) as u64, code);
                         Ok(WType::I64)
                     }
                     WType::I32 => {
@@ -444,6 +517,210 @@ fn emit_iexpr(e: &IExpr, env: &mut LocalEnv, code: &mut Vec<u8>) -> Result<WType
     }
 }
 
+/// Build the complete code-section *entry* (locals declaration + body +
+/// trailing `end`) for a checked-arithmetic helper. Each helper computes the
+/// wrapping result, checks the signed-i64 overflow condition, and executes
+/// `unreachable` (trap) on overflow; otherwise it returns the result.
+///
+/// Helper signatures (params are locals 0..n):
+///   * Add/Sub/Mul(a: i64, b: i64) -> i64
+///   * Neg(a: i64) -> i64
+fn emit_ovf_helper(h: OvfHelper) -> Vec<u8> {
+    // Opcode aliases for readability.
+    const I64_CONST: u8 = 0x42;
+    const I64_ADD: u8 = 0x7C;
+    const I64_SUB: u8 = 0x7D;
+    const I64_MUL: u8 = 0x7E;
+    const I64_DIV_S: u8 = 0x7F;
+    const I64_XOR: u8 = 0x85;
+    const I64_AND: u8 = 0x83;
+    const I64_LT_S: u8 = 0x53;
+    const I64_EQ: u8 = 0x51;
+    const LOCAL_GET: u8 = 0x20;
+    const LOCAL_TEE: u8 = 0x22;
+    const IF: u8 = 0x04;
+    const ELSE: u8 = 0x05;
+    const END: u8 = 0x0B;
+    const UNREACHABLE: u8 = 0x00;
+    const RETURN: u8 = 0x0F;
+    const BT_I64: u8 = 0x7E; // blocktype result = i64
+
+    // How many extra i64 locals (beyond params) each helper needs to hold its
+    // wrapped result `r`.
+    let (n_params, extra_locals): (u32, u32) = match h {
+        OvfHelper::Add | OvfHelper::Sub | OvfHelper::Mul => (2, 1), // a,b + r
+        OvfHelper::Neg => (1, 0),                                   // a only
+    };
+    // Local index of the result temp `r` (first slot after params).
+    let r = n_params;
+
+    let mut body: Vec<u8> = Vec::new();
+    let const_i64 = |v: i64, out: &mut Vec<u8>| {
+        out.push(I64_CONST);
+        leb_s(v, out);
+    };
+
+    match h {
+        OvfHelper::Add => {
+            // r = a + b
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body); // a
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body); // b
+            body.push(I64_ADD);
+            body.push(LOCAL_TEE);
+            leb_u(r as u64, &mut body); // r = a+b, leave r on stack
+            // overflow iff ((a ^ r) & (b ^ r)) < 0
+            // currently stack: [r]; build (a^r):
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body); // a   stack: [r, a]
+            body.push(I64_XOR); //         (a ^ r)  -- xor is commutative
+            // (b ^ r):
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body); // b
+            body.push(LOCAL_GET);
+            leb_u(r as u64, &mut body); // r
+            body.push(I64_XOR); // (b ^ r)
+            body.push(I64_AND); // (a^r) & (b^r)
+            const_i64(0, &mut body);
+            body.push(I64_LT_S); // < 0  ?
+            body.push(IF);
+            body.push(BT_I64);
+            body.push(UNREACHABLE); // overflow -> trap
+            body.push(ELSE);
+            body.push(LOCAL_GET);
+            leb_u(r as u64, &mut body); // return r
+            body.push(END);
+        }
+        OvfHelper::Sub => {
+            // r = a - b
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body); // a
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body); // b
+            body.push(I64_SUB);
+            body.push(0x21); // local.set r = a-b  (stack now empty)
+            leb_u(r as u64, &mut body);
+            // overflow iff ((a ^ b) & (a ^ r)) < 0
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body); // a
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body); // b
+            body.push(I64_XOR); // (a ^ b)
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body); // a
+            body.push(LOCAL_GET);
+            leb_u(r as u64, &mut body); // r
+            body.push(I64_XOR); // (a ^ r)
+            body.push(I64_AND); // (a^b) & (a^r)
+            const_i64(0, &mut body);
+            body.push(I64_LT_S);
+            body.push(IF);
+            body.push(BT_I64);
+            body.push(UNREACHABLE);
+            body.push(ELSE);
+            body.push(LOCAL_GET);
+            leb_u(r as u64, &mut body);
+            body.push(END);
+        }
+        OvfHelper::Mul => {
+            // if a == 0 -> 0
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body); // a
+            const_i64(0, &mut body);
+            body.push(I64_EQ);
+            body.push(IF);
+            body.push(BT_I64);
+            const_i64(0, &mut body); // result 0
+            body.push(RETURN);
+            body.push(ELSE);
+            // else if a == -1 -> overflow iff b == i64::MIN, else -b
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body); // a
+            const_i64(-1, &mut body);
+            body.push(I64_EQ);
+            body.push(IF);
+            body.push(BT_I64);
+            // a == -1
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body); // b
+            const_i64(I64_MIN, &mut body);
+            body.push(I64_EQ);
+            body.push(IF);
+            body.push(BT_I64);
+            body.push(UNREACHABLE); // -i64::MIN overflows
+            body.push(ELSE);
+            // result = 0 - b
+            const_i64(0, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body); // b
+            body.push(I64_SUB);
+            body.push(RETURN);
+            body.push(END); // end inner (b==MIN) if
+            // (the a==-1 if-block must yield i64; the then-branch returned, the
+            //  else-branch returned — but wasm still needs a value for the block
+            //  type on fall-through. Both arms `return`, so this point is
+            //  unreachable; emit `unreachable` to satisfy validation.)
+            body.push(UNREACHABLE);
+            body.push(ELSE);
+            // general case: a != 0 and a != -1, so div_s is safe.
+            // r = a * b
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body); // a
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body); // b
+            body.push(I64_MUL);
+            body.push(LOCAL_TEE);
+            leb_u(r as u64, &mut body); // r  stack:[r]
+            // overflow iff (r / a) != b
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body); // a    stack:[r, a]
+            body.push(I64_DIV_S); // r / a
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body); // b
+            body.push(I64_EQ); // (r/a) == b ?
+            body.push(IF);
+            body.push(BT_I64);
+            body.push(LOCAL_GET);
+            leb_u(r as u64, &mut body); // ok -> return r
+            body.push(ELSE);
+            body.push(UNREACHABLE); // overflow -> trap
+            body.push(END); // end (r/a)==b if
+            body.push(END); // end a==-1 if
+            body.push(END); // end a==0 if
+        }
+        OvfHelper::Neg => {
+            // overflow iff a == i64::MIN; else 0 - a
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body); // a
+            const_i64(I64_MIN, &mut body);
+            body.push(I64_EQ);
+            body.push(IF);
+            body.push(BT_I64);
+            body.push(UNREACHABLE);
+            body.push(ELSE);
+            const_i64(0, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body); // a
+            body.push(I64_SUB); // 0 - a
+            body.push(END);
+        }
+    }
+
+    // Assemble the entry: locals declaration + body + trailing `end`.
+    let mut entry = Vec::new();
+    if extra_locals == 0 {
+        leb_u(0, &mut entry); // no local groups
+    } else {
+        leb_u(1, &mut entry); // one group
+        leb_u(extra_locals as u64, &mut entry); // count
+        entry.push(WType::I64.byte());
+    }
+    entry.extend_from_slice(&body);
+    entry.push(END);
+    entry
+}
+
 /// Key under which a function's index is stored in `LocalEnv::index`. Prefixed
 /// to avoid colliding with a same-named local variable.
 fn fn_index_key(name: &str) -> String {
@@ -489,6 +766,10 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
     // 2. Lower the whole program to ANF IR (reusing the shared lowering pass).
     let fns: HashMap<String, IFn> = ir::lower_program(program)?;
 
+    // The checked-arithmetic helpers are appended after every user function, so
+    // the first helper (`Add`) gets index == number of user functions.
+    let ovf_base = order.len() as u32;
+
     // 3. Generate a code-section entry per function, in `order`.
     let mut code_entries: Vec<Vec<u8>> = Vec::new();
     let mut type_section_funcs: Vec<(Vec<WType>, WType)> = Vec::new();
@@ -523,6 +804,7 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
             locals: Vec::new(),
             n_params: sig.params.len() as u32,
             sigs: &sigs,
+            ovf_base,
         };
 
         // Emit the body instructions; the result is left on the stack.
@@ -554,6 +836,16 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
         type_section_funcs.push((sig.params.clone(), sig.ret));
     }
 
+    // 3b. Append the checked-arithmetic helper functions, in `OvfHelper::ALL`
+    //     order, so their indices line up with `ovf_base + offset`.
+    for h in OvfHelper::ALL {
+        type_section_funcs.push(h.sig());
+        let entry = emit_ovf_helper(h);
+        let mut sized = Vec::new();
+        vec_bytes(&entry, &mut sized);
+        code_entries.push(sized);
+    }
+
     // 4. Assemble the module.
     let mut out = Vec::new();
     // Header: magic + version.
@@ -576,10 +868,12 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
     }
 
     // Function section (id 3): type index per function (1:1 with type section).
+    // Covers user functions *and* the appended overflow helpers.
     {
+        let n = type_section_funcs.len();
         let mut content = Vec::new();
-        leb_u(order.len() as u64, &mut content);
-        for i in 0..order.len() {
+        leb_u(n as u64, &mut content);
+        for i in 0..n {
             leb_u(i as u64, &mut content); // type index == function index here
         }
         section(3, &content, &mut out);
@@ -734,6 +1028,63 @@ mod tests {
         if node_available() {
             assert_eq!(run_wasm(&bytes).unwrap(), "TRAP");
         }
+    }
+
+    /// Both backends must treat an overflowing program as an error: the
+    /// interpreter returns `Err`, and the compiled wasm traps (`unreachable`),
+    /// which Node surfaces as `TRAP`. Both are "error" => agreement.
+    fn assert_overflow_agrees(src: &str) {
+        let interp = interp_result(src);
+        assert!(
+            interp.is_err(),
+            "interpreter should error on overflow for:\n{}",
+            src
+        );
+        let bytes = compile_src(src).expect("overflowing program still compiles");
+        if node_available() {
+            assert_eq!(
+                run_wasm(&bytes).unwrap(),
+                "TRAP",
+                "wasm should trap on overflow for:\n{}",
+                src
+            );
+        }
+    }
+
+    #[test]
+    fn add_overflow_errors_in_both_backends() {
+        // i64::MAX + 1 overflows.
+        assert_overflow_agrees("fn main() -> Int = 9223372036854775807 + 1");
+    }
+
+    #[test]
+    fn mul_overflow_errors_in_both_backends() {
+        // 3037000500^2 exceeds i64::MAX.
+        assert_overflow_agrees("fn main() -> Int = 3037000500 * 3037000500");
+    }
+
+    #[test]
+    fn neg_overflow_errors_in_both_backends() {
+        // Negating i64::MIN overflows. Build MIN via (0 - MAX) - 1, then negate.
+        assert_overflow_agrees(
+            "fn neg(x: Int) -> Int = -x\n\
+             fn main() -> Int = neg((0 - 9223372036854775807) - 1)",
+        );
+        // Sub-form overflow: 0 - i64::MIN (the lowered unary-neg of a literal).
+        assert_overflow_agrees("fn main() -> Int = 0 - ((0 - 9223372036854775807) - 1)");
+    }
+
+    #[test]
+    fn near_boundary_non_overflow_still_agrees() {
+        // (i64::MAX - 1) + 1 == i64::MAX: right at the edge, must NOT trap and
+        // must agree between backends. Also a checked multiply that fits, and a
+        // safe unary negation.
+        differential("fn main() -> Int = 9223372036854775806 + 1");
+        differential("fn main() -> Int = 3037000499 * 3037000499");
+        differential(
+            "fn neg(x: Int) -> Int = -x\n\
+             fn main() -> Int = neg(42) + neg(0 - 7)",
+        );
     }
 
     #[test]
