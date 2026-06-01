@@ -115,11 +115,12 @@ cargo run --release -- mem    file.aria  # lower the Int/Bool/ADT subset to IR,
                                          # cross-check vs interpreter, count ADT allocations
 ```
 
-> `aria mem` inserts precise Perceus-style `dup`/`drop` and reports allocations,
-> frees, and peak live cells. It verifies **garbage-freeness** (every cell freed
-> exactly once, no annotations) and cross-checks the result against the
-> interpreter. The reuse analysis that drives the *gross* allocation count down
-> (by mutating unique cells in place) is the upcoming stage.
+> `aria mem` inserts precise Perceus-style `dup`/`drop` **and reuse analysis**,
+> then reports fresh allocations vs in-place reuses, frees, and peak live cells.
+> It verifies **garbage-freeness** (no cell live at exit, zero annotations) and
+> cross-checks the result against the interpreter. On the map benchmark, reuse
+> eliminates 50% of allocations (a unique list is mutated in place). This is a
+> POC on the Int/Bool/ADT subset — not yet the whole language or a native backend.
 
 Sample run (200k-row synthetic telemetry, 3 × i64 columns). Sizes are
 deterministic; times are from one representative run and vary by machine/load:
@@ -169,7 +170,7 @@ without touching the parser or AST.
 - [ ] Type inference for `let`-generalization / generics (polymorphism)
 - [x] Typed ANF IR + IR interpreter (differentially checked vs the tree-walker)
 - [x] Precise Perceus-style reference counting (zero-annotation, garbage-free verified)
-- [ ] Reuse analysis (in-place mutation of unique cells) — the de-risking measurement
+- [x] Reuse analysis (FBIP) — unique cells mutated in place; **50% of allocations eliminated** on the map benchmark, zero annotations
 - [x] rANS entropy coder + type-aware compression (beats gzip on structured data)
 - [x] Shaped-tensor runtime (matmul/softmax/layernorm) + INT8 quantization
 - [x] Transformer forward pass (inference) running on the tensor core
