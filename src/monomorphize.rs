@@ -398,6 +398,79 @@ impl<'a> Mono<'a> {
         }
     }
 
+    /// Best-effort synthesis of an expression's CONCRETE (mangled) type WITHOUT
+    /// rewriting it or enqueuing specializations. Returns `None` whenever the
+    /// type cannot be determined cheaply and locally (e.g. an under-determined
+    /// generic constructor, or a construct whose result type needs full
+    /// rewriting). Used only to seed whole-call type-parameter inference, so a
+    /// `None` here is never fatal — it just means this argument contributes
+    /// nothing to the seed and is resolved in the rewriting pass instead.
+    fn synth_ty(&mut self, e: &Expr, env: &HashMap<String, Ty>) -> Option<Ty> {
+        match e {
+            Expr::Int(_) => Some(Ty::Int),
+            Expr::Float(_) => Some(Ty::Float),
+            Expr::Bool(_) => Some(Ty::Bool),
+            Expr::Str(_) => Some(Ty::Str),
+            Expr::Unit => Some(Ty::Unit),
+            Expr::Var(n) => env.get(n).cloned(),
+            Expr::Unary(_, inner) => self.synth_ty(inner, env),
+            Expr::Binary(op, l, _) => {
+                let lt = self.synth_ty(l, env)?;
+                Some(binary_ret(*op, &lt))
+            }
+            Expr::Ctor(name, args) => {
+                // Only synthesizable if every owning type parameter is pinned by
+                // the constructor's own field types (no expected-type context
+                // available here). Otherwise return None.
+                let sig = self.ctors.get(name).cloned()?;
+                let mut sub: HashMap<String, Ty> = HashMap::new();
+                for (a, ft) in args.iter().zip(sig.fields.iter()) {
+                    if let Some(at) = self.synth_ty(a, env) {
+                        let _ = self.unify_decl(ft, &at, &mut sub);
+                    }
+                }
+                let mut targs = Vec::new();
+                for p in &sig.type_params {
+                    match sub.get(p) {
+                        Some(t) if !contains_var(t) => targs.push(resolve(t, &sub)),
+                        _ => return None,
+                    }
+                }
+                Some(Ty::Named(self.mangle_type_name(&sig.tyname, &targs), Vec::new()))
+            }
+            Expr::Call(name, args) => {
+                if !self.fns.contains_key(name) {
+                    let mut arg_tys = Vec::new();
+                    for a in args {
+                        arg_tys.push(self.synth_ty(a, env)?);
+                    }
+                    return Some(builtin_ret(name, &arg_tys));
+                }
+                let info = self.fns.get(name).cloned()?;
+                let mut sub: HashMap<String, Ty> = HashMap::new();
+                for (p, a) in info.decl.params.iter().zip(args.iter()) {
+                    if let Some(at) = self.synth_ty(a, env) {
+                        let _ = self.unify_decl(&p.ty, &at, &mut sub);
+                    }
+                }
+                let mut cmap: HashMap<String, Ty> = HashMap::new();
+                for p in &info.decl.type_params {
+                    match sub.get(p) {
+                        Some(t) if !contains_var(t) => {
+                            cmap.insert(p.clone(), resolve(t, &sub));
+                        }
+                        _ => return None,
+                    }
+                }
+                Some(self.subst_ty_partial(&info.decl.ret, &cmap).unwrap_or_else(|| {
+                    self.mangle_concrete(&resolve(&info.decl.ret, &cmap))
+                }))
+            }
+            // If / Match / Block need full rewriting to type; skip for seeding.
+            Expr::If(_, _, _) | Expr::Match(_, _) | Expr::Block(_, _) => None,
+        }
+    }
+
     // ---- expression rewriting + type synthesis ------------------------------
 
     /// Rewrite an expression in a monomorphic context, returning the rewritten
@@ -496,8 +569,22 @@ impl<'a> Mono<'a> {
                 if let Some(exp) = expected {
                     let _ = self.unify_decl(&info.decl.ret, exp, &mut sub);
                 }
-                // Infer callee type args by unifying declared params against the
-                // concrete actuals, pushing each param's (substituted) type down.
+                // FIRST PASS: solve the callee's type parameters by unifying its
+                // declared parameter types against best-effort synthesized
+                // argument types, ACROSS ALL arguments together. This lets one
+                // argument determine a parameter that another argument leaves
+                // free (the Either/`pick` case: `db: B = true` fixes `B`, so the
+                // under-determined `e: E[A, B] = Lft(5)` gets a concrete
+                // expected type below). Args we cannot synthesize cheaply are
+                // simply skipped here; they will be unified in the second pass.
+                for (p, a) in info.decl.params.iter().zip(args.iter()) {
+                    if let Some(at) = self.synth_ty(a, env) {
+                        let _ = self.unify_decl(&p.ty, &at, &mut sub);
+                    }
+                }
+                // SECOND PASS: now substitute the solved params to get each
+                // param's concrete type and thread it down as the EXPECTED type
+                // while rewriting, refining `sub` from the rewritten arg types.
                 let mut rargs = Vec::new();
                 for (p, a) in info.decl.params.iter().zip(args.iter()) {
                     let pexp = self.subst_ty_partial(&p.ty, &sub);

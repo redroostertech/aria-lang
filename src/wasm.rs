@@ -4128,6 +4128,73 @@ mod tests {
     }
 
     #[test]
+    fn generic_either_phantom_param_resolved_by_context() {
+        // Either/Result shape: a constructor that does NOT mention every type
+        // parameter (`Lft(A)` leaves `B` free, `Rgt(B)` leaves `A` free). At a
+        // call `pick(Lft(5), 0, true)`, `pick`'s `B` is fixed by the third arg
+        // (`db: B = true`), so `e: E[A, B]` is `E[Int, Bool]` and `Lft(5)` must
+        // monomorphize at `E[Int, Bool]` — its free `B` recovered from the
+        // call's resolved expected type, not from the constructor alone.
+        differential_heap(
+            "type E[A, B] = | Lft(A) | Rgt(B)\n\
+             fn pick[A, B](e: E[A, B], da: A, db: B) -> A = match e { Lft(a) => a, Rgt(b) => da, }\n\
+             fn main() -> Int = pick(Lft(5), 0, true) + pick(Rgt(true), 9, false)",
+        );
+    }
+
+    #[test]
+    fn generic_result_at_two_param_pairs() {
+        // A `Result[T, E]` with `Ok(T)`/`Err(E)` used at two DIFFERENT `(T, E)`
+        // pairs — `(Int, Bool)` and `(Int, String)`. Each call's free
+        // parameter (the one its scrutinee constructor doesn't pin) is fixed by
+        // a sibling argument (`dt: T`, `de: E`), so both `Ok` and `Err` get a
+        // fully concrete owning type. Each specialization must agree with the
+        // interpreter and end garbage-free.
+        differential_heap(
+            "type Result[T, E] = | Ok(T) | Err(E)\n\
+             fn choose[T, E](r: Result[T, E], dt: T, de: E) -> T = match r { Ok(v) => v, Err(e) => dt, }\n\
+             fn main() -> Int = choose(Ok(7), 0, false) + choose(Err(\"x\"), 100, \"y\")",
+        );
+    }
+
+    #[test]
+    fn generic_ctor_using_only_second_param() {
+        // A constructor (`Second(B)`) that uses ONLY the second type parameter:
+        // its owning type's first parameter `A` is left free by the field and
+        // must come from context. `get_b(Second(42), true, 0)` pins `A` via
+        // `da: A = true` and `B` via both the field and `db: B = 0`, giving
+        // `Tagged[Bool, Int]`. Agrees with the interpreter and garbage-free.
+        differential_heap(
+            "type Tagged[A, B] = | First(A) | Second(B)\n\
+             fn get_b[A, B](t: Tagged[A, B], da: A, db: B) -> B = match t { First(a) => db, Second(b) => b, }\n\
+             fn main() -> Int = get_b(Second(42), true, 0) + get_b(First(false), true, 9)",
+        );
+    }
+
+    #[test]
+    fn generic_true_phantom_is_clean_err() {
+        // A genuinely-unresolvable phantom: `A` is mentioned in `mk`'s signature
+        // but used by NO constructor of `Phantom[A]` and fixed by no argument or
+        // return context. Monomorphization must reject it with a clean `Err`
+        // (not a panic), while the interpreter — which never needs `A` concrete
+        // — still runs.
+        let src = "type Phantom[A] = | Only(Int)\n\
+                   fn mk[A]() -> Phantom[A] = Only(1)\n\
+                   fn main() -> Int = match mk() { Only(n) => n, }";
+        // Interpreter handles the unconstrained parameter dynamically.
+        assert!(interp_result(src).is_ok());
+        // The wasm pipeline must surface a clean error, not panic.
+        match compile_src(src) {
+            Err(msg) => assert!(
+                msg.contains("could not infer type parameter"),
+                "expected a clean phantom-parameter error, got: {}",
+                msg
+            ),
+            Ok(_) => panic!("expected monomorphization to reject the true phantom"),
+        }
+    }
+
+    #[test]
     fn heap_cons_list_sum() {
         differential_heap(
             "type L = | Nil | Cons(Int, L)\n\
