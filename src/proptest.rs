@@ -253,6 +253,19 @@ impl<'a> Gen<'a> {
                 let op = ["==", "!="][self.rng.choice(2)];
                 format!("({} {} {})", self.expr(Ty::Str, fuel - 1), op, self.expr(Ty::Str, fuel - 1))
             }
+            7 => {
+                // Structural ADT equality (== / !=) on two generated IntLists:
+                // exercises the wasm backend's recursive `__eq` helper against
+                // the interpreter's `values_equal` (and that the compared cells
+                // end garbage-free).
+                let op = ["==", "!="][self.rng.choice(2)];
+                format!(
+                    "({} {} {})",
+                    self.expr(Ty::List, fuel - 1),
+                    op,
+                    self.expr(Ty::List, fuel - 1)
+                )
+            }
             3 => format!("!{}", self.paren_bool(fuel - 1)),
             4 | 5 => {
                 let op = ["&&", "||"][self.rng.choice(2)];
@@ -381,7 +394,7 @@ fn ir_run_no_rc(src: &str) -> Result<String, String> {
     let toks = lexer::lex(src)?;
     let prog = parser::parse(toks)?;
     let fns = ir::lower_program(&prog)?;
-    let mut runner = ir::IrInterp::new(fns);
+    let mut runner = ir::IrInterp::new_no_rc(fns);
     let v = runner.run_main()?;
     Ok(runner.render(&v))
 }
@@ -678,7 +691,9 @@ fn run_wasm_live(bytes: &[u8]) -> Result<(String, i64), String> {
          const imp={{env:{{print_str:(p,n)=>{{\
          process.stdout.write(dec.decode(new Uint8Array(memref.buffer).subarray(p,p+n)));\
          process.stdout.write('\\n');}},\
-         print_float:(x)=>{{process.stdout.write(String(x));process.stdout.write('\\n');}}}}}};\
+         print_float:(x)=>{{process.stdout.write(String(x));process.stdout.write('\\n');}},\
+         print_int:(n)=>{{process.stdout.write(String(n));process.stdout.write('\\n');}},\
+         print_bool:(b)=>{{process.stdout.write(b?'true':'false');process.stdout.write('\\n');}}}}}};\
          const b=fs.readFileSync({:?});\
          WebAssembly.instantiate(b,imp).then(r=>{{\
          const ex=r.instance.exports;memref=ex.memory;\

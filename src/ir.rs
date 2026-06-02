@@ -378,13 +378,42 @@ pub struct IrInterp {
     heap: Vec<Option<Cell>>,
     depth: usize,
     pub metrics: Metrics,
+    /// True when the IR has been through the rc pass (`dup`/`drop` inserted), so
+    /// the interpreter actively manages reference counts. A `Bind::Prim(Eq|Ne)`
+    /// on ADTs consumes its operands — but only the rc'd IR has dup'd a reused
+    /// value beforehand, so the operand-drop is performed ONLY in this mode. On
+    /// un-rc'd IR (no dups inserted), the comparison leaves operands alone, which
+    /// avoids a spurious double-free for e.g. `v == v` (the un-rc'd baseline
+    /// never reclaims memory anyway — it only checks the result value).
+    manage_rc: bool,
 }
 
 type Env = HashMap<String, IValue>;
 
 impl IrInterp {
+    /// Construct an interpreter for rc'd IR (manages reference counts). This is
+    /// the production path (the wasm backend always rc's its IR).
     pub fn new(fns: HashMap<String, IFn>) -> Self {
-        IrInterp { fns, heap: Vec::new(), depth: 0, metrics: Metrics::default() }
+        IrInterp {
+            fns,
+            heap: Vec::new(),
+            depth: 0,
+            metrics: Metrics::default(),
+            manage_rc: true,
+        }
+    }
+
+    /// Construct an interpreter for un-rc'd IR (no dup/drop inserted). Used by
+    /// the differential fuzz baseline; it does not reclaim memory and so does
+    /// not perform the `Eq`/`Ne` operand-drop.
+    pub fn new_no_rc(fns: HashMap<String, IFn>) -> Self {
+        IrInterp {
+            fns,
+            heap: Vec::new(),
+            depth: 0,
+            metrics: Metrics::default(),
+            manage_rc: false,
+        }
     }
 
     /// Run `main` and return its value (plus collected metrics in `self`).
@@ -571,8 +600,28 @@ impl IrInterp {
                 // via the heap, exactly like interp::values_equal. prim() handles
                 // the arithmetic/ordering operators on scalars.
                 match op {
-                    BinOp::Eq => Ok(IValue::Bool(self.ir_equal(&x, &y))),
-                    BinOp::Ne => Ok(IValue::Bool(!self.ir_equal(&x, &y))),
+                    BinOp::Eq | BinOp::Ne => {
+                        let equal = self.ir_equal(&x, &y);
+                        // The rc pass marks `Eq`/`Ne` operands as CONSUMED (it
+                        // dups any value reused later and inserts no drop here),
+                        // so this comparison OWNS one reference to each operand
+                        // and must release it — after `ir_equal` read the heap —
+                        // to stay garbage-free, mirroring the wasm `__eq` site.
+                        // Only in rc mode: the un-rc'd baseline never dup'd a
+                        // reused operand, so dropping here would double-free e.g.
+                        // `v == v`.
+                        if self.manage_rc {
+                            if let IValue::Ref(a) = x {
+                                self.metrics.drops += 1;
+                                self.drop_cell(a)?;
+                            }
+                            if let IValue::Ref(a) = y {
+                                self.metrics.drops += 1;
+                                self.drop_cell(a)?;
+                            }
+                        }
+                        Ok(IValue::Bool(if *op == BinOp::Eq { equal } else { !equal }))
+                    }
                     _ => prim(*op, x, y),
                 }
             }

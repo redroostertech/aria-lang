@@ -306,10 +306,12 @@ enum HeapHelper {
     IntToStr, // (n:i64) -> ptr:i32     decimal UTF-8 of n
     StrEq,    // (a:i32, b:i32) -> i32   len+byte equality (1/0)
     StrLit,   // (data_addr:i32, len:i32) -> ptr:i32   alloc + copy a literal
+    // ---- structural ADT equality (Phase 2e) ----
+    Eq, // (a:i32, b:i32) -> i32   recursive structural ADT equality (1/0)
 }
 
 impl HeapHelper {
-    const ALL: [HeapHelper; 14] = [
+    const ALL: [HeapHelper; 15] = [
         HeapHelper::Alloc,
         HeapHelper::Free,
         HeapHelper::Dup,
@@ -324,6 +326,7 @@ impl HeapHelper {
         HeapHelper::IntToStr,
         HeapHelper::StrEq,
         HeapHelper::StrLit,
+        HeapHelper::Eq,
     ];
 
     fn offset(self) -> u32 {
@@ -342,6 +345,7 @@ impl HeapHelper {
             HeapHelper::IntToStr => 11,
             HeapHelper::StrEq => 12,
             HeapHelper::StrLit => 13,
+            HeapHelper::Eq => 14,
         }
     }
 
@@ -364,6 +368,7 @@ impl HeapHelper {
             HeapHelper::IntToStr => (vec![WType::I64], WType::I32),
             HeapHelper::StrEq => (vec![WType::I32, WType::I32], WType::I32),
             HeapHelper::StrLit => (vec![WType::I32, WType::I32], WType::I32),
+            HeapHelper::Eq => (vec![WType::I32, WType::I32], WType::I32),
         }
     }
 }
@@ -501,6 +506,10 @@ struct LocalEnv<'a> {
     print_str_idx: u32,
     /// Wasm function index of the imported `env.print_float` (always 1).
     print_float_idx: u32,
+    /// Wasm function index of the imported `env.print_int` (always 2).
+    print_int_idx: u32,
+    /// Wasm function index of the imported `env.print_bool` (always 3).
+    print_bool_idx: u32,
 }
 
 impl<'a> LocalEnv<'a> {
@@ -673,6 +682,8 @@ fn match_type(scrut: &Atom, arms: &[ir::IArm], env: &LocalEnv) -> Result<WType, 
             str_lits: env.str_lits,
             print_str_idx: env.print_str_idx,
             print_float_idx: env.print_float_idx,
+            print_int_idx: env.print_int_idx,
+            print_bool_idx: env.print_bool_idx,
         };
         let at = iexpr_type(&arm.body, &probe)?;
         match result {
@@ -728,6 +739,8 @@ fn iexpr_type(e: &IExpr, env: &LocalEnv) -> Result<WType, String> {
                 str_lits: env.str_lits,
                 print_str_idx: env.print_str_idx,
             print_float_idx: env.print_float_idx,
+            print_int_idx: env.print_int_idx,
+            print_bool_idx: env.print_bool_idx,
             };
             iexpr_type(body, &probe)
         }
@@ -750,6 +763,8 @@ fn iexpr_type(e: &IExpr, env: &LocalEnv) -> Result<WType, String> {
                 str_lits: env.str_lits,
                 print_str_idx: env.print_str_idx,
             print_float_idx: env.print_float_idx,
+            print_int_idx: env.print_int_idx,
+            print_bool_idx: env.print_bool_idx,
             };
             iexpr_type(body, &probe)
         }
@@ -819,6 +834,15 @@ fn emit_bind(bind: &Bind, env: &mut LocalEnv, code: &mut Vec<u8>) -> Result<WTyp
                     return Err("wasm backend: == / != on mismatched types".into());
                 }
                 return emit_str_eq(*op, l, r, env, code);
+            }
+            // ADT `==`/`!=`: recursive structural compare via `__eq`. Like the
+            // String case, the comparison OWNS its operands (the rc pass marks
+            // Eq/Ne operands consumed) and must drop both ADT pointers after.
+            if matches!(op, BinOp::Eq | BinOp::Ne) && atom_type(l, env)? == WType::Ref {
+                if atom_type(r, env)? != WType::Ref {
+                    return Err("wasm backend: == / != on mismatched types".into());
+                }
+                return emit_adt_eq(*op, l, r, env, code);
             }
             let lt = emit_atom(l, env, code)?;
             let rt = emit_atom(r, env, code)?;
@@ -1013,10 +1037,14 @@ fn emit_store_cell_fields(
 }
 
 /// The builtins the wasm backend implements inline. `concat`/`int_to_str`
-/// produce/consume Strings; `print_str`/`print_float` are host-imported
-/// effectful prints. (`print_float` takes an unboxed f64.)
+/// produce/consume Strings; `print_str`/`print_float`/`print_int`/`print_bool`
+/// are host-imported effectful prints. (`print_float` takes an unboxed f64,
+/// `print_int` an i64, `print_bool` an i32.)
 fn is_str_builtin(name: &str) -> bool {
-    matches!(name, "concat" | "int_to_str" | "print_str" | "print_float")
+    matches!(
+        name,
+        "concat" | "int_to_str" | "print_str" | "print_float" | "print_int" | "print_bool"
+    )
 }
 
 /// The wasm result type of an inline builtin. `print_str`/`print_float` are
@@ -1113,6 +1141,34 @@ fn emit_str_builtin(
             leb_s(0, code);
             Ok(WType::I32)
         }
+        "print_int" => {
+            if args.len() != 1 || atom_type(&args[0], env)? != WType::I64 {
+                return Err("wasm backend: print_int expects one Int".into());
+            }
+            // Push the i64 and call the host import `env.print_int(i64)`.
+            let print_idx = env.print_int_idx;
+            emit_atom(&args[0], env, code)?;
+            code.push(0x10); // call env.print_int
+            leb_u(print_idx as u64, code);
+            // dummy i32 result for the let-binding (print_int is Unit-like)
+            code.push(0x41); // i32.const 0
+            leb_s(0, code);
+            Ok(WType::I32)
+        }
+        "print_bool" => {
+            if args.len() != 1 || atom_type(&args[0], env)? != WType::I32 {
+                return Err("wasm backend: print_bool expects one Bool".into());
+            }
+            // Push the i32 (0/1) and call the host import `env.print_bool(i32)`.
+            let print_idx = env.print_bool_idx;
+            emit_atom(&args[0], env, code)?;
+            code.push(0x10); // call env.print_bool
+            leb_u(print_idx as u64, code);
+            // dummy i32 result for the let-binding (print_bool is Unit-like)
+            code.push(0x41); // i32.const 0
+            leb_s(0, code);
+            Ok(WType::I32)
+        }
         _ => Err(format!("wasm backend: unknown string builtin `{}`", name)),
     }
 }
@@ -1166,6 +1222,56 @@ fn emit_str_eq(
     };
     drop_one(l, lt, code);
     drop_one(r, rt, code);
+    Ok(WType::I32)
+}
+
+/// Emit an ADT `==` / `!=`. Both operands are evaluated into fresh i32 temps,
+/// `__eq` compares them structurally (recursively), the result is negated for
+/// `!=`, and BOTH operand pointers are then dropped via `__drop`. `__eq` only
+/// READS the heap, so dropping afterwards is safe. The comparison CONSUMES its
+/// ADT operands: the rc pass marks `Eq`/`Ne` operands as consumed (dup'ing a
+/// value that is reused later, and inserting no separate drop for these
+/// operands), so the comparison owns exactly one reference to each operand and
+/// releases it here — keeping the heap garbage-free, and the dup'd reuse path
+/// from double-freeing.
+fn emit_adt_eq(
+    op: BinOp,
+    l: &Atom,
+    r: &Atom,
+    env: &mut LocalEnv,
+    code: &mut Vec<u8>,
+) -> Result<WType, String> {
+    let lt = env.fresh_i32();
+    let rt = env.fresh_i32();
+    let eq = env.heap_index(HeapHelper::Eq);
+    let drop_ref = env.heap_index(HeapHelper::Drop);
+    // lt = l ; rt = r
+    emit_atom(l, env, code)?;
+    code.push(0x21); // local.set lt
+    leb_u(lt as u64, code);
+    emit_atom(r, env, code)?;
+    code.push(0x21); // local.set rt
+    leb_u(rt as u64, code);
+    // result = __eq(lt, rt)
+    code.push(0x20);
+    leb_u(lt as u64, code);
+    code.push(0x20);
+    leb_u(rt as u64, code);
+    code.push(0x10); // call __eq
+    leb_u(eq as u64, code);
+    if op == BinOp::Ne {
+        code.push(0x45); // i32.eqz (negate)
+    }
+    // Release each operand now that `__eq` has finished reading the heap.
+    let drop_one = |slot: u32, code: &mut Vec<u8>| {
+        code.push(0x20); // local.get slot
+        leb_u(slot as u64, code);
+        code.push(0x10); // call __drop
+        leb_u(drop_ref as u64, code);
+        code.push(0x1A); // drop dummy result
+    };
+    drop_one(lt, code);
+    drop_one(rt, code);
     Ok(WType::I32)
 }
 
@@ -1798,6 +1904,8 @@ fn emit_heap_helper(h: HeapHelper, ctors: &CtorTable, heap_base: u32) -> Vec<u8>
     let drop_str_idx = heap_base + HeapHelper::DropStr.offset();
     let alloc_idx = heap_base + HeapHelper::Alloc.offset();
     let alloc_str_idx = heap_base + HeapHelper::AllocStr.offset();
+    let streq_idx = heap_base + HeapHelper::StrEq.offset();
+    let eq_idx = heap_base + HeapHelper::Eq.offset();
 
     let mut body: Vec<u8> = Vec::new();
     match h {
@@ -2586,6 +2694,107 @@ fn emit_heap_helper(h: HeapHelper, ctors: &CtorTable, heap_base: u32) -> Vec<u8>
             leb_u(2, &mut body); // return ptr
             helper_entry(&[WType::I32, WType::I32], body)
         }
+        HeapHelper::Eq => {
+            // (a:i32, b:i32) -> i32. Structural ADT equality, recursive.
+            // This helper only READS the heap; it never dups/drops. The caller
+            // (`emit_adt_eq`) owns and drops both operands after the comparison.
+            //
+            // 1. If tag(a) != tag(b) return 0.
+            // 2. Per tag T: `if tag(a) == T { return AND of field comparisons }`
+            //    (no fields -> return 1). Fields compared by their static type:
+            //    Int/Bool -> i64.eq (Bool is zero-extended in its slot),
+            //    Float -> f64.eq, String -> __streq, Ref -> recursive __eq.
+            const I64_NE: u8 = 0x52;
+            const F64_EQ: u8 = 0x61;
+            const I32_AND: u8 = 0x71;
+            const RETURN: u8 = 0x0F;
+            // if tag(a) != tag(b) { return 0 }
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body); // a
+            i64_load(8, &mut body); // tag(a)
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body); // b
+            i64_load(8, &mut body); // tag(b)
+            body.push(I64_NE);
+            body.push(IF);
+            body.push(BT_VOID);
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            body.push(RETURN);
+            body.push(END);
+            // Per-tag dispatch (tags now known equal; key on tag(a)).
+            for info in ctor_infos_sorted(ctors) {
+                body.push(LOCAL_GET);
+                leb_u(0, &mut body); // a
+                i64_load(8, &mut body); // tag(a)
+                body.push(I64_CONST);
+                leb_s(info.tag, &mut body);
+                body.push(I64_EQ);
+                body.push(IF);
+                body.push(BT_VOID); // one-armed if; body only `return`s its result
+                // Accumulate field equalities, ANDed onto an initial `1`.
+                body.push(I32_CONST);
+                leb_s(1, &mut body); // start: all-equal so far
+                for (fi, fty) in info.field_types.iter().enumerate() {
+                    let off = CELL_HEADER + SLOT * fi as u64;
+                    match fty {
+                        // Int and Bool both live in the i64 slot (Bool is
+                        // zero-extended), so i64.eq compares them correctly.
+                        WType::I64 | WType::I32 => {
+                            body.push(LOCAL_GET);
+                            leb_u(0, &mut body); // a
+                            i64_load(off, &mut body);
+                            body.push(LOCAL_GET);
+                            leb_u(1, &mut body); // b
+                            i64_load(off, &mut body);
+                            body.push(I64_EQ);
+                        }
+                        WType::F64 => {
+                            body.push(LOCAL_GET);
+                            leb_u(0, &mut body); // a
+                            f64_load(off, &mut body);
+                            body.push(LOCAL_GET);
+                            leb_u(1, &mut body); // b
+                            f64_load(off, &mut body);
+                            body.push(F64_EQ);
+                        }
+                        WType::Str => {
+                            // __streq(a.field, b.field)
+                            body.push(LOCAL_GET);
+                            leb_u(0, &mut body); // a
+                            i64_load(off, &mut body);
+                            body.push(I32_WRAP_I64);
+                            body.push(LOCAL_GET);
+                            leb_u(1, &mut body); // b
+                            i64_load(off, &mut body);
+                            body.push(I32_WRAP_I64);
+                            body.push(CALL);
+                            leb_u(streq_idx as u64, &mut body);
+                        }
+                        WType::Ref => {
+                            // __eq(a.field, b.field)  (recursive)
+                            body.push(LOCAL_GET);
+                            leb_u(0, &mut body); // a
+                            i64_load(off, &mut body);
+                            body.push(I32_WRAP_I64);
+                            body.push(LOCAL_GET);
+                            leb_u(1, &mut body); // b
+                            i64_load(off, &mut body);
+                            body.push(I32_WRAP_I64);
+                            body.push(CALL);
+                            leb_u(eq_idx as u64, &mut body);
+                        }
+                    }
+                    body.push(I32_AND); // fold into the accumulator
+                }
+                body.push(RETURN); // return the accumulated equality
+                body.push(END); // end if tag==T
+            }
+            // Unreachable in practice (tags matched one of the known ctors).
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            helper_entry(&[], body)
+        }
     }
 }
 
@@ -2779,12 +2988,15 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
 
     // 1. Collect function signatures from the typed AST, in declaration order,
     //    assigning deterministic wasm function indices.
-    // We import two host functions: `env.print_str` (index 0) and
-    // `env.print_float` (index 1). Every DEFINED function index is offset by
+    // We import four host functions: `env.print_str` (index 0),
+    // `env.print_float` (index 1), `env.print_int` (index 2), and
+    // `env.print_bool` (index 3). Every DEFINED function index is offset by
     // N_IMPORTS.
-    const N_IMPORTS: u32 = 2;
+    const N_IMPORTS: u32 = 4;
     const PRINT_STR_IDX: u32 = 0;
     const PRINT_FLOAT_IDX: u32 = 1;
+    const PRINT_INT_IDX: u32 = 2;
+    const PRINT_BOOL_IDX: u32 = 3;
 
     let mut sigs: HashMap<String, FnSig> = HashMap::new();
     let mut order: Vec<String> = Vec::new();
@@ -2913,6 +3125,8 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
             str_lits: &str_lits,
             print_str_idx: PRINT_STR_IDX,
             print_float_idx: PRINT_FLOAT_IDX,
+            print_int_idx: PRINT_INT_IDX,
+            print_bool_idx: PRINT_BOOL_IDX,
         };
 
         // Emit the body instructions; the result is left on the stack.
@@ -2971,7 +3185,9 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
 
     // Type section (id 1): type index 0 is `env.print_str`'s signature
     // `(i32, i32) -> ()`; type index 1 is `env.print_float`'s `(f64) -> ()`;
-    // type indices 2.. are the defined functions' single-result signatures.
+    // type index 2 is `env.print_int`'s `(i64) -> ()`; type index 3 is
+    // `env.print_bool`'s `(i32) -> ()`; type indices 4.. are the defined
+    // functions' single-result signatures.
     {
         let mut content = Vec::new();
         leb_u((N_IMPORTS as usize + type_section_funcs.len()) as u64, &mut content);
@@ -2986,7 +3202,17 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
         leb_u(1, &mut content); // 1 param
         content.push(WType::F64.byte());
         leb_u(0, &mut content); // zero results
-        // types 2..: the defined functions.
+        // type 2: env.print_int(i64) -> ()  (no results)
+        content.push(0x60); // func type tag
+        leb_u(1, &mut content); // 1 param
+        content.push(WType::I64.byte());
+        leb_u(0, &mut content); // zero results
+        // type 3: env.print_bool(i32) -> ()  (no results)
+        content.push(0x60); // func type tag
+        leb_u(1, &mut content); // 1 param
+        content.push(WType::I32.byte());
+        leb_u(0, &mut content); // zero results
+        // types 4..: the defined functions.
         for (params, ret) in &type_section_funcs {
             content.push(0x60); // func type tag
             leb_u(params.len() as u64, &mut content);
@@ -2999,13 +3225,14 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
         section(1, &content, &mut out);
     }
 
-    // Import section (id 2): import `env.print_str` (type 0) and
-    // `env.print_float` (type 1).
+    // Import section (id 2): import `env.print_str` (type 0),
+    // `env.print_float` (type 1), `env.print_int` (type 2), and
+    // `env.print_bool` (type 3).
     {
         let mut content = Vec::new();
-        leb_u(2, &mut content); // two imports
-        // env.print_str : type 0
+        leb_u(N_IMPORTS as u64, &mut content); // four imports
         let m = b"env";
+        // env.print_str : type 0
         leb_u(m.len() as u64, &mut content);
         content.extend_from_slice(m);
         let nm = b"print_str";
@@ -3021,11 +3248,27 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
         content.extend_from_slice(nf);
         content.push(0x00); // import kind = func
         leb_u(1, &mut content); // type index 1
+        // env.print_int : type 2
+        leb_u(m.len() as u64, &mut content);
+        content.extend_from_slice(m);
+        let ni = b"print_int";
+        leb_u(ni.len() as u64, &mut content);
+        content.extend_from_slice(ni);
+        content.push(0x00); // import kind = func
+        leb_u(2, &mut content); // type index 2
+        // env.print_bool : type 3
+        leb_u(m.len() as u64, &mut content);
+        content.extend_from_slice(m);
+        let nb = b"print_bool";
+        leb_u(nb.len() as u64, &mut content);
+        content.extend_from_slice(nb);
+        content.push(0x00); // import kind = func
+        leb_u(3, &mut content); // type index 3
         section(2, &content, &mut out);
     }
 
-    // Function section (id 3): type index per DEFINED function. Type indices 0
-    // and 1 are the imports; defined function `i` uses type index
+    // Function section (id 3): type index per DEFINED function. Type indices
+    // 0..N_IMPORTS are the imports; defined function `i` uses type index
     // `N_IMPORTS + i`.
     {
         let n = type_section_funcs.len();
@@ -3152,7 +3395,7 @@ mod tests {
         let script = format!(
             "const fs=require('fs');\
              const dec=new TextDecoder();\
-             const imp={{env:{{print_str:(p,n)=>{{}},print_float:(x)=>{{}}}}}};\
+             const imp={{env:{{print_str:(p,n)=>{{}},print_float:(x)=>{{}},print_int:(n)=>{{}},print_bool:(b)=>{{}}}}}};\
              try{{const b=fs.readFileSync({:?});\
              WebAssembly.instantiate(b,imp).then(r=>{{\
              try{{const ex=r.instance.exports;const v=ex.main();\
@@ -3313,13 +3556,14 @@ mod tests {
 
     #[test]
     fn unsupported_programs_return_err_not_panic() {
-        // print_int builtin call (not implemented in the wasm backend).
-        let s4 = "fn main() -> Int = { print_int(1); 0 }";
-        // Unit-returning function.
+        // Unit-returning `main` (Unit is outside the compilable result subset).
         let s5 = "fn main() -> Unit = ()";
-        // Still-deferred: structural ADT equality (needs a recursive compare).
+        // `main` returning Bool: the Node harness decodes only Int/Float/String
+        // results, so a Bool-returning `main` is rejected (even though structural
+        // ADT `==` itself is now supported — here it's main's RETURN type that is
+        // out of subset).
         let s8 = "type P = | P(Int, Int)\nfn main() -> Bool = P(1, 2) == P(1, 2)";
-        for src in [s4, s5, s8] {
+        for src in [s5, s8] {
             let r = compile_src(src);
             assert!(r.is_err(), "expected Err (no panic) for:\n{}", src);
         }
@@ -3344,7 +3588,7 @@ mod tests {
         // BigUint64Array view, so we compare bit patterns (NaN-safe, exact).
         let script = format!(
             "const fs=require('fs');\
-             const imp={{env:{{print_str:(p,n)=>{{}},print_float:(x)=>{{}}}}}};\
+             const imp={{env:{{print_str:(p,n)=>{{}},print_float:(x)=>{{}},print_int:(n)=>{{}},print_bool:(b)=>{{}}}}}};\
              const b=fs.readFileSync({:?});\
              WebAssembly.instantiate(b,imp).then(r=>{{\
              const ex=r.instance.exports;const v=ex.main();\
@@ -3449,6 +3693,114 @@ mod tests {
     }
 
     #[test]
+    fn adt_structural_equality_matches_interpreter() {
+        // Structural ADT `==`/`!=` compiled to the recursive `__eq` helper must
+        // agree with the interpreter AND end garbage-free (`__live == 0`). The
+        // result is an Int derived from the comparison (main can't return Bool).
+
+        // Nullary constructors: equal vs unequal tags, `==` and `!=`.
+        differential_heap(
+            "type C = | Red | Green | Blue\n\
+             fn main() -> Int = if Red == Red { 1 } else { 0 }",
+        );
+        differential_heap(
+            "type C = | Red | Green | Blue\n\
+             fn main() -> Int = if Red == Green { 1 } else { 0 }",
+        );
+        differential_heap(
+            "type C = | Red | Green | Blue\n\
+             fn main() -> Int = if Red != Blue { 1 } else { 0 }",
+        );
+
+        // Int fields: equal, unequal, and a different constructor.
+        differential_heap(
+            "type P = | A(Int, Int) | B(Int)\n\
+             fn main() -> Int = if A(1, 2) == A(1, 2) { 1 } else { 0 }",
+        );
+        differential_heap(
+            "type P = | A(Int, Int) | B(Int)\n\
+             fn main() -> Int = if A(1, 2) == A(1, 9) { 1 } else { 0 }",
+        );
+        differential_heap(
+            "type P = | A(Int, Int) | B(Int)\n\
+             fn main() -> Int = if A(1, 2) != B(1) { 1 } else { 0 }",
+        );
+
+        // Bool fields.
+        differential_heap(
+            "type Q = | Q(Bool, Bool)\n\
+             fn main() -> Int = if Q(true, false) == Q(true, false) { 1 } else { 0 }",
+        );
+        differential_heap(
+            "type Q = | Q(Bool, Bool)\n\
+             fn main() -> Int = if Q(true, false) == Q(true, true) { 1 } else { 0 }",
+        );
+
+        // Float fields.
+        differential_heap(
+            "type F = | F(Float, Float)\n\
+             fn main() -> Int = if F(1.5, 2.5) == F(1.5, 2.5) { 1 } else { 0 }",
+        );
+        differential_heap(
+            "type F = | F(Float, Float)\n\
+             fn main() -> Int = if F(1.5, 2.5) == F(1.5, 9.0) { 1 } else { 0 }",
+        );
+
+        // String fields (compared via `__streq` inside `__eq`).
+        differential_heap(
+            "type S = | S(String, Int)\n\
+             fn main() -> Int = if S(\"hi\", 3) == S(\"hi\", 3) { 1 } else { 0 }",
+        );
+        differential_heap(
+            "type S = | S(String, Int)\n\
+             fn main() -> Int = if S(\"hi\", 3) == S(\"bye\", 3) { 1 } else { 0 }",
+        );
+
+        // NESTED ADTs (Ref fields): recursive `__eq` descends both lists.
+        differential_heap(
+            "type L = | Nil | Cons(Int, L)\n\
+             fn main() -> Int = if Cons(1, Cons(2, Nil)) == Cons(1, Cons(2, Nil)) { 1 } else { 0 }",
+        );
+        differential_heap(
+            "type L = | Nil | Cons(Int, L)\n\
+             fn main() -> Int = if Cons(1, Cons(2, Nil)) == Cons(1, Cons(3, Nil)) { 1 } else { 0 }",
+        );
+        differential_heap(
+            "type L = | Nil | Cons(Int, L)\n\
+             fn main() -> Int = if Cons(1, Nil) != Cons(1, Cons(2, Nil)) { 1 } else { 0 }",
+        );
+    }
+
+    #[test]
+    fn adt_equality_shared_operand_no_double_free() {
+        // A value compared (consumed by `==`) and then USED AGAIN: the rc pass
+        // dups it before the comparison, the `==` site drops its one owned
+        // reference, and the later use drops the other. No double-free; the heap
+        // ends garbage-free (`__live == 0`).
+        differential_heap(
+            "type L = | Nil | Cons(Int, L)\n\
+             fn lenL(xs: L) -> Int = match xs { Nil => 0, Cons(_, r) => 1 + lenL(r), }\n\
+             fn main() -> Int = {\n\
+               let xs = Cons(1, Cons(2, Nil));\n\
+               let ys = Cons(1, Cons(2, Nil));\n\
+               let eq = if xs == ys { 1 } else { 0 };\n\
+               eq + lenL(xs)\n\
+             }",
+        );
+        // Both operands shared and reused after the comparison.
+        differential_heap(
+            "type L = | Nil | Cons(Int, L)\n\
+             fn lenL(xs: L) -> Int = match xs { Nil => 0, Cons(_, r) => 1 + lenL(r), }\n\
+             fn main() -> Int = {\n\
+               let xs = Cons(1, Cons(2, Nil));\n\
+               let ys = Cons(1, Cons(2, Nil));\n\
+               let eq = if xs == ys { 10 } else { 0 };\n\
+               eq + lenL(xs) + lenL(ys)\n\
+             }",
+        );
+    }
+
+    #[test]
     fn float_main_returns_f64() {
         // A Float-field ADT whose matched field flows out as main's f64 result.
         differential_float(
@@ -3494,7 +3846,9 @@ mod tests {
         let script = format!(
             "const fs=require('fs');\
              const imp={{env:{{print_str:(p,n)=>{{}},\
-             print_float:(x)=>{{process.stdout.write(String(x));process.stdout.write('\\n');}}}}}};\
+             print_float:(x)=>{{process.stdout.write(String(x));process.stdout.write('\\n');}},\
+             print_int:(n)=>{{process.stdout.write(String(n));process.stdout.write('\\n');}},\
+             print_bool:(b)=>{{process.stdout.write(b?'true':'false');process.stdout.write('\\n');}}}}}};\
              const b=fs.readFileSync({:?});\
              WebAssembly.instantiate(b,imp).then(r=>{{r.instance.exports.main();}})\
              .catch(e=>process.stdout.write('TRAP'));",
@@ -3522,7 +3876,7 @@ mod tests {
         let script = format!(
             "const fs=require('fs');\
              const dec=new TextDecoder();\
-             const imp={{env:{{print_str:(p,n)=>{{}},print_float:(x)=>{{}}}}}};\
+             const imp={{env:{{print_str:(p,n)=>{{}},print_float:(x)=>{{}},print_int:(n)=>{{}},print_bool:(b)=>{{}}}}}};\
              const b=fs.readFileSync({:?});\
              WebAssembly.instantiate(b,imp).then(r=>{{\
              const ex=r.instance.exports;const v=ex.main();\
@@ -3681,7 +4035,7 @@ mod tests {
         std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
         let script = format!(
             "const fs=require('fs');\
-             const imp={{env:{{print_str:(p,n)=>{{}},print_float:(x)=>{{}}}}}};\
+             const imp={{env:{{print_str:(p,n)=>{{}},print_float:(x)=>{{}},print_int:(n)=>{{}},print_bool:(b)=>{{}}}}}};\
              const b=fs.readFileSync({:?});\
              WebAssembly.instantiate(b,imp).then(r=>{{\
              const m=String(r.instance.exports.main());\
@@ -3870,7 +4224,7 @@ mod tests {
         std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
         let script = format!(
             "const fs=require('fs');\
-             const imp={{env:{{print_str:(p,n)=>{{}},print_float:(x)=>{{}}}}}};\
+             const imp={{env:{{print_str:(p,n)=>{{}},print_float:(x)=>{{}},print_int:(n)=>{{}},print_bool:(b)=>{{}}}}}};\
              const b=fs.readFileSync({:?});\
              WebAssembly.instantiate(b,imp).then(r=>{{\
              const m=String(r.instance.exports.main());\

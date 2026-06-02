@@ -228,6 +228,10 @@ fn run_wasm_run(args: &[String]) -> ExitCode {
          process.stdout.write(dec.decode(mem.subarray(p,p+n)));\
          process.stdout.write('\\n');}},\
          print_float:(x)=>{{process.stdout.write(String(x));\
+         process.stdout.write('\\n');}},\
+         print_int:(n)=>{{process.stdout.write(String(n));\
+         process.stdout.write('\\n');}},\
+         print_bool:(b)=>{{process.stdout.write(b?'true':'false');\
          process.stdout.write('\\n');}}}}}};\
          try{{const b=fs.readFileSync({:?});\
          WebAssembly.instantiate(b,imp).then(r=>{{\
