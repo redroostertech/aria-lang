@@ -61,27 +61,30 @@ use crate::ir::{self, Atom, Bind, IExpr, IFn};
 enum WType {
     I64, // Aria Int
     I32, // Aria Bool
+    F64, // Aria Float (unboxed IEEE-754 double)
     Ref, // pointer into linear memory (i32 address) — Phase 2b ADT cell
     Str, // pointer into linear memory (i32 address) — Phase 2d String object
 }
 
 impl WType {
-    /// The valtype byte used in the binary (`0x7E` = i64, `0x7F` = i32).
-    /// `Ref` is a wasm32 address, so it is an i32 at the wasm level.
+    /// The valtype byte used in the binary (`0x7E` = i64, `0x7F` = i32,
+    /// `0x7C` = f64). `Ref`/`Str` are wasm32 addresses, so they are i32.
     fn byte(self) -> u8 {
         match self {
             WType::I64 => 0x7E,
+            WType::F64 => 0x7C,
             WType::I32 | WType::Ref | WType::Str => 0x7F,
         }
     }
 
-    /// Map an AST type to a wasm value type. `Int -> i64`, `Bool -> i32`, and a
-    /// *non-generic* named ADT type -> `Ref` (a heap pointer). Generic type
-    /// variables, Float, String and Unit remain outside the 2b subset.
+    /// Map an AST type to a wasm value type. `Int -> i64`, `Bool -> i32`,
+    /// `Float -> f64`, and a *non-generic* named ADT type -> `Ref` (a heap
+    /// pointer). Generic type variables and Unit remain outside the subset.
     fn from_ty(ty: &Ty) -> Result<WType, String> {
         match ty {
             Ty::Int => Ok(WType::I64),
             Ty::Bool => Ok(WType::I32),
+            Ty::Float => Ok(WType::F64),
             // An immutable, reference-counted heap String (Phase 2d).
             Ty::Str => Ok(WType::Str),
             // A named ADT becomes a heap reference. (Generics — args present —
@@ -415,6 +418,20 @@ fn i64_load(offset: u64, out: &mut Vec<u8>) {
     leb_u(offset, out);
 }
 
+/// `f64.store` with the given byte offset (3 = align 2^3 = 8 bytes).
+fn f64_store(offset: u64, out: &mut Vec<u8>) {
+    out.push(0x39); // f64.store
+    leb_u(3, out); // align
+    leb_u(offset, out); // offset
+}
+
+/// `f64.load` with the given byte offset (align 2^3 = 8 bytes).
+fn f64_load(offset: u64, out: &mut Vec<u8>) {
+    out.push(0x2B); // f64.load
+    leb_u(3, out);
+    leb_u(offset, out);
+}
+
 /// `i32.store` with the given byte offset (2 = align 2^2 = 4 bytes).
 fn i32_store(offset: u64, out: &mut Vec<u8>) {
     out.push(0x36); // i32.store
@@ -482,6 +499,8 @@ struct LocalEnv<'a> {
     str_lits: &'a HashMap<Vec<u8>, u64>,
     /// Wasm function index of the imported `env.print_str` (always 0).
     print_str_idx: u32,
+    /// Wasm function index of the imported `env.print_float` (always 1).
+    print_float_idx: u32,
 }
 
 impl<'a> LocalEnv<'a> {
@@ -545,7 +564,7 @@ fn atom_type(a: &Atom, env: &LocalEnv) -> Result<WType, String> {
         Atom::Int(_) => Ok(WType::I64),
         Atom::Bool(_) => Ok(WType::I32),
         Atom::Var(n) => env.var_type(n),
-        Atom::Float(_) => Err("wasm backend: Float literals are outside the 2a subset".into()),
+        Atom::Float(_) => Ok(WType::F64),
         Atom::Str(_) => Ok(WType::Str),
         Atom::Unit => Err("wasm backend: Unit is outside the 2a subset".into()),
     }
@@ -555,8 +574,9 @@ fn atom_type(a: &Atom, env: &LocalEnv) -> Result<WType, String> {
 fn bind_type(bind: &Bind, env: &LocalEnv) -> Result<WType, String> {
     match bind {
         Bind::Atom(a) => atom_type(a, env),
-        Bind::Prim(op, _, _) => Ok(match op {
-            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => WType::I64,
+        Bind::Prim(op, l, _) => Ok(match op {
+            // Arithmetic keeps the operand type: Int -> i64, Float -> f64.
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => atom_type(l, env)?,
             // Comparisons and logical ops produce a Bool (i32).
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::And
             | BinOp::Or => WType::I32,
@@ -652,6 +672,7 @@ fn match_type(scrut: &Atom, arms: &[ir::IArm], env: &LocalEnv) -> Result<WType, 
             scratch_ptr: env.scratch_ptr,
             str_lits: env.str_lits,
             print_str_idx: env.print_str_idx,
+            print_float_idx: env.print_float_idx,
         };
         let at = iexpr_type(&arm.body, &probe)?;
         match result {
@@ -706,6 +727,7 @@ fn iexpr_type(e: &IExpr, env: &LocalEnv) -> Result<WType, String> {
                 scratch_ptr: env.scratch_ptr,
                 str_lits: env.str_lits,
                 print_str_idx: env.print_str_idx,
+            print_float_idx: env.print_float_idx,
             };
             iexpr_type(body, &probe)
         }
@@ -727,6 +749,7 @@ fn iexpr_type(e: &IExpr, env: &LocalEnv) -> Result<WType, String> {
                 scratch_ptr: env.scratch_ptr,
                 str_lits: env.str_lits,
                 print_str_idx: env.print_str_idx,
+            print_float_idx: env.print_float_idx,
             };
             iexpr_type(body, &probe)
         }
@@ -753,7 +776,13 @@ fn emit_atom(a: &Atom, env: &LocalEnv, code: &mut Vec<u8>) -> Result<WType, Stri
             leb_u(env.var_index(n)? as u64, code);
             env.var_type(n)
         }
-        Atom::Float(_) => Err("wasm backend: Float literals are outside the 2a subset".into()),
+        Atom::Float(f) => {
+            // f64.const: opcode 0x44 followed by the 8 raw little-endian
+            // IEEE-754 bytes (a fixed 8-byte immediate, NOT LEB-encoded).
+            code.push(0x44); // f64.const
+            code.extend_from_slice(&f.to_le_bytes());
+            Ok(WType::F64)
+        }
         Atom::Str(s) => {
             // Materialize the literal at runtime: push (data_addr, len) and call
             // `__str_lit`, which allocs a String object and copies the raw UTF-8
@@ -798,7 +827,9 @@ fn emit_bind(bind: &Bind, env: &mut LocalEnv, code: &mut Vec<u8>) -> Result<WTyp
             // interpreter. Everything else (Div/Mod/comparisons/logical) stays
             // inline. Div/Mod already trap natively on /0 and MIN/-1.
             match op {
-                BinOp::Add | BinOp::Sub | BinOp::Mul => {
+                // Int Add/Sub/Mul are checked (overflow traps). Float
+                // Add/Sub/Mul are plain f64 ops (no overflow concept).
+                BinOp::Add | BinOp::Sub | BinOp::Mul if lt == WType::I64 || rt == WType::I64 => {
                     if lt != WType::I64 || rt != WType::I64 {
                         return Err("wasm backend: arithmetic expects Int operands".into());
                     }
@@ -827,8 +858,14 @@ fn emit_bind(bind: &Bind, env: &mut LocalEnv, code: &mut Vec<u8>) -> Result<WTyp
                         leb_u(env.ovf_index(OvfHelper::Neg) as u64, code);
                         Ok(WType::I64)
                     }
+                    WType::F64 => {
+                        // f64.neg: no overflow concept for floats.
+                        emit_atom(a, env, code)?;
+                        code.push(0x9A); // f64.neg
+                        Ok(WType::F64)
+                    }
                     WType::I32 | WType::Ref | WType::Str => {
-                        Err("wasm backend: numeric negation requires an Int".into())
+                        Err("wasm backend: numeric negation requires an Int or Float".into())
                     }
                 }
             }
@@ -912,17 +949,6 @@ fn emit_bind(bind: &Bind, env: &mut LocalEnv, code: &mut Vec<u8>) -> Result<WTyp
     }
 }
 
-/// Push an atom and convert it to an i64 suitable for an 8-byte field slot.
-/// Int stays i64; Bool (i32 0/1) and Ref (i32 address) are zero-extended.
-fn emit_atom_as_slot(a: &Atom, env: &LocalEnv, code: &mut Vec<u8>) -> Result<(), String> {
-    let t = emit_atom(a, env, code)?;
-    match t {
-        WType::I64 => {}
-        WType::I32 | WType::Ref | WType::Str => code.push(0xAD), // i64.extend_i32_u
-    }
-    Ok(())
-}
-
 /// Validate a constructor's name/arity, returning its (cloned) `CtorInfo`.
 fn ctor_info_checked(
     name: &str,
@@ -970,24 +996,31 @@ fn emit_store_cell_fields(
                 name, i, t, fty
             ));
         }
-        // Convert the operand to the field's i64 slot encoding.
-        match fty {
-            WType::I64 => {}
-            WType::I32 | WType::Ref | WType::Str => code.push(0xAD), // i64.extend_i32_u
-        }
         let off = CELL_HEADER + SLOT * i as u64;
-        i64_store(off, code);
+        // Store into the 8-byte slot per field kind. A Float field is an
+        // unboxed f64 (f64.store); Int/Bool/Ref/Str go through the i64 slot
+        // (Bool/Ref/Str zero-extended from i32).
+        match fty {
+            WType::F64 => f64_store(off, code),
+            WType::I64 => i64_store(off, code),
+            WType::I32 | WType::Ref | WType::Str => {
+                code.push(0xAD); // i64.extend_i32_u
+                i64_store(off, code);
+            }
+        }
     }
     Ok(())
 }
 
-/// The String-producing/consuming builtins the wasm backend implements inline.
+/// The builtins the wasm backend implements inline. `concat`/`int_to_str`
+/// produce/consume Strings; `print_str`/`print_float` are host-imported
+/// effectful prints. (`print_float` takes an unboxed f64.)
 fn is_str_builtin(name: &str) -> bool {
-    matches!(name, "concat" | "int_to_str" | "print_str")
+    matches!(name, "concat" | "int_to_str" | "print_str" | "print_float")
 }
 
-/// The wasm result type of a String builtin. `print_str` is logically Unit; we
-/// give it a dummy i32 result (the let-binding never uses it).
+/// The wasm result type of an inline builtin. `print_str`/`print_float` are
+/// logically Unit; we give them a dummy i32 result (never used).
 fn str_builtin_ret(name: &str) -> WType {
     match name {
         "concat" | "int_to_str" => WType::Str,
@@ -1062,6 +1095,20 @@ fn emit_str_builtin(
             leb_u(drop_str as u64, code);
             code.push(0x1A); // drop dummy result
             // dummy i32 result for the let-binding
+            code.push(0x41); // i32.const 0
+            leb_s(0, code);
+            Ok(WType::I32)
+        }
+        "print_float" => {
+            if args.len() != 1 || atom_type(&args[0], env)? != WType::F64 {
+                return Err("wasm backend: print_float expects one Float".into());
+            }
+            // Push the f64 and call the host import `env.print_float(f64)`.
+            let print_idx = env.print_float_idx;
+            emit_atom(&args[0], env, code)?;
+            code.push(0x10); // call env.print_float
+            leb_u(print_idx as u64, code);
+            // dummy i32 result for the let-binding (print_float is Unit-like)
             code.push(0x41); // i32.const 0
             leb_s(0, code);
             Ok(WType::I32)
@@ -1291,12 +1338,18 @@ fn emit_arm_body(
                 // Allocate a local for the binder and load the field into it.
                 env.add_local(b, fty);
                 let slot = env.var_index(b)?;
+                let off = CELL_HEADER + SLOT * idx as u64;
                 emit_atom(scrut, env, code)?; // address
-                i64_load(CELL_HEADER + SLOT * idx as u64, code); // raw i64 slot
-                // Convert i64 slot -> field stack type.
+                // Load the 8-byte slot per field kind, converting to the field's
+                // stack type. A Float field is an f64 (f64.load); Int stays i64;
+                // Bool/Ref/Str are wrapped back down to i32.
                 match fty {
-                    WType::I64 => {}
-                    WType::I32 | WType::Ref | WType::Str => code.push(0xA7), // i32.wrap_i64
+                    WType::F64 => f64_load(off, code),
+                    WType::I64 => i64_load(off, code),
+                    WType::I32 | WType::Ref | WType::Str => {
+                        i64_load(off, code);
+                        code.push(0xA7); // i32.wrap_i64
+                    }
                 }
                 code.push(0x21); // local.set slot
                 leb_u(slot as u64, code);
@@ -1326,6 +1379,22 @@ fn emit_arm_body(
 fn emit_prim(op: BinOp, lt: WType, rt: WType, code: &mut Vec<u8>) -> Result<WType, String> {
     match op {
         BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
+            if lt == WType::F64 || rt == WType::F64 {
+                if lt != WType::F64 || rt != WType::F64 {
+                    return Err("wasm backend: arithmetic expects matching operands".into());
+                }
+                // Float arithmetic: plain f64 ops. Div by 0.0 yields inf/NaN
+                // (no trap), matching the interpreter; there is no Float `Mod`.
+                code.push(match op {
+                    BinOp::Add => 0xA0, // f64.add
+                    BinOp::Sub => 0xA1, // f64.sub
+                    BinOp::Mul => 0xA2, // f64.mul
+                    BinOp::Div => 0xA3, // f64.div
+                    BinOp::Mod => return Err("wasm backend: Float has no `%`".into()),
+                    _ => unreachable!(),
+                });
+                return Ok(WType::F64);
+            }
             if lt != WType::I64 || rt != WType::I64 {
                 return Err("wasm backend: arithmetic expects Int operands".into());
             }
@@ -1340,6 +1409,21 @@ fn emit_prim(op: BinOp, lt: WType, rt: WType, code: &mut Vec<u8>) -> Result<WTyp
             Ok(WType::I64)
         }
         BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+            if lt == WType::F64 || rt == WType::F64 {
+                if lt != WType::F64 || rt != WType::F64 {
+                    return Err("wasm backend: ordering comparisons expect matching operands".into());
+                }
+                // f64 comparisons yield i32 (Bool); they already give 0 for any
+                // NaN operand, matching the interpreter's `NaN`-aware ordering.
+                code.push(match op {
+                    BinOp::Lt => 0x63, // f64.lt
+                    BinOp::Gt => 0x64, // f64.gt
+                    BinOp::Le => 0x65, // f64.le
+                    BinOp::Ge => 0x66, // f64.ge
+                    _ => unreachable!(),
+                });
+                return Ok(WType::I32);
+            }
             if lt != WType::I64 || rt != WType::I64 {
                 return Err("wasm backend: ordering comparisons expect Int operands".into());
             }
@@ -1359,6 +1443,9 @@ fn emit_prim(op: BinOp, lt: WType, rt: WType, code: &mut Vec<u8>) -> Result<WTyp
             match lt {
                 WType::I64 => code.push(if op == BinOp::Eq { 0x51 } else { 0x52 }),
                 WType::I32 => code.push(if op == BinOp::Eq { 0x46 } else { 0x47 }),
+                // f64.eq (0x61) / f64.ne (0x62); f64.eq gives 0 for NaN==NaN,
+                // matching the interpreter (`x == y` so `NaN != NaN`).
+                WType::F64 => code.push(if op == BinOp::Eq { 0x61 } else { 0x62 }),
                 // String equality is handled in `emit_bind` (it needs `env` to
                 // call `__streq` + drop literal temps), so it never reaches here.
                 WType::Str => {
@@ -2684,10 +2771,12 @@ fn collect_str_lits_atom(a: &Atom, out: &mut Vec<Vec<u8>>) {
 pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
     // 1. Collect function signatures from the typed AST, in declaration order,
     //    assigning deterministic wasm function indices.
-    // We import exactly one host function (`env.print_str`); it occupies wasm
-    // function index 0, so every DEFINED function index is offset by N_IMPORTS.
-    const N_IMPORTS: u32 = 1;
+    // We import two host functions: `env.print_str` (index 0) and
+    // `env.print_float` (index 1). Every DEFINED function index is offset by
+    // N_IMPORTS.
+    const N_IMPORTS: u32 = 2;
     const PRINT_STR_IDX: u32 = 0;
+    const PRINT_FLOAT_IDX: u32 = 1;
 
     let mut sigs: HashMap<String, FnSig> = HashMap::new();
     let mut order: Vec<String> = Vec::new();
@@ -2714,11 +2803,14 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
     }
     {
         let m = &sigs["main"];
-        // `main` takes no params and returns either Int (existing) or a heap
-        // String (Phase 2d); the Node runner decodes the result accordingly.
-        if !m.params.is_empty() || (m.ret != WType::I64 && m.ret != WType::Str) {
+        // `main` takes no params and returns Int (existing), Float (an f64
+        // export decodes to a JS number), or a heap String (Phase 2d); the Node
+        // runner decodes the result accordingly.
+        if !m.params.is_empty()
+            || (m.ret != WType::I64 && m.ret != WType::F64 && m.ret != WType::Str)
+        {
             return Err(
-                "wasm backend: `main` must take no params and return Int or String".into(),
+                "wasm backend: `main` must take no params and return Int, Float, or String".into(),
             );
         }
     }
@@ -2812,6 +2904,7 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
             scratch_ptr: None,
             str_lits: &str_lits,
             print_str_idx: PRINT_STR_IDX,
+            print_float_idx: PRINT_FLOAT_IDX,
         };
 
         // Emit the body instructions; the result is left on the stack.
@@ -2868,19 +2961,24 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
     // Header: magic + version.
     out.extend_from_slice(&[0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]);
 
-    // Type section (id 1): type index 0 is the imported host function's
-    // signature `(i32, i32) -> ()` (the only VOID-result functype); type indices
-    // 1.. are the defined functions' single-result signatures, in `order`.
+    // Type section (id 1): type index 0 is `env.print_str`'s signature
+    // `(i32, i32) -> ()`; type index 1 is `env.print_float`'s `(f64) -> ()`;
+    // type indices 2.. are the defined functions' single-result signatures.
     {
         let mut content = Vec::new();
-        leb_u((1 + type_section_funcs.len()) as u64, &mut content);
+        leb_u((N_IMPORTS as usize + type_section_funcs.len()) as u64, &mut content);
         // type 0: env.print_str(ptr:i32, len:i32) -> ()  (no results)
         content.push(0x60); // func type tag
         leb_u(2, &mut content); // 2 params
         content.push(WType::I32.byte());
         content.push(WType::I32.byte());
         leb_u(0, &mut content); // zero results
-        // types 1..: the defined functions.
+        // type 1: env.print_float(f64) -> ()  (no results)
+        content.push(0x60); // func type tag
+        leb_u(1, &mut content); // 1 param
+        content.push(WType::F64.byte());
+        leb_u(0, &mut content); // zero results
+        // types 2..: the defined functions.
         for (params, ret) in &type_section_funcs {
             content.push(0x60); // func type tag
             leb_u(params.len() as u64, &mut content);
@@ -2893,10 +2991,12 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
         section(1, &content, &mut out);
     }
 
-    // Import section (id 2): import the host function `env.print_str` (type 0).
+    // Import section (id 2): import `env.print_str` (type 0) and
+    // `env.print_float` (type 1).
     {
         let mut content = Vec::new();
-        leb_u(1, &mut content); // one import
+        leb_u(2, &mut content); // two imports
+        // env.print_str : type 0
         let m = b"env";
         leb_u(m.len() as u64, &mut content);
         content.extend_from_slice(m);
@@ -2905,11 +3005,20 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
         content.extend_from_slice(nm);
         content.push(0x00); // import kind = func
         leb_u(0, &mut content); // type index 0
+        // env.print_float : type 1
+        leb_u(m.len() as u64, &mut content);
+        content.extend_from_slice(m);
+        let nf = b"print_float";
+        leb_u(nf.len() as u64, &mut content);
+        content.extend_from_slice(nf);
+        content.push(0x00); // import kind = func
+        leb_u(1, &mut content); // type index 1
         section(2, &content, &mut out);
     }
 
-    // Function section (id 3): type index per DEFINED function. Type index 0 is
-    // the import; defined function `i` uses type index `1 + i` (= N_IMPORTS + i).
+    // Function section (id 3): type index per DEFINED function. Type indices 0
+    // and 1 are the imports; defined function `i` uses type index
+    // `N_IMPORTS + i`.
     {
         let n = type_section_funcs.len();
         let mut content = Vec::new();
@@ -3008,7 +3117,7 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{interp, ir, lexer, parser, typeck};
+    use crate::{interp, lexer, parser, typeck};
     use std::process::Command;
 
     fn node_available() -> bool {
@@ -3035,7 +3144,7 @@ mod tests {
         let script = format!(
             "const fs=require('fs');\
              const dec=new TextDecoder();\
-             const imp={{env:{{print_str:(p,n)=>{{}}}}}};\
+             const imp={{env:{{print_str:(p,n)=>{{}},print_float:(x)=>{{}}}}}};\
              try{{const b=fs.readFileSync({:?});\
              WebAssembly.instantiate(b,imp).then(r=>{{\
              try{{const ex=r.instance.exports;const v=ex.main();\
@@ -3196,20 +3305,196 @@ mod tests {
 
     #[test]
     fn unsupported_programs_return_err_not_panic() {
-        // Float signature.
-        let s3 = "fn main() -> Float = 3.5";
-        // print_int builtin call.
+        // print_int builtin call (not implemented in the wasm backend).
         let s4 = "fn main() -> Int = { print_int(1); 0 }";
         // Unit-returning function.
         let s5 = "fn main() -> Unit = ()";
-        // 2b-deferred: an ADT carrying a Float field (only Int/Bool/Ref/Str fields).
-        let s6 = "type B = | B(Float)\nfn main() -> Int = match B(1.5) { B(x) => 0, }";
-        // 2b-deferred: structural ADT equality (needs a recursive compare).
+        // Still-deferred: structural ADT equality (needs a recursive compare).
         let s8 = "type P = | P(Int, Int)\nfn main() -> Bool = P(1, 2) == P(1, 2)";
-        for src in [s3, s4, s5, s6, s8] {
+        for src in [s4, s5, s8] {
             let r = compile_src(src);
             assert!(r.is_err(), "expected Err (no panic) for:\n{}", src);
         }
+    }
+
+    // ---- Float (f64) support --------------------------------------------
+
+    /// Run a `main -> Float` compiled module under Node, returning the raw f64
+    /// bit pattern (so the comparison is NUMERIC/bitwise, never via printed
+    /// text — Rust `{}` and JS `Number.toString()` differ for some f64s). Also
+    /// returns `__live`. A trap surfaces as `Err`.
+    fn run_wasm_f64_bits(bytes: &[u8]) -> Result<(u64, i64), String> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "aria_wasm_f64_{}_{}.wasm",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
+        // Write the returned f64 into a Float64Array and read its raw bits via a
+        // BigUint64Array view, so we compare bit patterns (NaN-safe, exact).
+        let script = format!(
+            "const fs=require('fs');\
+             const imp={{env:{{print_str:(p,n)=>{{}},print_float:(x)=>{{}}}}}};\
+             const b=fs.readFileSync({:?});\
+             WebAssembly.instantiate(b,imp).then(r=>{{\
+             const ex=r.instance.exports;const v=ex.main();\
+             const fb=new Float64Array(1);fb[0]=v;\
+             const ub=new BigUint64Array(fb.buffer);\
+             process.stdout.write(String(ub[0])+'|'+String(ex.__live()));\
+             }}).catch(e=>process.stdout.write('TRAP|0'));",
+            path.to_string_lossy()
+        );
+        let out = Command::new("node").arg("-e").arg(&script).output().map_err(|e| e.to_string())?;
+        let _ = std::fs::remove_file(&path);
+        let s = String::from_utf8_lossy(&out.stdout).to_string();
+        if s.starts_with("TRAP") {
+            return Err("TRAP".into());
+        }
+        let (bits, live) = s.split_once('|').ok_or("bad harness output")?;
+        Ok((
+            bits.parse::<u64>().map_err(|e| e.to_string())?,
+            live.parse::<i64>().unwrap_or(-1),
+        ))
+    }
+
+    /// Differential check for a `main -> Float` program: parse the interpreter's
+    /// printed float and the wasm's returned f64 and assert they are BITWISE
+    /// equal (NaN bit patterns compared raw too), never by printed text.
+    fn differential_float(src: &str) {
+        let interp = interp_result(src).expect("interpreter should succeed");
+        let expected: f64 = interp.parse().expect("interpreter float parses");
+        let bytes = compile_src(src).expect("compile should succeed");
+        if !node_available() {
+            return;
+        }
+        let (wasm_bits, live) = run_wasm_f64_bits(&bytes).expect("running wasm");
+        assert_eq!(
+            expected.to_bits(),
+            wasm_bits,
+            "wasm f64 bits != interpreter for:\n{}\n  interp={} ({:#x}) wasm={:#x}",
+            src,
+            expected,
+            expected.to_bits(),
+            wasm_bits
+        );
+        assert_eq!(live, 0, "float program leaked {} live cell(s) in:\n{}", live, src);
+    }
+
+    #[test]
+    fn float_computation_through_int_and_bool() {
+        // Exact Int-valued results from float computation compare cleanly (no
+        // float text formatting involved). `main` returns Int (the wasm harness
+        // decodes an i64 result); the float work happens internally.
+        differential("fn main() -> Int = if 1.5 * 2.0 == 3.0 { 1 } else { 0 }");
+        differential("fn main() -> Int = if 0.1 + 0.2 > 0.3 { 1 } else { 0 }");
+        differential("fn main() -> Int = if 2.5 - 1.5 == 1.0 { 1 } else { 0 }");
+        differential("fn main() -> Int = if 7.0 / 2.0 == 3.5 { 1 } else { 0 }");
+        // Float division by 0.0 yields +inf (no trap): inf > 1000000.0 is true.
+        differential("fn main() -> Int = if 1.0 / 0.0 > 1000000.0 { 1 } else { 0 }");
+        // NaN comparisons: 0.0/0.0 is NaN; NaN == NaN is false, NaN != NaN true.
+        differential("fn main() -> Int = if (0.0 / 0.0) == (0.0 / 0.0) { 1 } else { 0 }");
+        differential("fn main() -> Int = if (0.0 / 0.0) != (0.0 / 0.0) { 1 } else { 0 }");
+        // Ordering ops (<, <=, >, >=) combined.
+        differential(
+            "fn main() -> Int = if 1.25 < 1.5 && 2.0 >= 2.0 && 3.0 <= 3.0 { 1 } else { 0 }",
+        );
+    }
+
+    #[test]
+    fn float_negation() {
+        differential("fn main() -> Int = if -2.5 + 2.5 == 0.0 { 1 } else { 0 }");
+        differential(
+            "fn neg(x: Float) -> Float = -x\n\
+             fn main() -> Int = if neg(3.5) == -3.5 { 1 } else { 0 }",
+        );
+        // main -> Float, numeric (bitwise) comparison.
+        differential_float("fn main() -> Float = -2.5");
+        differential_float("fn neg(x: Float) -> Float = -x\nfn main() -> Float = neg(0.0 - 7.5)");
+    }
+
+    #[test]
+    fn float_main_returns_f64_numeric() {
+        // main -> Float results compared by f64 bits, not printed text.
+        differential_float("fn area(r: Float) -> Float = 3.14159 * r * r\nfn main() -> Float = area(2.0) / 2.0");
+        differential_float("fn main() -> Float = 1.0 / 0.0"); // +inf
+        differential_float("fn main() -> Float = { let a = 1.5; let b = 2.0; a + b }");
+    }
+
+    #[test]
+    fn float_field_in_adt_is_garbage_free() {
+        // An ADT carrying Float fields: sum/compare them, discard the cell. The
+        // Float field is NOT reference-managed, so __drop just frees the cell;
+        // the heap must end garbage-free (__live == 0). Result is a Bool.
+        differential_heap(
+            "type V = | V(Float, Float)\n\
+             fn main() -> Int = match V(1.5, 2.25) { V(a, b) => if a + b == 3.75 { 1 } else { 0 }, }",
+        );
+        // A list of Float-field records, summed via a Bool/Int result.
+        differential_heap(
+            "type P = | P(Float, Float)\n\
+             type L = | Nil | Cons(P, L)\n\
+             fn cnt(xs: L) -> Int = match xs { Nil => 0, Cons(_, r) => 1 + cnt(r), }\n\
+             fn main() -> Int = cnt(Cons(P(1.0, 2.0), Cons(P(3.0, 4.0), Nil)))",
+        );
+    }
+
+    #[test]
+    fn float_main_returns_f64() {
+        // A Float-field ADT whose matched field flows out as main's f64 result.
+        differential_float(
+            "type V = | V(Float, Float)\n\
+             fn main() -> Float = match V(1.5, 2.25) { V(a, b) => a + b, }",
+        );
+    }
+
+    #[test]
+    fn print_float_simple_value_matches() {
+        // print_float on values where Rust `{}` (the interpreter) and JS
+        // Number.toString (the Node harness) agree (small exact decimals). The
+        // interpreter prints via println!("{}", f); the expected text is exactly
+        // `format!("{}", f)`, compared to the wasm's captured stdout. NOTE:
+        // float text formatting can differ between Rust and JS for some values,
+        // so this is restricted to exact decimals where they agree.
+        for (src, value) in [
+            ("fn main() -> Int = { print_float(1.5); 0 }", 1.5f64),
+            ("fn main() -> Int = { print_float(2.0 + 0.5); 0 }", 2.5f64),
+            ("fn main() -> Int = { print_float(-3.25); 0 }", -3.25f64),
+        ] {
+            let expected = format!("{}\n", value);
+            let bytes = compile_src(src).expect("compile should succeed");
+            if !node_available() {
+                continue;
+            }
+            let wasm_out = run_wasm_capture_stdout(&bytes).expect("running wasm");
+            assert_eq!(expected, wasm_out, "print_float output mismatch for:\n{}", src);
+        }
+    }
+
+    /// Run a compiled module capturing the host print side effects' stdout (the
+    /// `print_float` import writes String(x)+"\n"), ignoring the Int result.
+    fn run_wasm_capture_stdout(bytes: &[u8]) -> Result<String, String> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "aria_wasm_pf_{}_{}.wasm",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
+        let script = format!(
+            "const fs=require('fs');\
+             const imp={{env:{{print_str:(p,n)=>{{}},\
+             print_float:(x)=>{{process.stdout.write(String(x));process.stdout.write('\\n');}}}}}};\
+             const b=fs.readFileSync({:?});\
+             WebAssembly.instantiate(b,imp).then(r=>{{r.instance.exports.main();}})\
+             .catch(e=>process.stdout.write('TRAP'));",
+            path.to_string_lossy()
+        );
+        let out = Command::new("node").arg("-e").arg(&script).output().map_err(|e| e.to_string())?;
+        let _ = std::fs::remove_file(&path);
+        Ok(String::from_utf8_lossy(&out.stdout).to_string())
     }
 
     // ---- Phase 2d: heap-allocated Strings -------------------------------
@@ -3229,7 +3514,7 @@ mod tests {
         let script = format!(
             "const fs=require('fs');\
              const dec=new TextDecoder();\
-             const imp={{env:{{print_str:(p,n)=>{{}}}}}};\
+             const imp={{env:{{print_str:(p,n)=>{{}},print_float:(x)=>{{}}}}}};\
              const b=fs.readFileSync({:?});\
              WebAssembly.instantiate(b,imp).then(r=>{{\
              const ex=r.instance.exports;const v=ex.main();\
@@ -3388,7 +3673,7 @@ mod tests {
         std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
         let script = format!(
             "const fs=require('fs');\
-             const imp={{env:{{print_str:(p,n)=>{{}}}}}};\
+             const imp={{env:{{print_str:(p,n)=>{{}},print_float:(x)=>{{}}}}}};\
              const b=fs.readFileSync({:?});\
              WebAssembly.instantiate(b,imp).then(r=>{{\
              const m=String(r.instance.exports.main());\
@@ -3518,7 +3803,7 @@ mod tests {
         std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
         let script = format!(
             "const fs=require('fs');\
-             const imp={{env:{{print_str:(p,n)=>{{}}}}}};\
+             const imp={{env:{{print_str:(p,n)=>{{}},print_float:(x)=>{{}}}}}};\
              const b=fs.readFileSync({:?});\
              WebAssembly.instantiate(b,imp).then(r=>{{\
              const m=String(r.instance.exports.main());\

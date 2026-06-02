@@ -225,12 +225,15 @@ fn run_wasm_run(args: &[String]) -> ExitCode {
          const imp={{env:{{print_str:(p,n)=>{{\
          const mem=new Uint8Array(memref.buffer);\
          process.stdout.write(dec.decode(mem.subarray(p,p+n)));\
+         process.stdout.write('\\n');}},\
+         print_float:(x)=>{{process.stdout.write(String(x));\
          process.stdout.write('\\n');}}}}}};\
          try{{const b=fs.readFileSync({:?});\
          WebAssembly.instantiate(b,imp).then(r=>{{\
          try{{const ex=r.instance.exports;memref=ex.memory;\
          const v=ex.main();\
          if(typeof v==='bigint'){{process.stdout.write(String(v));}}\
+         else if(typeof v==='number'){{process.stdout.write(String(v));}}\
          else{{process.stdout.write(decodeStr(v));}}\
          if(ex.__live){{process.stderr.write('__live='+String(ex.__live()));}}\
          if(ex.__reuses){{process.stderr.write(' __reuses='+String(ex.__reuses()));}}}}\

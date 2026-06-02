@@ -677,7 +677,8 @@ fn run_wasm_live(bytes: &[u8]) -> Result<(String, i64), String> {
          let memref=null;\
          const imp={{env:{{print_str:(p,n)=>{{\
          process.stdout.write(dec.decode(new Uint8Array(memref.buffer).subarray(p,p+n)));\
-         process.stdout.write('\\n');}}}}}};\
+         process.stdout.write('\\n');}},\
+         print_float:(x)=>{{process.stdout.write(String(x));process.stdout.write('\\n');}}}}}};\
          const b=fs.readFileSync({:?});\
          WebAssembly.instantiate(b,imp).then(r=>{{\
          const ex=r.instance.exports;memref=ex.memory;\
