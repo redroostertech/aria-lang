@@ -186,11 +186,12 @@ impl<'a> Gen<'a> {
 
     fn random_ty(&mut self) -> Ty {
         if self.wasm_subset {
-            // Restricted universe: no Float/String so generated programs stay
-            // inside the wasm backend's compilable subset.
-            return match self.rng.below(3) {
+            // Restricted universe: Int/Bool/IntList AND String (Phase 2d). No
+            // Float, which stays outside the wasm backend's compilable subset.
+            return match self.rng.below(4) {
                 0 => Ty::Int,
                 1 => Ty::Bool,
+                2 => Ty::Str,
                 _ => Ty::List,
             };
         }
@@ -240,11 +241,17 @@ impl<'a> Gen<'a> {
     }
 
     fn gen_bool(&mut self, fuel: u32) -> String {
-        match self.rng.below(8) {
+        match self.rng.below(9) {
             0 | 1 => self.leaf(Ty::Bool),
             2 => {
                 let op = ["<", "<=", ">", ">=", "==", "!="][self.rng.choice(6)];
                 format!("({} {} {})", self.expr(Ty::Int, fuel - 1), op, self.expr(Ty::Int, fuel - 1))
+            }
+            8 => {
+                // String structural equality (== / !=): exercises the wasm
+                // backend's `__streq` against the interpreter's `values_equal`.
+                let op = ["==", "!="][self.rng.choice(2)];
+                format!("({} {} {})", self.expr(Ty::Str, fuel - 1), op, self.expr(Ty::Str, fuel - 1))
             }
             3 => format!("!{}", self.paren_bool(fuel - 1)),
             4 | 5 => {
@@ -666,10 +673,20 @@ fn run_wasm_live(bytes: &[u8]) -> Result<(String, i64), String> {
     std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
     let script = format!(
         "const fs=require('fs');\
+         const dec=new TextDecoder();\
+         let memref=null;\
+         const imp={{env:{{print_str:(p,n)=>{{\
+         process.stdout.write(dec.decode(new Uint8Array(memref.buffer).subarray(p,p+n)));\
+         process.stdout.write('\\n');}}}}}};\
          const b=fs.readFileSync({:?});\
-         WebAssembly.instantiate(b).then(r=>{{\
-         const m=String(r.instance.exports.main());\
-         const l=String(r.instance.exports.__live());\
+         WebAssembly.instantiate(b,imp).then(r=>{{\
+         const ex=r.instance.exports;memref=ex.memory;\
+         const v=ex.main();\
+         let m;if(typeof v==='bigint'){{m=String(v);}}\
+         else{{const dv=new DataView(ex.memory.buffer);\
+         const len=Number(dv.getBigInt64(v+8,true));\
+         m=dec.decode(new Uint8Array(ex.memory.buffer).subarray(v+16,v+16+len));}}\
+         const l=String(ex.__live());\
          process.stdout.write(m+'|'+l);\
          }}).catch(e=>process.stdout.write('TRAP|0'));",
         path.to_string_lossy()

@@ -216,11 +216,24 @@ fn run_wasm_run(args: &[String]) -> ExitCode {
     // visible. A wasm trap surfaces as `TRAP`, matching the interpreter's `Err`.
     let script = format!(
         "const fs=require('fs');\
+         const dec=new TextDecoder();\
+         let memref=null;\
+         const decodeStr=(p)=>{{const mem=new Uint8Array(memref.buffer);\
+         const dv=new DataView(memref.buffer);\
+         const len=Number(dv.getBigInt64(p+8,true));\
+         return dec.decode(mem.subarray(p+16,p+16+len));}};\
+         const imp={{env:{{print_str:(p,n)=>{{\
+         const mem=new Uint8Array(memref.buffer);\
+         process.stdout.write(dec.decode(mem.subarray(p,p+n)));\
+         process.stdout.write('\\n');}}}}}};\
          try{{const b=fs.readFileSync({:?});\
-         WebAssembly.instantiate(b).then(r=>{{\
-         try{{process.stdout.write(String(r.instance.exports.main()));\
-         if(r.instance.exports.__live){{process.stderr.write('__live='+String(r.instance.exports.__live()));}}\
-         if(r.instance.exports.__reuses){{process.stderr.write(' __reuses='+String(r.instance.exports.__reuses()));}}}}\
+         WebAssembly.instantiate(b,imp).then(r=>{{\
+         try{{const ex=r.instance.exports;memref=ex.memory;\
+         const v=ex.main();\
+         if(typeof v==='bigint'){{process.stdout.write(String(v));}}\
+         else{{process.stdout.write(decodeStr(v));}}\
+         if(ex.__live){{process.stderr.write('__live='+String(ex.__live()));}}\
+         if(ex.__reuses){{process.stderr.write(' __reuses='+String(ex.__reuses()));}}}}\
          catch(e){{process.stdout.write('TRAP');}}\
          }}).catch(e=>{{process.stdout.write('TRAP');}});}}\
          catch(e){{process.stdout.write('TRAP');}}",

@@ -180,7 +180,7 @@ without touching the parser or AST.
 - [x] Wire predictor + arithmetic coder into an end-to-end neural codec (`aria npack`)
 - [ ] Add a match model / higher-order contexts (beat gzip), then a transformer predictor
 - [x] **WASM backend (Phase 2a)** — compiles the pure Int/Bool/function subset to a real `.wasm` binary (hand-emitted), runs via Node, differentially tested vs the interpreter (`aria wasm` / `aria wasm-run`). Integer overflow is a defined error: the compiled wasm **traps** on `+`/`-`/`*`/negation overflow, matching the interpreter's checked-error semantics (the two backends agree).
-- [x] **WASM Phase 2b** — ADTs on linear memory with reference counting (`dup`/`drop`) lowered to wasm: a bump+free-list allocator, per-constructor recursive drop, **garbage-free verified in the compiled output** (`__live()==0`), differentially tested vs the interpreter. (Strings + in-place reuse in wasm are the next slice.)
+- [x] **WASM Phase 2b** — ADTs + **strings** on linear memory with reference counting (`dup`/`drop`) and **in-place reuse (FBIP)** lowered to wasm: a bump+free-list allocator, per-constructor recursive drop, `concat`/`int_to_str`/string-`==`, `print_str` via a host import. **Garbage-free verified in the compiled output** (`__live()==0`); reuse eliminates ~50% of allocations in compiled code (`__reuses` counter); continuously fuzzed against the interpreter oracle (sampled `wasm == interp` + garbage-free).
 - [ ] Effect / capability system
 - [ ] Native backend (Cranelift or LLVM)
 - [ ] GBNF grammar export for constrained decoding

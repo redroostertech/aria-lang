@@ -130,14 +130,22 @@ fn collect_fv_bind(bind: &Bind, acc: &mut HashSet<String>) {
 }
 
 /// Operand variables whose ownership a bind transfers (moves a heap reference):
-/// aliasing, constructor fields, and call arguments. Prim/Unary operate on
-/// unboxed values and `If`/`Match` are handled structurally, so none here.
+/// aliasing, constructor fields, call arguments, and the operands of an
+/// equality comparison. Most `Prim`/`Unary` ops act on unboxed values, but
+/// `==`/`!=` may compare heap values (Strings in the wasm backend, structural
+/// ADTs in the interpreter) and consume them — the last use of each operand is
+/// the comparison itself. Drops on unboxed (Int/Bool) operands are runtime
+/// no-ops, so treating every `Eq`/`Ne` operand as consumed is uniformly safe.
 fn consumed(bind: &Bind) -> Vec<String> {
     match bind {
         Bind::Atom(Atom::Var(v)) => vec![v.clone()],
         Bind::Ctor(_, atoms) | Bind::Call(_, atoms) => atoms
             .iter()
             .filter_map(|a| if let Atom::Var(v) = a { Some(v.clone()) } else { None })
+            .collect(),
+        Bind::Prim(crate::ast::BinOp::Eq | crate::ast::BinOp::Ne, a, b) => [a, b]
+            .iter()
+            .filter_map(|x| if let Atom::Var(v) = x { Some(v.clone()) } else { None })
             .collect(),
         _ => vec![],
     }

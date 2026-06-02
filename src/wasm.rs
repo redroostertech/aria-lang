@@ -62,6 +62,7 @@ enum WType {
     I64, // Aria Int
     I32, // Aria Bool
     Ref, // pointer into linear memory (i32 address) — Phase 2b ADT cell
+    Str, // pointer into linear memory (i32 address) — Phase 2d String object
 }
 
 impl WType {
@@ -70,7 +71,7 @@ impl WType {
     fn byte(self) -> u8 {
         match self {
             WType::I64 => 0x7E,
-            WType::I32 | WType::Ref => 0x7F,
+            WType::I32 | WType::Ref | WType::Str => 0x7F,
         }
     }
 
@@ -81,11 +82,13 @@ impl WType {
         match ty {
             Ty::Int => Ok(WType::I64),
             Ty::Bool => Ok(WType::I32),
+            // An immutable, reference-counted heap String (Phase 2d).
+            Ty::Str => Ok(WType::Str),
             // A named ADT becomes a heap reference. (Generics — args present —
             // are out of the 2b subset and rejected below.)
             Ty::Named(_, args) if args.is_empty() => Ok(WType::Ref),
             other => Err(format!(
-                "wasm backend: unsupported type `{:?}` (2b subset: Int/Bool and non-generic ADTs)",
+                "wasm backend: unsupported type `{:?}` (subset: Int/Bool/String and non-generic ADTs)",
                 other
             )),
         }
@@ -113,13 +116,27 @@ impl CtorInfo {
     fn arity(&self) -> usize {
         self.field_types.len()
     }
-    /// Indices of the fields that are heap references (must be dropped).
+    /// Indices of the fields that are heap references (must be dropped via
+    /// `__drop`).
     fn ref_fields(&self) -> Vec<usize> {
         self.field_types
             .iter()
             .enumerate()
             .filter_map(|(i, t)| if *t == WType::Ref { Some(i) } else { None })
             .collect()
+    }
+    /// Indices of the fields that are heap Strings (dropped via `__drop_str`).
+    fn str_fields(&self) -> Vec<usize> {
+        self.field_types
+            .iter()
+            .enumerate()
+            .filter_map(|(i, t)| if *t == WType::Str { Some(i) } else { None })
+            .collect()
+    }
+    /// True if this constructor has any reference-managed field (Ref or Str),
+    /// i.e. dropping a dead cell of this tag must release children.
+    fn has_managed_fields(&self) -> bool {
+        !self.ref_fields().is_empty() || !self.str_fields().is_empty()
     }
 }
 
@@ -195,6 +212,39 @@ const FREELIST_BASE: u64 = 24; // i32 per arity, 4 bytes each
 const CELL_HEADER: u64 = 16; // rc(8) + tag(8)
 const SLOT: u64 = 8;
 
+// ---- String heap objects (Phase 2d) -------------------------------------
+//
+// A String is an immutable, reference-counted heap object, distinct from an
+// ADT cell. Layout at pointer `p`:
+//   [p+0]  rc   (i64)
+//   [p+8]  len  (i64)   — UTF-8 byte length
+//   [p+16 .. p+16+len]  the raw UTF-8 bytes
+// A String has no Ref/Str children, so dropping it at rc 0 just frees it.
+//
+// Distinguishing Strings from ADT cells in `__drop`: rather than overload the
+// tag word (which a String repurposes as `len`), Strings get their OWN runtime
+// helpers `__dup_str`/`__drop_str`. The backend knows statically (from the AST
+// type) whether a value is an ADT (`Ref`) or a String (`Str`), so it calls the
+// matching dup/drop. For a String FIELD inside an ADT cell, `__drop`'s per-tag
+// recursive field-release calls `__drop_str` on Str fields and `__drop` on Ref
+// fields (the per-field kind is compiled in from the typed AST).
+//
+// Allocation: Strings are variable-size. `__alloc_str(len)` rounds the total
+// object size (16 + len) up to an 8-byte boundary, computes a "size class" =
+// (rounded_total - CELL_HEADER) / SLOT (i.e. an effective field count), and
+// reuses the existing segregated free-list `__alloc`/`__free` machinery keyed
+// on that size class. Thus String allocs/frees flow through the SAME bump +
+// free-list allocator and the SAME `__live` counter as ADT cells (+1 on alloc,
+// -1 on free), keeping the garbage-free invariant intact.
+const STR_HEADER: u64 = 16; // rc(8) + len(8)
+
+/// Largest String size class that gets an exact-size free-list bucket. The
+/// free-list array is sized to `max(max_arity, STR_MAX_CLASS) + 1`. A String
+/// whose size class exceeds this is bump-allocated and, on free, decrements
+/// `__live` but is not returned to a bucket (still garbage-free by `__live`,
+/// just not reclaimed). Covers strings up to ~`(STR_MAX_CLASS*8 - 8)` bytes.
+const STR_MAX_CLASS: u64 = 64;
+
 /// The emitted checked-arithmetic helper functions. Each detects signed-i64
 /// overflow and executes `unreachable` (a wasm trap) on overflow; otherwise it
 /// returns the wrapped result. They are appended to the module after all user
@@ -245,10 +295,18 @@ enum HeapHelper {
     Live,      // () -> i64
     DropReuse, // (ptr:i32) -> token:i32  (the cell ptr if unique-and-dead, else 0)
     Reuses,    // () -> i64  (in-place reuse counter)
+    // ---- String runtime (Phase 2d) ----
+    AllocStr, // (len:i32) -> ptr:i32   alloc a String object (rc=1, len set, bytes uninit)
+    DupStr,   // (ptr:i32) -> ()        rc++ on a String
+    DropStr,  // (ptr:i32) -> ()        rc--; free at 0 (no children)
+    Concat,   // (a:i32, b:i32) -> ptr:i32   new String = a ++ b
+    IntToStr, // (n:i64) -> ptr:i32     decimal UTF-8 of n
+    StrEq,    // (a:i32, b:i32) -> i32   len+byte equality (1/0)
+    StrLit,   // (data_addr:i32, len:i32) -> ptr:i32   alloc + copy a literal
 }
 
 impl HeapHelper {
-    const ALL: [HeapHelper; 7] = [
+    const ALL: [HeapHelper; 14] = [
         HeapHelper::Alloc,
         HeapHelper::Free,
         HeapHelper::Dup,
@@ -256,6 +314,13 @@ impl HeapHelper {
         HeapHelper::Live,
         HeapHelper::DropReuse,
         HeapHelper::Reuses,
+        HeapHelper::AllocStr,
+        HeapHelper::DupStr,
+        HeapHelper::DropStr,
+        HeapHelper::Concat,
+        HeapHelper::IntToStr,
+        HeapHelper::StrEq,
+        HeapHelper::StrLit,
     ];
 
     fn offset(self) -> u32 {
@@ -267,12 +332,19 @@ impl HeapHelper {
             HeapHelper::Live => 4,
             HeapHelper::DropReuse => 5,
             HeapHelper::Reuses => 6,
+            HeapHelper::AllocStr => 7,
+            HeapHelper::DupStr => 8,
+            HeapHelper::DropStr => 9,
+            HeapHelper::Concat => 10,
+            HeapHelper::IntToStr => 11,
+            HeapHelper::StrEq => 12,
+            HeapHelper::StrLit => 13,
         }
     }
 
-    /// `(params, ret)` wasm signature. `Free`/`Dup`/`Drop` are logically void;
-    /// to keep the module's "exactly one result" invariant we make them return
-    /// an i32 (a dummy 0), and the caller `drop`s the result.
+    /// `(params, ret)` wasm signature. `Free`/`Dup`/`Drop`/`DupStr`/`DropStr`
+    /// are logically void; to keep the module's "exactly one result" invariant
+    /// we make them return an i32 (a dummy 0), and the caller `drop`s it.
     fn sig(self) -> (Vec<WType>, WType) {
         match self {
             HeapHelper::Alloc => (vec![WType::I32], WType::I32),
@@ -282,6 +354,13 @@ impl HeapHelper {
             HeapHelper::Live => (vec![], WType::I64),
             HeapHelper::DropReuse => (vec![WType::I32], WType::I32),
             HeapHelper::Reuses => (vec![], WType::I64),
+            HeapHelper::AllocStr => (vec![WType::I32], WType::I32),
+            HeapHelper::DupStr => (vec![WType::I32], WType::I32),
+            HeapHelper::DropStr => (vec![WType::I32], WType::I32),
+            HeapHelper::Concat => (vec![WType::I32, WType::I32], WType::I32),
+            HeapHelper::IntToStr => (vec![WType::I64], WType::I32),
+            HeapHelper::StrEq => (vec![WType::I32, WType::I32], WType::I32),
+            HeapHelper::StrLit => (vec![WType::I32, WType::I32], WType::I32),
         }
     }
 }
@@ -350,6 +429,20 @@ fn i32_load(offset: u64, out: &mut Vec<u8>) {
     leb_u(offset, out);
 }
 
+/// `i32.store8` (single byte) with the given offset (align 2^0 = 1).
+fn i32_store8(offset: u64, out: &mut Vec<u8>) {
+    out.push(0x3A); // i32.store8
+    leb_u(0, out);
+    leb_u(offset, out);
+}
+
+/// `i32.load8_u` (zero-extended byte) with the given offset (align 2^0 = 1).
+fn i32_load8_u(offset: u64, out: &mut Vec<u8>) {
+    out.push(0x2D); // i32.load8_u
+    leb_u(0, out);
+    leb_u(offset, out);
+}
+
 /// Emit a length-prefixed byte vector (LEB u32 count of *bytes*, then bytes).
 fn vec_bytes(content: &[u8], out: &mut Vec<u8>) {
     leb_u(content.len() as u64, out);
@@ -383,6 +476,12 @@ struct LocalEnv<'a> {
     /// Scratch i32 local index used to hold a cell pointer while storing its
     /// fields. Allocated lazily (the function may have no constructors).
     scratch_ptr: Option<u32>,
+    /// String-literal pool: literal bytes -> the data-segment address of the
+    /// raw UTF-8 bytes (in read-only data). A literal is materialized at runtime
+    /// by `__alloc_str(len)` + a copy from this address.
+    str_lits: &'a HashMap<Vec<u8>, u64>,
+    /// Wasm function index of the imported `env.print_str` (always 0).
+    print_str_idx: u32,
 }
 
 impl<'a> LocalEnv<'a> {
@@ -404,6 +503,14 @@ impl<'a> LocalEnv<'a> {
         let idx = self.n_params + self.locals.len() as u32;
         self.locals.push(WType::I32);
         self.scratch_ptr = Some(idx);
+        idx
+    }
+
+    /// Allocate a brand-new anonymous i32 local slot (e.g. a string-compare
+    /// temporary). Always fresh, never reused, so callers can hold two at once.
+    fn fresh_i32(&mut self) -> u32 {
+        let idx = self.n_params + self.locals.len() as u32;
+        self.locals.push(WType::I32);
         idx
     }
 
@@ -439,7 +546,7 @@ fn atom_type(a: &Atom, env: &LocalEnv) -> Result<WType, String> {
         Atom::Bool(_) => Ok(WType::I32),
         Atom::Var(n) => env.var_type(n),
         Atom::Float(_) => Err("wasm backend: Float literals are outside the 2a subset".into()),
-        Atom::Str(_) => Err("wasm backend: String literals are outside the 2a subset".into()),
+        Atom::Str(_) => Ok(WType::Str),
         Atom::Unit => Err("wasm backend: Unit is outside the 2a subset".into()),
     }
 }
@@ -459,6 +566,9 @@ fn bind_type(bind: &Bind, env: &LocalEnv) -> Result<WType, String> {
             UnOp::Not => Ok(WType::I32),    // Bool Not
         },
         Bind::Call(name, _) => {
+            if is_str_builtin(name) {
+                return Ok(str_builtin_ret(name));
+            }
             let sig = env
                 .sigs
                 .get(name)
@@ -540,6 +650,8 @@ fn match_type(scrut: &Atom, arms: &[ir::IArm], env: &LocalEnv) -> Result<WType, 
             heap_base: env.heap_base,
             ctors: env.ctors,
             scratch_ptr: env.scratch_ptr,
+            str_lits: env.str_lits,
+            print_str_idx: env.print_str_idx,
         };
         let at = iexpr_type(&arm.body, &probe)?;
         match result {
@@ -592,6 +704,8 @@ fn iexpr_type(e: &IExpr, env: &LocalEnv) -> Result<WType, String> {
                 heap_base: env.heap_base,
                 ctors: env.ctors,
                 scratch_ptr: env.scratch_ptr,
+                str_lits: env.str_lits,
+                print_str_idx: env.print_str_idx,
             };
             iexpr_type(body, &probe)
         }
@@ -611,6 +725,8 @@ fn iexpr_type(e: &IExpr, env: &LocalEnv) -> Result<WType, String> {
                 heap_base: env.heap_base,
                 ctors: env.ctors,
                 scratch_ptr: env.scratch_ptr,
+                str_lits: env.str_lits,
+                print_str_idx: env.print_str_idx,
             };
             iexpr_type(body, &probe)
         }
@@ -638,7 +754,23 @@ fn emit_atom(a: &Atom, env: &LocalEnv, code: &mut Vec<u8>) -> Result<WType, Stri
             env.var_type(n)
         }
         Atom::Float(_) => Err("wasm backend: Float literals are outside the 2a subset".into()),
-        Atom::Str(_) => Err("wasm backend: String literals are outside the 2a subset".into()),
+        Atom::Str(s) => {
+            // Materialize the literal at runtime: push (data_addr, len) and call
+            // `__str_lit`, which allocs a String object and copies the raw UTF-8
+            // bytes from the read-only data region. Keeps `emit_atom` free of any
+            // local allocation (the copy loop lives inside the helper).
+            let bytes = s.as_bytes();
+            let data_addr = *env.str_lits.get(bytes).ok_or_else(|| {
+                "wasm backend: string literal missing from pool (internal)".to_string()
+            })?;
+            code.push(0x41); // i32.const data_addr
+            leb_s(data_addr as i64, code);
+            code.push(0x41); // i32.const len
+            leb_s(bytes.len() as i64, code);
+            code.push(0x10); // call __str_lit
+            leb_u(env.heap_index(HeapHelper::StrLit) as u64, code);
+            Ok(WType::Str)
+        }
         Atom::Unit => Err("wasm backend: Unit is outside the 2a subset".into()),
     }
 }
@@ -648,6 +780,17 @@ fn emit_bind(bind: &Bind, env: &mut LocalEnv, code: &mut Vec<u8>) -> Result<WTyp
     match bind {
         Bind::Atom(a) => emit_atom(a, env, code),
         Bind::Prim(op, l, r) => {
+            // String `==`/`!=`: structural (len + byte) compare via `__streq`.
+            // Operand ownership mirrors the rc pass: a Prim does NOT consume its
+            // variable operands (they are borrowed and dropped at their real last
+            // use), but a String *literal* operand allocates a temporary that the
+            // rc pass never sees, so we drop it here to stay garbage-free.
+            if matches!(op, BinOp::Eq | BinOp::Ne) && atom_type(l, env)? == WType::Str {
+                if atom_type(r, env)? != WType::Str {
+                    return Err("wasm backend: == / != on mismatched types".into());
+                }
+                return emit_str_eq(*op, l, r, env, code);
+            }
             let lt = emit_atom(l, env, code)?;
             let rt = emit_atom(r, env, code)?;
             // Add/Sub/Mul on Int are checked: route through an emitted helper
@@ -684,7 +827,7 @@ fn emit_bind(bind: &Bind, env: &mut LocalEnv, code: &mut Vec<u8>) -> Result<WTyp
                         leb_u(env.ovf_index(OvfHelper::Neg) as u64, code);
                         Ok(WType::I64)
                     }
-                    WType::I32 | WType::Ref => {
+                    WType::I32 | WType::Ref | WType::Str => {
                         Err("wasm backend: numeric negation requires an Int".into())
                     }
                 }
@@ -699,6 +842,11 @@ fn emit_bind(bind: &Bind, env: &mut LocalEnv, code: &mut Vec<u8>) -> Result<WTyp
             }
         },
         Bind::Call(name, args) => {
+            // String builtins are emitted inline (they consume their String
+            // arguments, matching the rc pass's "Call args are consumed" rule).
+            if is_str_builtin(name) {
+                return emit_str_builtin(name, args, env, code);
+            }
             let sig_ret;
             let sig_params;
             {
@@ -770,7 +918,7 @@ fn emit_atom_as_slot(a: &Atom, env: &LocalEnv, code: &mut Vec<u8>) -> Result<(),
     let t = emit_atom(a, env, code)?;
     match t {
         WType::I64 => {}
-        WType::I32 | WType::Ref => code.push(0xAD), // i64.extend_i32_u
+        WType::I32 | WType::Ref | WType::Str => code.push(0xAD), // i64.extend_i32_u
     }
     Ok(())
 }
@@ -825,12 +973,153 @@ fn emit_store_cell_fields(
         // Convert the operand to the field's i64 slot encoding.
         match fty {
             WType::I64 => {}
-            WType::I32 | WType::Ref => code.push(0xAD), // i64.extend_i32_u
+            WType::I32 | WType::Ref | WType::Str => code.push(0xAD), // i64.extend_i32_u
         }
         let off = CELL_HEADER + SLOT * i as u64;
         i64_store(off, code);
     }
     Ok(())
+}
+
+/// The String-producing/consuming builtins the wasm backend implements inline.
+fn is_str_builtin(name: &str) -> bool {
+    matches!(name, "concat" | "int_to_str" | "print_str")
+}
+
+/// The wasm result type of a String builtin. `print_str` is logically Unit; we
+/// give it a dummy i32 result (the let-binding never uses it).
+fn str_builtin_ret(name: &str) -> WType {
+    match name {
+        "concat" | "int_to_str" => WType::Str,
+        _ => WType::I32, // print_str -> dummy i32
+    }
+}
+
+/// Emit a String builtin call. Per the rc pass's "Call arguments are consumed"
+/// rule, each builtin CONSUMES (drops) its String arguments:
+///   * `concat(a, b)` -> `__concat(a, b)` (the helper copies both runs, then
+///     drops `a` and `b`); result is a fresh String (rc=1).
+///   * `int_to_str(n)` -> `__int_to_str(n)` (n is unboxed Int, nothing to drop).
+///   * `print_str(s)` -> imported `env.print_str(ptr+16, len)`, then `__drop_str(s)`;
+///     yields a dummy i32 0.
+fn emit_str_builtin(
+    name: &str,
+    args: &[Atom],
+    env: &mut LocalEnv,
+    code: &mut Vec<u8>,
+) -> Result<WType, String> {
+    match name {
+        "concat" => {
+            if args.len() != 2 {
+                return Err("wasm backend: concat expects 2 arguments".into());
+            }
+            if atom_type(&args[0], env)? != WType::Str || atom_type(&args[1], env)? != WType::Str {
+                return Err("wasm backend: concat expects two Strings".into());
+            }
+            emit_atom(&args[0], env, code)?;
+            emit_atom(&args[1], env, code)?;
+            code.push(0x10); // call __concat (consumes both args internally)
+            leb_u(env.heap_index(HeapHelper::Concat) as u64, code);
+            Ok(WType::Str)
+        }
+        "int_to_str" => {
+            if args.len() != 1 || atom_type(&args[0], env)? != WType::I64 {
+                return Err("wasm backend: int_to_str expects one Int".into());
+            }
+            emit_atom(&args[0], env, code)?;
+            code.push(0x10); // call __int_to_str
+            leb_u(env.heap_index(HeapHelper::IntToStr) as u64, code);
+            Ok(WType::Str)
+        }
+        "print_str" => {
+            if args.len() != 1 || atom_type(&args[0], env)? != WType::Str {
+                return Err("wasm backend: print_str expects one String".into());
+            }
+            // Evaluate the String once into a temp, call the host import with
+            // (ptr+16, len), then drop the String (this call consumes it).
+            let s = env.fresh_i32();
+            let print_idx = env.print_str_idx;
+            let drop_str = env.heap_index(HeapHelper::DropStr);
+            emit_atom(&args[0], env, code)?;
+            code.push(0x21); // local.set s
+            leb_u(s as u64, code);
+            // env.print_str(ptr + 16, len)
+            code.push(0x20); // local.get s
+            leb_u(s as u64, code);
+            code.push(0x41); // i32.const STR_HEADER
+            leb_s(STR_HEADER as i64, code);
+            code.push(0x6A); // i32.add  -> bytes pointer
+            code.push(0x20); // local.get s
+            leb_u(s as u64, code);
+            i64_load(8, code); // len (i64)
+            code.push(0xA7); // i32.wrap_i64 -> len:i32
+            code.push(0x10); // call env.print_str
+            leb_u(print_idx as u64, code);
+            // drop the String
+            code.push(0x20); // local.get s
+            leb_u(s as u64, code);
+            code.push(0x10); // call __drop_str
+            leb_u(drop_str as u64, code);
+            code.push(0x1A); // drop dummy result
+            // dummy i32 result for the let-binding
+            code.push(0x41); // i32.const 0
+            leb_s(0, code);
+            Ok(WType::I32)
+        }
+        _ => Err(format!("wasm backend: unknown string builtin `{}`", name)),
+    }
+}
+
+/// Emit a String `==` / `!=`. Both operands are evaluated into fresh i32 temps
+/// (so a literal operand's pointer is captured), `__streq` compares them, the
+/// result is negated for `!=`, and BOTH operands are then dropped via
+/// `__drop_str`. The comparison CONSUMES its String operands: the rc pass marks
+/// `Eq`/`Ne` operands as consumed (so it dups a variable that is used again and
+/// never separately drops it here), and a literal operand has its own rc=1
+/// temp; either way the comparison owns one reference and releases it, keeping
+/// the heap garbage-free.
+fn emit_str_eq(
+    op: BinOp,
+    l: &Atom,
+    r: &Atom,
+    env: &mut LocalEnv,
+    code: &mut Vec<u8>,
+) -> Result<WType, String> {
+    let lt = env.fresh_i32();
+    let rt = env.fresh_i32();
+    let streq = env.heap_index(HeapHelper::StrEq);
+    let drop_str = env.heap_index(HeapHelper::DropStr);
+    // lt = l ; rt = r
+    emit_atom(l, env, code)?;
+    code.push(0x21); // local.set lt
+    leb_u(lt as u64, code);
+    emit_atom(r, env, code)?;
+    code.push(0x21); // local.set rt
+    leb_u(rt as u64, code);
+    // result = __streq(lt, rt)
+    code.push(0x20);
+    leb_u(lt as u64, code);
+    code.push(0x20);
+    leb_u(rt as u64, code);
+    code.push(0x10); // call __streq
+    leb_u(streq as u64, code);
+    if op == BinOp::Ne {
+        code.push(0x45); // i32.eqz (negate)
+    }
+    // The comparison result is now on the stack. The comparison consumes BOTH
+    // operands (the rc pass dup'd any variable still needed later and inserts no
+    // drop for these operands), so release each here — after `__streq` read the
+    // bytes. A literal temp and a moved-in variable both held one owned ref.
+    let drop_one = |_a: &Atom, slot: u32, code: &mut Vec<u8>| {
+        code.push(0x20); // local.get slot
+        leb_u(slot as u64, code);
+        code.push(0x10); // call __drop_str
+        leb_u(drop_str as u64, code);
+        code.push(0x1A); // drop dummy result
+    };
+    drop_one(l, lt, code);
+    drop_one(r, rt, code);
+    Ok(WType::I32)
 }
 
 /// Emit a `Bind::Ctor`: allocate a cell, store its tag and fields, yield the
@@ -1007,7 +1296,7 @@ fn emit_arm_body(
                 // Convert i64 slot -> field stack type.
                 match fty {
                     WType::I64 => {}
-                    WType::I32 | WType::Ref => code.push(0xA7), // i32.wrap_i64
+                    WType::I32 | WType::Ref | WType::Str => code.push(0xA7), // i32.wrap_i64
                 }
                 code.push(0x21); // local.set slot
                 leb_u(slot as u64, code);
@@ -1070,6 +1359,11 @@ fn emit_prim(op: BinOp, lt: WType, rt: WType, code: &mut Vec<u8>) -> Result<WTyp
             match lt {
                 WType::I64 => code.push(if op == BinOp::Eq { 0x51 } else { 0x52 }),
                 WType::I32 => code.push(if op == BinOp::Eq { 0x46 } else { 0x47 }),
+                // String equality is handled in `emit_bind` (it needs `env` to
+                // call `__streq` + drop literal temps), so it never reaches here.
+                WType::Str => {
+                    return Err("wasm backend: internal — String `==` should be routed earlier".into())
+                }
                 // Structural ADT equality needs a recursive compare (and would
                 // interact with reference counting); out of the 2b subset.
                 WType::Ref => {
@@ -1106,24 +1400,40 @@ fn emit_iexpr(e: &IExpr, env: &mut LocalEnv, code: &mut Vec<u8>) -> Result<WType
             emit_iexpr(body, env, code)
         }
         IExpr::Dup(v, body) => {
-            // dup is a no-op on non-Ref (unboxed) values, exactly like the IR
-            // interpreter; only heap references are reference-counted.
-            if env.var_type(v)? == WType::Ref {
-                code.push(0x20); // local.get v
-                leb_u(env.var_index(v)? as u64, code);
-                code.push(0x10); // call __dup
-                leb_u(env.heap_index(HeapHelper::Dup) as u64, code);
-                code.push(0x1A); // drop the dummy i32 result
+            // dup is a no-op on unboxed values; ADT cells use `__dup`, Strings
+            // use `__dup_str` (both just bump the rc word at [ptr+0]).
+            match env.var_type(v)? {
+                WType::Ref | WType::Str => {
+                    let h = if env.var_type(v)? == WType::Str {
+                        HeapHelper::DupStr
+                    } else {
+                        HeapHelper::Dup
+                    };
+                    code.push(0x20); // local.get v
+                    leb_u(env.var_index(v)? as u64, code);
+                    code.push(0x10); // call __dup / __dup_str
+                    leb_u(env.heap_index(h) as u64, code);
+                    code.push(0x1A); // drop the dummy i32 result
+                }
+                _ => {}
             }
             emit_iexpr(body, env, code)
         }
         IExpr::Drop(v, body) => {
-            if env.var_type(v)? == WType::Ref {
-                code.push(0x20); // local.get v
-                leb_u(env.var_index(v)? as u64, code);
-                code.push(0x10); // call __drop
-                leb_u(env.heap_index(HeapHelper::Drop) as u64, code);
-                code.push(0x1A); // drop the dummy i32 result
+            match env.var_type(v)? {
+                WType::Ref | WType::Str => {
+                    let h = if env.var_type(v)? == WType::Str {
+                        HeapHelper::DropStr
+                    } else {
+                        HeapHelper::Drop
+                    };
+                    code.push(0x20); // local.get v
+                    leb_u(env.var_index(v)? as u64, code);
+                    code.push(0x10); // call __drop / __drop_str
+                    leb_u(env.heap_index(h) as u64, code);
+                    code.push(0x1A); // drop the dummy i32 result
+                }
+                _ => {}
             }
             emit_iexpr(body, env, code)
         }
@@ -1380,6 +1690,7 @@ fn emit_heap_helper(h: HeapHelper, ctors: &CtorTable, heap_base: u32) -> Vec<u8>
     const I32_CONST: u8 = 0x41;
     const I64_CONST: u8 = 0x42;
     const I32_ADD: u8 = 0x6A;
+    const I32_SUB: u8 = 0x6B;
     const I32_MUL: u8 = 0x6C;
     const I32_NE: u8 = 0x47;
     const I32_WRAP_I64: u8 = 0xA7;
@@ -1397,6 +1708,9 @@ fn emit_heap_helper(h: HeapHelper, ctors: &CtorTable, heap_base: u32) -> Vec<u8>
 
     let drop_idx = heap_base + HeapHelper::Drop.offset();
     let free_idx = heap_base + HeapHelper::Free.offset();
+    let drop_str_idx = heap_base + HeapHelper::DropStr.offset();
+    let alloc_idx = heap_base + HeapHelper::Alloc.offset();
+    let alloc_str_idx = heap_base + HeapHelper::AllocStr.offset();
 
     let mut body: Vec<u8> = Vec::new();
     match h {
@@ -1571,7 +1885,7 @@ fn emit_heap_helper(h: HeapHelper, ctors: &CtorTable, heap_base: u32) -> Vec<u8>
                 body.push(I64_EQ);
                 body.push(IF);
                 body.push(BT_VOID);
-                // recursively drop each Ref field
+                // recursively drop each Ref field (ADT child) via __drop
                 for fi in info.ref_fields() {
                     body.push(LOCAL_GET);
                     leb_u(0, &mut body); // ptr
@@ -1579,6 +1893,17 @@ fn emit_heap_helper(h: HeapHelper, ctors: &CtorTable, heap_base: u32) -> Vec<u8>
                     body.push(I32_WRAP_I64); // field address
                     body.push(CALL);
                     leb_u(drop_idx as u64, &mut body);
+                    body.push(DROP); // dummy result
+                }
+                // drop each String field via __drop_str (a String field is
+                // reference-managed, just like a Ref field)
+                for fi in info.str_fields() {
+                    body.push(LOCAL_GET);
+                    leb_u(0, &mut body); // ptr
+                    i64_load(CELL_HEADER + SLOT * fi as u64, &mut body);
+                    body.push(I32_WRAP_I64); // String field address
+                    body.push(CALL);
+                    leb_u(drop_str_idx as u64, &mut body);
                     body.push(DROP); // dummy result
                 }
                 // free(ptr, arity)
@@ -1627,7 +1952,7 @@ fn emit_heap_helper(h: HeapHelper, ctors: &CtorTable, heap_base: u32) -> Vec<u8>
             // per-tag Ref-field knowledge), but DO NOT free or decrement __live
             // for THIS cell — its slot is retained for reuse.
             for info in ctor_infos_sorted(ctors) {
-                if info.ref_fields().is_empty() {
+                if !info.has_managed_fields() {
                     continue; // no children to release for this tag
                 }
                 body.push(LOCAL_GET);
@@ -1645,6 +1970,15 @@ fn emit_heap_helper(h: HeapHelper, ctors: &CtorTable, heap_base: u32) -> Vec<u8>
                     body.push(I32_WRAP_I64); // child address
                     body.push(CALL);
                     leb_u(drop_idx as u64, &mut body);
+                    body.push(DROP); // dummy result
+                }
+                for fi in info.str_fields() {
+                    body.push(LOCAL_GET);
+                    leb_u(0, &mut body); // ptr
+                    i64_load(CELL_HEADER + SLOT * fi as u64, &mut body);
+                    body.push(I32_WRAP_I64); // String child address
+                    body.push(CALL);
+                    leb_u(drop_str_idx as u64, &mut body);
                     body.push(DROP); // dummy result
                 }
                 body.push(END); // end if tag==T
@@ -1665,7 +1999,618 @@ fn emit_heap_helper(h: HeapHelper, ctors: &CtorTable, heap_base: u32) -> Vec<u8>
             i64_load(0, &mut body);
             helper_entry(&[], body)
         }
+        HeapHelper::AllocStr => {
+            // (len:i32) -> ptr:i32. Round (STR_HEADER + len) up to 8; size class
+            // = (rounded - CELL_HEADER) / SLOT, clamped to STR_MAX_CLASS. Alloc a
+            // cell of that class via __alloc (rc=1, live++), then store len at
+            // [ptr+8]. Locals: cls(1,i32), ptr(2,i32).
+            // cls = ((STR_HEADER + len + 7) & ~7 - CELL_HEADER) / SLOT
+            body.push(I32_CONST);
+            leb_s(STR_HEADER as i64, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body); // len
+            body.push(I32_ADD);
+            body.push(I32_CONST);
+            leb_s(7, &mut body);
+            body.push(I32_ADD);
+            body.push(I32_CONST);
+            leb_s(-8, &mut body); // i32 0xFFFFFFF8 (= ~7), signed-LEB encoded
+            body.push(0x71); // i32.and  -> rounded total
+            body.push(I32_CONST);
+            leb_s(CELL_HEADER as i64, &mut body);
+            body.push(I32_SUB); // rounded - 16
+            body.push(I32_CONST);
+            leb_s(SLOT as i64, &mut body);
+            body.push(0x6E); // i32.div_u  -> size class
+            // clamp to STR_MAX_CLASS: if cls > MAX { cls = MAX }
+            body.push(LOCAL_TEE);
+            leb_u(1, &mut body); // cls
+            body.push(I32_CONST);
+            leb_s(STR_MAX_CLASS as i64, &mut body);
+            body.push(0x4B); // i32.gt_u
+            body.push(IF);
+            body.push(BT_VOID);
+            body.push(I32_CONST);
+            leb_s(STR_MAX_CLASS as i64, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(1, &mut body); // cls = MAX
+            body.push(END);
+            // ptr = __alloc(cls)
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body); // cls
+            body.push(CALL);
+            leb_u(alloc_idx as u64, &mut body);
+            body.push(LOCAL_TEE);
+            leb_u(2, &mut body); // ptr
+            // store len at [ptr+8]
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body); // len (i32)
+            body.push(I64_EXTEND_I32_U); // -> i64
+            i64_store(8, &mut body);
+            // return ptr
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body);
+            helper_entry(&[WType::I32, WType::I32], body)
+        }
+        HeapHelper::DupStr => {
+            // (ptr:i32) -> i32. rc++ (same as __dup).
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body); // ptr (address)
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body); // ptr
+            i64_load(0, &mut body);
+            body.push(I64_CONST);
+            leb_s(1, &mut body);
+            body.push(I64_ADD);
+            i64_store(0, &mut body);
+            body.push(I32_CONST);
+            leb_s(0, &mut body); // dummy return
+            helper_entry(&[], body)
+        }
+        HeapHelper::DropStr => {
+            // (ptr:i32) -> i32. rc--; at 0 free the String (no children). The
+            // size class to free with is recomputed from len: same formula as
+            // AllocStr. Locals: rc(1,i64), cls(2,i32).
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body); // ptr (address)
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body); // ptr
+            i64_load(0, &mut body);
+            body.push(I64_CONST);
+            leb_s(1, &mut body);
+            body.push(I64_SUB);
+            body.push(LOCAL_TEE);
+            leb_u(1, &mut body); // rc
+            i64_store(0, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body); // rc
+            body.push(I64_EQZ);
+            body.push(IF);
+            body.push(BT_VOID);
+            // cls = clamp(((STR_HEADER + len + 7)&~7 - 16)/8, MAX)
+            body.push(I32_CONST);
+            leb_s(STR_HEADER as i64, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body); // ptr
+            i64_load(8, &mut body); // len (i64)
+            body.push(I32_WRAP_I64); // -> i32
+            body.push(I32_ADD);
+            body.push(I32_CONST);
+            leb_s(7, &mut body);
+            body.push(I32_ADD);
+            body.push(I32_CONST);
+            leb_s(-8, &mut body); // i32 0xFFFFFFF8 (= ~7), signed-LEB encoded
+            body.push(0x71); // i32.and
+            body.push(I32_CONST);
+            leb_s(CELL_HEADER as i64, &mut body);
+            body.push(I32_SUB);
+            body.push(I32_CONST);
+            leb_s(SLOT as i64, &mut body);
+            body.push(0x6E); // i32.div_u
+            body.push(LOCAL_TEE);
+            leb_u(2, &mut body); // cls
+            body.push(I32_CONST);
+            leb_s(STR_MAX_CLASS as i64, &mut body);
+            body.push(0x4B); // i32.gt_u
+            body.push(IF);
+            body.push(BT_VOID);
+            body.push(I32_CONST);
+            leb_s(STR_MAX_CLASS as i64, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(2, &mut body);
+            body.push(END);
+            // __free(ptr, cls)
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body); // ptr
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body); // cls
+            body.push(CALL);
+            leb_u(free_idx as u64, &mut body);
+            body.push(DROP); // dummy
+            body.push(END); // end if rc==0
+            body.push(I32_CONST);
+            leb_s(0, &mut body); // dummy return
+            helper_entry(&[WType::I64, WType::I32], body)
+        }
+        HeapHelper::Concat => {
+            // (a:i32, b:i32) -> ptr:i32. result = alloc_str(len(a)+len(b));
+            // copy a's bytes then b's bytes; drop a; drop b; return result.
+            // Locals: la(2,i32), lb(3,i32), out(4,i32), i(5,i32).
+            // la = len(a)
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body); // a
+            i64_load(8, &mut body);
+            body.push(I32_WRAP_I64);
+            body.push(LOCAL_SET);
+            leb_u(2, &mut body); // la
+            // lb = len(b)
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body); // b
+            i64_load(8, &mut body);
+            body.push(I32_WRAP_I64);
+            body.push(LOCAL_SET);
+            leb_u(3, &mut body); // lb
+            // out = __alloc_str(la + lb)
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            body.push(I32_ADD);
+            body.push(CALL);
+            leb_u(alloc_str_idx as u64, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(4, &mut body); // out
+            // copy a: i = 0; while i < la { out[16+i] = a[16+i]; i++ }
+            emit_byte_copy_loop(&mut body, /*src*/ 0, /*dst*/ 4, /*len*/ 2, /*dst_off*/ 0, /*i*/ 5);
+            // copy b into out at offset la: while i<lb { out[16+la+i]=b[16+i] }
+            // We reuse i; dst byte index = la + i, handled via a running dst ptr.
+            emit_byte_copy_loop_offset(&mut body, /*src*/ 1, /*dst*/ 4, /*len*/ 3, /*dst_base_extra*/ 2, /*i*/ 5);
+            // drop a, drop b (this builtin consumes its args)
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(CALL);
+            leb_u(drop_str_idx as u64, &mut body);
+            body.push(DROP);
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body);
+            body.push(CALL);
+            leb_u(drop_str_idx as u64, &mut body);
+            body.push(DROP);
+            // return out
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body);
+            helper_entry(&[WType::I32, WType::I32, WType::I32, WType::I32], body)
+        }
+        HeapHelper::IntToStr => {
+            // (n:i64) -> ptr:i32. Format n in decimal UTF-8. Matches Rust's
+            // i64::to_string: "0", negatives prefixed with '-'. Algorithm:
+            //   neg = n < 0; if neg, work with magnitude (use i64, careful with
+            //   i64::MIN: we operate on the value via unsigned-safe digit extract
+            //   by negating per-digit). We compute digits into a 24-byte scratch
+            //   buffer high-to-low at SCRATCH, then alloc_str and copy.
+            // Simpler robust approach: handle sign, then repeatedly take
+            //   d = n % 10 (could be negative), char = '0' + |d|, n = n / 10.
+            // This works for i64::MIN too since we never negate the whole value.
+            // Locals: neg(1,i32), buf(2,i32 scratch addr), p(3,i32 write ptr),
+            //   len(4,i32), d(5,i64), ptr(6,i32 result), n stays in 0.
+            //
+            // We use a fixed scratch region in linear memory at SCRATCH_ADDR to
+            // build digits low-to-high, then reverse-copy into the String.
+            // n == 0 special-case.
+            // buf = SCRATCH (a 32-byte scratch at a fixed high-ish bookkeeping
+            // address — we reuse REUSES? no. We use the free area just after the
+            // freelist; but that's the heap. Instead build digits on the wasm
+            // stack is awkward; use a small fixed scratch in low memory that is
+            // never otherwise used: bytes [ITOA_SCRATCH .. +24).)
+            const ITOA_SCRATCH: i64 = 4; // bytes 4..8 are unused padding before LIVE_ADDR? No.
+            let _ = ITOA_SCRATCH;
+            // Build into the to-be-allocated String directly is hard (length
+            // unknown up front). Two-pass: pass 1 count digits, pass 2 fill.
+            // count: tmp=n; cnt=0; if neg cnt++ ; do { cnt++; tmp/=10 } while tmp!=0
+            // Locals indices: neg(1,i32) cnt(2,i32) tmp(3,i64) ptr(4,i32) wp(5,i32) dig(6,i64)
+            // neg = n < 0
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(I64_CONST);
+            leb_s(0, &mut body);
+            body.push(0x53); // i64.lt_s
+            body.push(LOCAL_SET);
+            leb_u(1, &mut body); // neg
+            // cnt = 0 ; tmp = n
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(2, &mut body); // cnt
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(3, &mut body); // tmp
+            // loop: cnt++ ; tmp = tmp / 10 ; if tmp != 0 continue
+            body.push(0x03); // loop
+            body.push(BT_VOID);
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body); // cnt
+            body.push(I32_CONST);
+            leb_s(1, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_SET);
+            leb_u(2, &mut body); // cnt++
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body); // tmp
+            body.push(I64_CONST);
+            leb_s(10, &mut body);
+            body.push(0x7F); // i64.div_s
+            body.push(LOCAL_TEE);
+            leb_u(3, &mut body); // tmp
+            body.push(I64_CONST);
+            leb_s(0, &mut body);
+            body.push(0x52); // i64.ne
+            body.push(0x0D); // br_if
+            leb_u(0, &mut body); // -> loop header
+            body.push(END); // end loop
+            // if neg cnt++
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body); // neg
+            body.push(IF);
+            body.push(BT_VOID);
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body);
+            body.push(I32_CONST);
+            leb_s(1, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_SET);
+            leb_u(2, &mut body); // cnt++
+            body.push(END);
+            // ptr = __alloc_str(cnt)
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body); // cnt
+            body.push(CALL);
+            leb_u(alloc_str_idx as u64, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(4, &mut body); // ptr
+            // wp = ptr + 16 + cnt   (write digits backwards from the end)
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body);
+            body.push(I32_CONST);
+            leb_s(STR_HEADER as i64, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body); // cnt
+            body.push(I32_ADD);
+            body.push(LOCAL_SET);
+            leb_u(5, &mut body); // wp (one past last byte)
+            // tmp = n
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(3, &mut body); // tmp
+            // loop: dig = tmp % 10 (signed, may be <=0 for negatives);
+            //   ch = '0' + |dig| ; wp-- ; store ch ; tmp /= 10 ; if tmp!=0 cont
+            body.push(0x03); // loop
+            body.push(BT_VOID);
+            // wp = wp - 1
+            body.push(LOCAL_GET);
+            leb_u(5, &mut body);
+            body.push(I32_CONST);
+            leb_s(1, &mut body);
+            body.push(I32_SUB);
+            body.push(LOCAL_SET);
+            leb_u(5, &mut body); // wp--
+            // dig = tmp % 10
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body); // tmp
+            body.push(I64_CONST);
+            leb_s(10, &mut body);
+            body.push(0x81); // i64.rem_s
+            body.push(LOCAL_SET);
+            leb_u(6, &mut body); // dig (in [-9,9])
+            // |dig|: if dig < 0 dig = -dig
+            body.push(LOCAL_GET);
+            leb_u(6, &mut body);
+            body.push(I64_CONST);
+            leb_s(0, &mut body);
+            body.push(0x53); // i64.lt_s
+            body.push(IF);
+            body.push(BT_VOID);
+            body.push(I64_CONST);
+            leb_s(0, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(6, &mut body);
+            body.push(I64_SUB); // 0 - dig
+            body.push(LOCAL_SET);
+            leb_u(6, &mut body);
+            body.push(END);
+            // store byte: [wp] = '0' + dig  (i32.store8). address = wp, value:
+            body.push(LOCAL_GET);
+            leb_u(5, &mut body); // wp (addr)
+            body.push(I32_CONST);
+            leb_s('0' as i64, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(6, &mut body); // dig (i64)
+            body.push(I32_WRAP_I64);
+            body.push(I32_ADD); // '0' + dig
+            i32_store8(0, &mut body);
+            // tmp = tmp / 10 ; if tmp != 0 continue
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            body.push(I64_CONST);
+            leb_s(10, &mut body);
+            body.push(0x7F); // i64.div_s
+            body.push(LOCAL_TEE);
+            leb_u(3, &mut body);
+            body.push(I64_CONST);
+            leb_s(0, &mut body);
+            body.push(0x52); // i64.ne
+            body.push(0x0D); // br_if
+            leb_u(0, &mut body);
+            body.push(END); // end loop
+            // if neg: wp-- ; [wp] = '-'
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body); // neg
+            body.push(IF);
+            body.push(BT_VOID);
+            body.push(LOCAL_GET);
+            leb_u(5, &mut body);
+            body.push(I32_CONST);
+            leb_s(1, &mut body);
+            body.push(I32_SUB);
+            body.push(LOCAL_TEE);
+            leb_u(5, &mut body); // wp--
+            body.push(I32_CONST);
+            leb_s('-' as i64, &mut body);
+            i32_store8(0, &mut body);
+            body.push(END);
+            // return ptr
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body);
+            helper_entry(
+                &[WType::I32, WType::I32, WType::I64, WType::I32, WType::I32, WType::I64],
+                body,
+            )
+        }
+        HeapHelper::StrEq => {
+            // (a:i32, b:i32) -> i32. 1 if len(a)==len(b) and all bytes equal.
+            // Locals: la(2,i32), i(3,i32).
+            // if len(a) != len(b) return 0
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body); // a
+            i64_load(8, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body); // b
+            i64_load(8, &mut body);
+            body.push(0x52); // i64.ne
+            body.push(IF);
+            body.push(BT_VOID); // we only `return` inside
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            body.push(0x0F); // return
+            body.push(END);
+            // la = len(a) (i32)
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(8, &mut body);
+            body.push(I32_WRAP_I64);
+            body.push(LOCAL_SET);
+            leb_u(2, &mut body); // la
+            // i = 0
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(3, &mut body);
+            // loop while i < la: if a[16+i] != b[16+i] return 0; i++
+            body.push(0x03); // loop
+            body.push(BT_VOID);
+            // if i < la
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body);
+            body.push(0x49); // i32.lt_u
+            body.push(IF);
+            body.push(BT_VOID);
+            // compare bytes: a[16+i] vs b[16+i]
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body); // a
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body); // i
+            body.push(I32_ADD);
+            i32_load8_u(STR_HEADER, &mut body); // a byte
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body); // b
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body); // i
+            body.push(I32_ADD);
+            i32_load8_u(STR_HEADER, &mut body); // b byte
+            body.push(I32_NE);
+            body.push(IF);
+            body.push(BT_VOID); // one-armed if; body only `return`s, no value
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            body.push(0x0F); // return 0
+            body.push(END);
+            // i++
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            body.push(I32_CONST);
+            leb_s(1, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_SET);
+            leb_u(3, &mut body);
+            body.push(0x0C); // br to loop header (continue)
+            leb_u(1, &mut body); // depth 1 = the loop (0 = inner if-block)
+            body.push(END); // end if i<la
+            body.push(END); // end loop
+            // all equal
+            body.push(I32_CONST);
+            leb_s(1, &mut body);
+            helper_entry(&[WType::I32, WType::I32], body)
+        }
+        HeapHelper::StrLit => {
+            // (data_addr:i32, len:i32) -> ptr:i32. ptr = __alloc_str(len);
+            // copy len bytes from data_addr into [ptr+16..]; return ptr.
+            // Locals: ptr(2,i32), i(3,i32).
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body); // len
+            body.push(CALL);
+            leb_u(alloc_str_idx as u64, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(2, &mut body); // ptr
+            // i = 0; while i < len { [ptr+16+i] = [data_addr+i]; i++ }
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(3, &mut body);
+            body.push(0x03); // loop
+            body.push(BT_VOID);
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body); // i
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body); // len
+            body.push(0x49); // i32.lt_u
+            body.push(IF);
+            body.push(BT_VOID);
+            // dst = ptr + i ; (offset STR_HEADER folded into store8)
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body); // ptr
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body); // i
+            body.push(I32_ADD);
+            // src byte = [data_addr + i]
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body); // data_addr
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body); // i
+            body.push(I32_ADD);
+            i32_load8_u(0, &mut body);
+            i32_store8(STR_HEADER, &mut body); // [ptr + i + 16]
+            // i++
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            body.push(I32_CONST);
+            leb_s(1, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_SET);
+            leb_u(3, &mut body);
+            body.push(0x0C); // br loop
+            leb_u(1, &mut body);
+            body.push(END); // end if
+            body.push(END); // end loop
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body); // return ptr
+            helper_entry(&[WType::I32, WType::I32], body)
+        }
     }
+}
+
+/// Emit a byte-copy loop: `while i < <len_local> { dst[16 + i] = src[16 + i]; i++ }`,
+/// where `src`/`dst` are i32 locals holding String pointers, `len_local` the
+/// byte count, and `i_local` a scratch i32 counter. `_dst_off` is unused (kept
+/// for signature symmetry). Copies into dst's byte region starting at index 0.
+fn emit_byte_copy_loop(
+    body: &mut Vec<u8>,
+    src: u32,
+    dst: u32,
+    len_local: u32,
+    _dst_off: u32,
+    i_local: u32,
+) {
+    // i = 0
+    body.push(0x41);
+    leb_s(0, body);
+    body.push(0x21);
+    leb_u(i_local as u64, body);
+    body.push(0x03); // loop
+    body.push(0x40);
+    // if i < len
+    body.push(0x20);
+    leb_u(i_local as u64, body);
+    body.push(0x20);
+    leb_u(len_local as u64, body);
+    body.push(0x49); // i32.lt_u
+    body.push(0x04); // if
+    body.push(0x40);
+    // dst + i
+    body.push(0x20);
+    leb_u(dst as u64, body);
+    body.push(0x20);
+    leb_u(i_local as u64, body);
+    body.push(0x6A); // i32.add
+    // src byte [src + i + 16]
+    body.push(0x20);
+    leb_u(src as u64, body);
+    body.push(0x20);
+    leb_u(i_local as u64, body);
+    body.push(0x6A);
+    i32_load8_u(STR_HEADER, body);
+    i32_store8(STR_HEADER, body); // [dst + i + 16]
+    // i++
+    body.push(0x20);
+    leb_u(i_local as u64, body);
+    body.push(0x41);
+    leb_s(1, body);
+    body.push(0x6A);
+    body.push(0x21);
+    leb_u(i_local as u64, body);
+    body.push(0x0C); // br loop
+    leb_u(1, body);
+    body.push(0x0B); // end if
+    body.push(0x0B); // end loop
+}
+
+/// Like `emit_byte_copy_loop` but the destination index is offset by the value
+/// of `dst_extra_local` (e.g. the length already written): copies
+/// `src[16+i]` -> `dst[16 + dst_extra + i]` for i in 0..len.
+fn emit_byte_copy_loop_offset(
+    body: &mut Vec<u8>,
+    src: u32,
+    dst: u32,
+    len_local: u32,
+    dst_extra_local: u32,
+    i_local: u32,
+) {
+    // i = 0
+    body.push(0x41);
+    leb_s(0, body);
+    body.push(0x21);
+    leb_u(i_local as u64, body);
+    body.push(0x03); // loop
+    body.push(0x40);
+    body.push(0x20);
+    leb_u(i_local as u64, body);
+    body.push(0x20);
+    leb_u(len_local as u64, body);
+    body.push(0x49); // i32.lt_u
+    body.push(0x04); // if
+    body.push(0x40);
+    // dst + dst_extra + i  (address; +16 folded into store8 offset)
+    body.push(0x20);
+    leb_u(dst as u64, body);
+    body.push(0x20);
+    leb_u(dst_extra_local as u64, body);
+    body.push(0x6A); // i32.add
+    body.push(0x20);
+    leb_u(i_local as u64, body);
+    body.push(0x6A); // + i
+    // src byte
+    body.push(0x20);
+    leb_u(src as u64, body);
+    body.push(0x20);
+    leb_u(i_local as u64, body);
+    body.push(0x6A);
+    i32_load8_u(STR_HEADER, body);
+    i32_store8(STR_HEADER, body);
+    // i++
+    body.push(0x20);
+    leb_u(i_local as u64, body);
+    body.push(0x41);
+    leb_s(1, body);
+    body.push(0x6A);
+    body.push(0x21);
+    leb_u(i_local as u64, body);
+    body.push(0x0C);
+    leb_u(1, body);
+    body.push(0x0B); // end if
+    body.push(0x0B); // end loop
 }
 
 /// Constructor infos sorted by tag (deterministic codegen for `__drop`).
@@ -1681,6 +2626,57 @@ fn fn_index_key(name: &str) -> String {
     format!("\u{1}fn:{}", name)
 }
 
+// ---- string-literal pool -------------------------------------------------
+
+/// Walk an `IExpr` and collect every distinct `Atom::Str` literal's bytes.
+fn collect_str_lits_iexpr(e: &IExpr, out: &mut Vec<Vec<u8>>) {
+    match e {
+        IExpr::Ret(a) => collect_str_lits_atom(a, out),
+        IExpr::Let(_, b, body) => {
+            collect_str_lits_bind(b, out);
+            collect_str_lits_iexpr(body, out);
+        }
+        IExpr::Dup(_, body) | IExpr::Drop(_, body) | IExpr::DropReuse(_, _, body) => {
+            collect_str_lits_iexpr(body, out)
+        }
+    }
+}
+
+fn collect_str_lits_bind(b: &Bind, out: &mut Vec<Vec<u8>>) {
+    match b {
+        Bind::Atom(a) | Bind::Unary(_, a) => collect_str_lits_atom(a, out),
+        Bind::Prim(_, l, r) => {
+            collect_str_lits_atom(l, out);
+            collect_str_lits_atom(r, out);
+        }
+        Bind::Ctor(_, args) | Bind::Call(_, args) | Bind::CtorReuse(_, _, args) => {
+            for a in args {
+                collect_str_lits_atom(a, out);
+            }
+        }
+        Bind::If(c, then, els) => {
+            collect_str_lits_atom(c, out);
+            collect_str_lits_iexpr(then, out);
+            collect_str_lits_iexpr(els, out);
+        }
+        Bind::Match(scrut, arms) => {
+            collect_str_lits_atom(scrut, out);
+            for arm in arms {
+                collect_str_lits_iexpr(&arm.body, out);
+            }
+        }
+    }
+}
+
+fn collect_str_lits_atom(a: &Atom, out: &mut Vec<Vec<u8>>) {
+    if let Atom::Str(s) = a {
+        let bytes = s.as_bytes().to_vec();
+        if !out.contains(&bytes) {
+            out.push(bytes);
+        }
+    }
+}
+
 // ---- top-level driver ----------------------------------------------------
 
 /// Compile a type-checked `Program` to a WebAssembly binary (subset 2a).
@@ -1688,6 +2684,11 @@ fn fn_index_key(name: &str) -> String {
 pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
     // 1. Collect function signatures from the typed AST, in declaration order,
     //    assigning deterministic wasm function indices.
+    // We import exactly one host function (`env.print_str`); it occupies wasm
+    // function index 0, so every DEFINED function index is offset by N_IMPORTS.
+    const N_IMPORTS: u32 = 1;
+    const PRINT_STR_IDX: u32 = 0;
+
     let mut sigs: HashMap<String, FnSig> = HashMap::new();
     let mut order: Vec<String> = Vec::new();
     let mut fn_index: HashMap<String, u32> = HashMap::new();
@@ -1700,7 +2701,8 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| format!("fn `{}`: {}", f.name, e))?;
             let ret = WType::from_ty(&f.ret).map_err(|e| format!("fn `{}`: {}", f.name, e))?;
-            let idx = order.len() as u32;
+            // The wasm function index = N_IMPORTS + declaration ordinal.
+            let idx = N_IMPORTS + order.len() as u32;
             fn_index.insert(f.name.clone(), idx);
             order.push(f.name.clone());
             sigs.insert(f.name.clone(), FnSig { params, ret });
@@ -1712,8 +2714,12 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
     }
     {
         let m = &sigs["main"];
-        if !m.params.is_empty() || m.ret != WType::I64 {
-            return Err("wasm backend: `main` must take no params and return Int".into());
+        // `main` takes no params and returns either Int (existing) or a heap
+        // String (Phase 2d); the Node runner decodes the result accordingly.
+        if !m.params.is_empty() || (m.ret != WType::I64 && m.ret != WType::Str) {
+            return Err(
+                "wasm backend: `main` must take no params and return Int or String".into(),
+            );
         }
     }
 
@@ -1733,18 +2739,38 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
     // to a fresh allocation; either way the heap stays garbage-free.
     let fns: HashMap<String, IFn> = crate::rc::insert_rc(&lowered);
 
-    // Helper function indices come after every user function:
-    //   [user fns...] [overflow helpers x4] [heap helpers x5]
-    let ovf_base = order.len() as u32;
+    // Helper function indices come after the imports and every user function:
+    //   [imports...] [user fns...] [overflow helpers x4] [heap helpers...]
+    let ovf_base = N_IMPORTS + order.len() as u32;
     let heap_base = ovf_base + OvfHelper::ALL.len() as u32;
 
-    // HEAP_BASE: cells are bump-allocated above the bookkeeping region (bump
-    // pointer + live word + one free-list head i32 per arity 0..=max_arity),
-    // rounded up to an 8-byte boundary.
-    let heap_base_addr = {
-        let raw = FREELIST_BASE + 4 * (ctors.max_arity as u64 + 1);
+    // Collect the program's distinct String literals (their raw UTF-8 bytes).
+    let mut lit_list: Vec<Vec<u8>> = Vec::new();
+    for name in &order {
+        if let Some(ifn) = fns.get(name) {
+            collect_str_lits_iexpr(&ifn.body, &mut lit_list);
+        }
+    }
+
+    // Read-only data region: the bookkeeping area (bump ptr + live + reuses +
+    // free-list heads) rounded to 8, followed by the String-literal bytes.
+    // String literals live BELOW the heap so their addresses never alias a cell.
+    // The free-list array must cover every size class an allocation can request:
+    // ADT arities 0..=max_arity AND String size classes 0..=STR_MAX_CLASS.
+    let n_freelist_slots = (ctors.max_arity as u64).max(STR_MAX_CLASS) + 1;
+    let ro_base = {
+        let raw = FREELIST_BASE + 4 * n_freelist_slots;
         (raw + 7) & !7
     };
+    // Assign each literal a data-segment address; `str_lits` maps bytes -> addr.
+    let mut str_lits: HashMap<Vec<u8>, u64> = HashMap::new();
+    let mut lit_addr = ro_base;
+    for bytes in &lit_list {
+        str_lits.insert(bytes.clone(), lit_addr);
+        lit_addr += bytes.len() as u64;
+    }
+    // The heap (bump allocator) starts after all literal bytes, 8-aligned.
+    let heap_base_addr = (lit_addr + 7) & !7;
 
     // 3. Generate a code-section entry per function, in `order`.
     let mut code_entries: Vec<Vec<u8>> = Vec::new();
@@ -1784,6 +2810,8 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
             heap_base,
             ctors: &ctors,
             scratch_ptr: None,
+            str_lits: &str_lits,
+            print_str_idx: PRINT_STR_IDX,
         };
 
         // Emit the body instructions; the result is left on the stack.
@@ -1840,10 +2868,19 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
     // Header: magic + version.
     out.extend_from_slice(&[0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]);
 
-    // Type section (id 1): one functype per function, in order.
+    // Type section (id 1): type index 0 is the imported host function's
+    // signature `(i32, i32) -> ()` (the only VOID-result functype); type indices
+    // 1.. are the defined functions' single-result signatures, in `order`.
     {
         let mut content = Vec::new();
-        leb_u(type_section_funcs.len() as u64, &mut content);
+        leb_u((1 + type_section_funcs.len()) as u64, &mut content);
+        // type 0: env.print_str(ptr:i32, len:i32) -> ()  (no results)
+        content.push(0x60); // func type tag
+        leb_u(2, &mut content); // 2 params
+        content.push(WType::I32.byte());
+        content.push(WType::I32.byte());
+        leb_u(0, &mut content); // zero results
+        // types 1..: the defined functions.
         for (params, ret) in &type_section_funcs {
             content.push(0x60); // func type tag
             leb_u(params.len() as u64, &mut content);
@@ -1856,14 +2893,29 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
         section(1, &content, &mut out);
     }
 
-    // Function section (id 3): type index per function (1:1 with type section).
-    // Covers user functions *and* the appended overflow helpers.
+    // Import section (id 2): import the host function `env.print_str` (type 0).
+    {
+        let mut content = Vec::new();
+        leb_u(1, &mut content); // one import
+        let m = b"env";
+        leb_u(m.len() as u64, &mut content);
+        content.extend_from_slice(m);
+        let nm = b"print_str";
+        leb_u(nm.len() as u64, &mut content);
+        content.extend_from_slice(nm);
+        content.push(0x00); // import kind = func
+        leb_u(0, &mut content); // type index 0
+        section(2, &content, &mut out);
+    }
+
+    // Function section (id 3): type index per DEFINED function. Type index 0 is
+    // the import; defined function `i` uses type index `1 + i` (= N_IMPORTS + i).
     {
         let n = type_section_funcs.len();
         let mut content = Vec::new();
         leb_u(n as u64, &mut content);
         for i in 0..n {
-            leb_u(i as u64, &mut content); // type index == function index here
+            leb_u((N_IMPORTS as usize + i) as u64, &mut content); // type index
         }
         section(3, &content, &mut out);
     }
@@ -1927,7 +2979,9 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
     // the 4-byte little-endian initial bump value.
     {
         let mut content = Vec::new();
-        leb_u(1, &mut content); // one segment
+        // segment count = 1 (bump pointer) + one per String literal.
+        leb_u((1 + lit_list.len()) as u64, &mut content);
+        // segment 0: the initial bump-pointer value at BUMP_PTR_ADDR.
         content.push(0x00); // flags=0: active, memory 0, i32.const offset
         content.push(0x41); // i32.const
         leb_s(BUMP_PTR_ADDR as i64, &mut content);
@@ -1935,6 +2989,16 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
         let bytes = (heap_base_addr as u32).to_le_bytes();
         leb_u(bytes.len() as u64, &mut content);
         content.extend_from_slice(&bytes);
+        // one segment per String literal: raw UTF-8 bytes at their pool address.
+        for bytes in &lit_list {
+            let addr = str_lits[bytes];
+            content.push(0x00); // flags=0: active, memory 0
+            content.push(0x41); // i32.const
+            leb_s(addr as i64, &mut content);
+            content.push(0x0B); // end of offset expr
+            leb_u(bytes.len() as u64, &mut content);
+            content.extend_from_slice(bytes);
+        }
         section(11, &content, &mut out);
     }
 
@@ -1970,9 +3034,16 @@ mod tests {
         std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
         let script = format!(
             "const fs=require('fs');\
+             const dec=new TextDecoder();\
+             const imp={{env:{{print_str:(p,n)=>{{}}}}}};\
              try{{const b=fs.readFileSync({:?});\
-             WebAssembly.instantiate(b).then(r=>{{\
-             try{{process.stdout.write(String(r.instance.exports.main()));}}\
+             WebAssembly.instantiate(b,imp).then(r=>{{\
+             try{{const ex=r.instance.exports;const v=ex.main();\
+             if(typeof v==='bigint'){{process.stdout.write(String(v));}}\
+             else{{const mem=new Uint8Array(ex.memory.buffer);\
+             const dv=new DataView(ex.memory.buffer);\
+             const len=Number(dv.getBigInt64(v+8,true));\
+             process.stdout.write(dec.decode(mem.subarray(v+16,v+16+len)));}}}}\
              catch(e){{process.stdout.write('TRAP');}}\
              }}).catch(e=>{{process.stdout.write('TRAP');}});}}\
              catch(e){{process.stdout.write('TRAP');}}",
@@ -2125,25 +3196,152 @@ mod tests {
 
     #[test]
     fn unsupported_programs_return_err_not_panic() {
-        // String result.
-        let s1 = "fn main() -> String = concat(\"a\", \"b\")";
         // Float signature.
         let s3 = "fn main() -> Float = 3.5";
         // print_int builtin call.
         let s4 = "fn main() -> Int = { print_int(1); 0 }";
         // Unit-returning function.
         let s5 = "fn main() -> Unit = ()";
-        // 2b-deferred: an ADT carrying a Float field (only Int/Bool/Ref fields).
+        // 2b-deferred: an ADT carrying a Float field (only Int/Bool/Ref/Str fields).
         let s6 = "type B = | B(Float)\nfn main() -> Int = match B(1.5) { B(x) => 0, }";
-        // 2b-deferred: an ADT carrying a String field.
-        let s7 = "type R = | R(String, Int)\n\
-                  fn main() -> Int = match R(\"a\", 1) { R(s, n) => n, }";
         // 2b-deferred: structural ADT equality (needs a recursive compare).
         let s8 = "type P = | P(Int, Int)\nfn main() -> Bool = P(1, 2) == P(1, 2)";
-        for src in [s1, s3, s4, s5, s6, s7, s8] {
+        for src in [s3, s4, s5, s6, s8] {
             let r = compile_src(src);
             assert!(r.is_err(), "expected Err (no panic) for:\n{}", src);
         }
+    }
+
+    // ---- Phase 2d: heap-allocated Strings -------------------------------
+
+    /// Run a String-returning compiled module under Node, returning
+    /// `(decoded_string, live_cells)`. The host `env.print_str` import is a
+    /// no-op here (these programs don't print); `__live` is read after `main`.
+    fn run_wasm_str_live(bytes: &[u8]) -> Result<(String, i64), String> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "aria_wasm_str_{}_{}.wasm",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
+        let script = format!(
+            "const fs=require('fs');\
+             const dec=new TextDecoder();\
+             const imp={{env:{{print_str:(p,n)=>{{}}}}}};\
+             const b=fs.readFileSync({:?});\
+             WebAssembly.instantiate(b,imp).then(r=>{{\
+             const ex=r.instance.exports;const v=ex.main();\
+             const dv=new DataView(ex.memory.buffer);\
+             const len=Number(dv.getBigInt64(v+8,true));\
+             const s=dec.decode(new Uint8Array(ex.memory.buffer).subarray(v+16,v+16+len));\
+             process.stdout.write(s+'\\u0000'+String(ex.__live()));\
+             }}).catch(e=>process.stdout.write('TRAP\\u00000'));",
+            path.to_string_lossy()
+        );
+        let out = Command::new("node").arg("-e").arg(&script).output().map_err(|e| e.to_string())?;
+        let _ = std::fs::remove_file(&path);
+        let s = String::from_utf8_lossy(&out.stdout).to_string();
+        let (res, live) = s.split_once('\u{0}').ok_or("bad harness output")?;
+        Ok((res.to_string(), live.parse::<i64>().unwrap_or(-1)))
+    }
+
+    /// Differential check for a String-returning program: the decoded wasm
+    /// result must equal the interpreter's `display`, and exactly ONE heap
+    /// object (the returned String) may remain live (garbage-free otherwise).
+    fn differential_str(src: &str) {
+        let interp = interp_result(src).expect("interpreter should succeed");
+        let bytes = compile_src(src).expect("compile should succeed");
+        if !node_available() {
+            return;
+        }
+        let (wasm, live) = run_wasm_str_live(&bytes).expect("running wasm");
+        assert_eq!(interp, wasm, "wasm != interpreter for:\n{}", src);
+        assert_eq!(live, 1, "expected exactly the result String live, got {} in:\n{}", live, src);
+    }
+
+    #[test]
+    fn string_literal_returned() {
+        differential_str("fn main() -> String = \"hello, world\"");
+    }
+
+    #[test]
+    fn string_concat_and_int_to_str() {
+        differential_str("fn main() -> String = concat(\"hello, \", int_to_str(42))");
+    }
+
+    #[test]
+    fn string_int_to_str_negative_and_zero() {
+        differential_str("fn main() -> String = concat(int_to_str(0), int_to_str(-12345))");
+        // i64::MIN must format correctly (the per-digit algorithm never negates
+        // the whole value). MIN is built at runtime as (0 - i64::MAX) - 1, since
+        // the literal `9223372036854775808` is out of range for the lexer.
+        differential_str(
+            "fn min() -> Int = (0 - 9223372036854775807) - 1\n\
+             fn main() -> String = int_to_str(min())",
+        );
+    }
+
+    #[test]
+    fn string_concat_chain_is_garbage_free() {
+        // Multiple concats build and free intermediate Strings; only the final
+        // result remains live.
+        differential_str(
+            "fn main() -> String = concat(concat(\"a\", \"b\"), concat(int_to_str(7), \"z\"))",
+        );
+    }
+
+    #[test]
+    fn string_equality_matches_interpreter() {
+        // String `==` / `!=`: equal, unequal (same len), and length-mismatch.
+        differential(
+            "fn main() -> Int = if \"abc\" == \"abc\" { 1 } else { 0 }",
+        );
+        differential(
+            "fn main() -> Int = if \"abc\" == \"abd\" { 1 } else { 0 }",
+        );
+        differential(
+            "fn main() -> Int = if \"abc\" != \"ab\" { 1 } else { 0 }",
+        );
+        // Through int_to_str, and the `!=` negation path.
+        differential(
+            "fn main() -> Int = if int_to_str(42) == \"42\" { 100 } else { 0 }",
+        );
+    }
+
+    #[test]
+    fn string_equality_is_garbage_free() {
+        // After comparing two literal Strings, both temporaries must be freed
+        // (the result is an unboxed Bool), so `__live` ends at 0.
+        let src = "fn main() -> Int = if \"hello\" == \"hello\" { 1 } else { 0 }";
+        let bytes = compile_src(src).expect("compile should succeed");
+        if !node_available() {
+            return;
+        }
+        let (wasm, live) = run_wasm_live(&bytes).expect("running wasm");
+        assert_eq!(interp_result(src).unwrap(), wasm, "wasm != interpreter");
+        assert_eq!(live, 0, "string == leaked: {} live", live);
+    }
+
+    #[test]
+    fn string_field_in_adt_is_dropped() {
+        // An ADT carrying a String field: matching it out and discarding the
+        // cell must drop the String too, leaving the heap garbage-free.
+        differential_heap(
+            "type R = | R(String, Int)\n\
+             fn main() -> Int = match R(concat(\"a\", \"b\"), 5) { R(s, n) => n, }",
+        );
+    }
+
+    #[test]
+    fn string_returned_from_branch() {
+        // `main -> String` selected by a Bool, exercising the if-result String
+        // type and the harness's String decode.
+        differential_str(
+            "fn pick(b: Bool) -> String = if b { \"yes\" } else { concat(\"n\", \"o\") }\n\
+             fn main() -> String = pick(false)",
+        );
     }
 
     #[test]
@@ -2190,8 +3388,9 @@ mod tests {
         std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
         let script = format!(
             "const fs=require('fs');\
+             const imp={{env:{{print_str:(p,n)=>{{}}}}}};\
              const b=fs.readFileSync({:?});\
-             WebAssembly.instantiate(b).then(r=>{{\
+             WebAssembly.instantiate(b,imp).then(r=>{{\
              const m=String(r.instance.exports.main());\
              const l=String(r.instance.exports.__live());\
              process.stdout.write(m+'|'+l);\
@@ -2319,8 +3518,9 @@ mod tests {
         std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
         let script = format!(
             "const fs=require('fs');\
+             const imp={{env:{{print_str:(p,n)=>{{}}}}}};\
              const b=fs.readFileSync({:?});\
-             WebAssembly.instantiate(b).then(r=>{{\
+             WebAssembly.instantiate(b,imp).then(r=>{{\
              const m=String(r.instance.exports.main());\
              const l=String(r.instance.exports.__live());\
              const u=String(r.instance.exports.__reuses());\
