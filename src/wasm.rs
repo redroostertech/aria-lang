@@ -2769,6 +2769,14 @@ fn collect_str_lits_atom(a: &Atom, out: &mut Vec<Vec<u8>>) {
 /// Compile a type-checked `Program` to a WebAssembly binary (subset 2a).
 /// Returns a clean `Err` for any feature outside the subset; never panics.
 pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
+    // 0. Monomorphization (wasm-backend-only pre-pass): specialize every
+    //    generic function and ADT reachable from `main` per the concrete type
+    //    arguments actually used, producing a type-variable-free program. A
+    //    program with no generics passes through unchanged. The rest of the
+    //    backend then sees only concrete Int/Bool/Float/String/ADT types.
+    let mono = crate::monomorphize::monomorphize(program)?;
+    let program = &mono;
+
     // 1. Collect function signatures from the typed AST, in declaration order,
     //    assigning deterministic wasm function indices.
     // We import two host functions: `env.print_str` (index 0) and
@@ -3704,6 +3712,65 @@ mod tests {
         let (wasm, live) = run_wasm_live(&bytes).expect("running wasm");
         assert_eq!(interp, wasm, "wasm != interpreter for:\n{}", src);
         assert_eq!(live, 0, "leak: {} live cell(s) after main in:\n{}", live, src);
+    }
+
+    // ---- Generics via monomorphization ----------------------------------
+
+    #[test]
+    fn generic_option_get_at_int() {
+        // A generic `Opt[T]` and a generic `get[T]`, both specialized to Int.
+        // Nullary `None`'s type args are recovered from the param's expected
+        // type. Result equals the interpreter and the heap ends garbage-free.
+        differential_heap(
+            "type Opt[T] = | None | Some(T)\n\
+             fn get[T](o: Opt[T], d: T) -> T = match o { None => d, Some(x) => x, }\n\
+             fn main() -> Int = get(Some(7), 0)",
+        );
+        differential_heap(
+            "type Opt[T] = | None | Some(T)\n\
+             fn or_else(o: Opt[Int], d: Int) -> Int = match o { None => d, Some(x) => x, }\n\
+             fn main() -> Int = or_else(None, 99) + or_else(Some(5), 0)",
+        );
+    }
+
+    #[test]
+    fn generic_list_sum_and_length_at_int() {
+        // Generic `List[T]` used at `List[Int]`: a monomorphic `sum` over the
+        // concrete instantiation plus a generic `length[T]` specialized to Int.
+        differential_heap(
+            "type List[T] = | Nil | Cons(T, List[T])\n\
+             fn sum(xs: List[Int]) -> Int = match xs { Nil => 0, Cons(h, r) => h + sum(r), }\n\
+             fn length[T](xs: List[T]) -> Int = match xs { Nil => 0, Cons(_, r) => 1 + length(r), }\n\
+             fn main() -> Int = { let xs = Cons(1, Cons(2, Cons(3, Cons(4, Nil)))); sum(xs) + length(xs) }",
+        );
+    }
+
+    #[test]
+    fn generic_fn_instantiated_at_two_types() {
+        // The SAME generic function/type instantiated at TWO concrete types in
+        // one program (`List[Int]` and `List[Bool]`): each gets its own
+        // specialization (length$Int / length$Bool over List$Int / List$Bool).
+        differential_heap(
+            "type List[T] = | Nil | Cons(T, List[T])\n\
+             fn length[T](xs: List[T]) -> Int = match xs { Nil => 0, Cons(_, r) => 1 + length(r), }\n\
+             fn main() -> Int = {\n\
+               let xs = Cons(1, Cons(2, Nil));\n\
+               let bs = Cons(true, Cons(false, Cons(true, Nil)));\n\
+               length(xs) + length(bs)\n\
+             }",
+        );
+    }
+
+    #[test]
+    fn generic_wrap_returns_specialized_type() {
+        // A generic function returning `Option[T]`, instantiated at Int; the
+        // result type is inferred from the call's argument.
+        differential_heap(
+            "type Option[T] = | None | Some(T)\n\
+             fn wrap[T](x: T) -> Option[T] = Some(x)\n\
+             fn unwrap(o: Option[Int], d: Int) -> Int = match o { None => d, Some(x) => x, }\n\
+             fn main() -> Int = unwrap(wrap(42), 0)",
+        );
     }
 
     #[test]

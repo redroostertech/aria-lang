@@ -18,6 +18,7 @@ mod builtins;
 mod interp;
 mod ir;
 mod lexer;
+mod monomorphize;
 mod neural_codec;
 mod pack;
 mod parser;
