@@ -45,6 +45,12 @@ Re-run the checks with `cargo test`, `aria bench`, and the probes noted below.
 | **Aria compiles to WebAssembly** | `src/wasm.rs` hand-emits a real `.wasm` for the pure Int/Bool/function subset (arithmetic, comparisons, `if`, integer `match`, recursion, short-circuit `&&`/`\|\|`); runs via Node | ✅ Differentially tested vs the interpreter oracle; unsupported features (ADTs/strings/floats/builtins) rejected with a clean error, not a panic. Heap data is Phase 2b. |
 | **Compiled and interpreted Aria agree** | verified across a curated battery + adversarial edge cases (LEB128 limits, multi-byte section lengths, many functions/locals, negatives, large i64) | ✅ Integer overflow is a *defined error*: wasm **traps** on `+`/`-`/`*`/negation overflow and div/rem-by-zero (and `MIN/-1`), matching the interpreter's checked-error semantics. No silent-wrap divergence. |
 
+### Backend agreement caveats (honest)
+
+- **Recursion depth (wasm):** compiled wasm recursion is bounded by the host runtime's stack. Under Node it traps on ~20k-deep non-tail recursion; the `wasm-run` harness passes `--stack-size=8000` to raise this so it matches the interpreter (1 GiB thread) and native (C stack) on the cases tested (50k+). This is a *runtime stack limit*, not a miscompilation — a different wasm runtime would differ.
+- **`softmax` / `embed_similarity`:** agree with the interpreter within ~1e-5, not bit-exact, because `exp` (Rust `f32::exp` vs JS `Math.exp`) is not bit-portable. All other tensor ops (`matmul`/`transpose`/`relu`/`get`) bit-match.
+- **Codec builtins** (`compressed_size`, `neural_bits_per_byte`) remain interpreter-only in the compiled backends (porting the whole coders is deferred; they return a clean `Err`).
+
 ## Net
 
 The core *language-property* claims (immutability, expressions, case rule,

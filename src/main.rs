@@ -253,7 +253,14 @@ fn run_wasm_run(args: &[String]) -> ExitCode {
          catch(e){{process.stdout.write('TRAP');}}",
         path.to_string_lossy()
     );
-    let out = std::process::Command::new("node").arg("-e").arg(&script).output();
+    // `--stack-size` raises V8's stack so compiled wasm can recurse as deeply as
+    // the interpreter / native backend (wasm under Node's default stack traps on
+    // ~20k-deep non-tail recursion — a runtime stack limit, not a miscompilation).
+    let out = std::process::Command::new("node")
+        .arg("--stack-size=8000")
+        .arg("-e")
+        .arg(&script)
+        .output();
     let _ = std::fs::remove_file(&path);
     match out {
         Ok(o) if o.status.success() => {
