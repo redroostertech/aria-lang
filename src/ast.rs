@@ -57,6 +57,16 @@ pub enum Expr {
     /// local function value, or `(\x -> x)(5)`. The third field is the concrete
     /// result type, filled in by `monomorphize` (`None` from the parser).
     Apply(Box<Expr>, Vec<Expr>, Option<Ty>),
+    /// A record literal, e.g. `Point { x: 1.0, y: 2.0 }`. Fields may be written
+    /// in any order; the checker validates the set against the declared record
+    /// and the interpreter reorders them into declared field order. A record is
+    /// a single-constructor type whose constructor shares the type's name.
+    Record(String, Vec<(String, Expr)>),
+    /// Field access, e.g. `p.x`. Resolved against the record type of the object.
+    Field(Box<Expr>, String),
+    /// Functional record update, e.g. `{ p | x = 3.0 }`: a copy of the base
+    /// record with the listed fields replaced. Type-preserving.
+    Update(Box<Expr>, Vec<(String, Expr)>),
     Unary(UnOp, Box<Expr>),
     Binary(BinOp, Box<Expr>, Box<Expr>),
     If(Box<Expr>, Box<Expr>, Box<Expr>),
@@ -84,6 +94,9 @@ pub enum Pattern {
     Int(i64),
     Bool(bool),
     Ctor(String, Vec<Pattern>),
+    /// A record pattern, e.g. `Point { x, y }`, binding each named field to a
+    /// same-named variable. Unmentioned fields are ignored.
+    Record(String, Vec<(String, Pattern)>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -132,6 +145,11 @@ pub struct FnDecl {
 pub struct Variant {
     pub name: String,
     pub fields: Vec<Ty>,
+    /// `Some(names)` iff this is a record-style variant (`type P = { x: T, .. }`):
+    /// the field names, positionally aligned with `fields`. `None` for ordinary
+    /// positional sum-type variants. A record type has exactly one such variant
+    /// whose name equals the type name.
+    pub field_names: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone)]

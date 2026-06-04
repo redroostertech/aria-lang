@@ -46,14 +46,70 @@ use std::fmt::Write as _;
 use crate::ast::{BinOp, Item, Program, Ty, UnOp};
 use crate::ir::{self, Atom, Bind, IExpr, IFn};
 
+/// The concrete element kind of a native array, encoding both the slot storage
+/// and whether elements are heap references (needing a recursive drop). This
+/// mirrors the one-char suffix the monomorphizer attaches to array builtins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ElemKind {
+    Int,   // Int/Bool — stored directly in an int64 slot
+    Float, // Float — f64 bit-reinterpreted into an int64 slot
+    Str,   // heap String object (ref counted, recursive drop)
+    Ref,   // boxed heap value: ADT cell, closure, nested array (recursive drop)
+}
+
+impl ElemKind {
+    /// Parse the monomorphizer's one-char element-kind suffix.
+    fn from_tag(c: char) -> Result<ElemKind, String> {
+        match c {
+            'i' => Ok(ElemKind::Int),
+            'f' => Ok(ElemKind::Float),
+            's' => Ok(ElemKind::Str),
+            'r' => Ok(ElemKind::Ref),
+            other => Err(format!("c backend: bad array element-kind tag `{}`", other)),
+        }
+    }
+
+    /// The header `kind` code stored in `AriaArray.kind` (drives the kind-aware
+    /// runtime drop). Must match the codes used in the C runtime below.
+    fn code(self) -> i64 {
+        match self {
+            ElemKind::Int => 0,
+            ElemKind::Float => 1,
+            ElemKind::Str => 2,
+            ElemKind::Ref => 3,
+        }
+    }
+
+    /// The C value type of an element of this kind.
+    fn elem_ctype(self) -> CType {
+        match self {
+            ElemKind::Int => CType::Int,
+            ElemKind::Float => CType::Float,
+            ElemKind::Str => CType::Str,
+            ElemKind::Ref => CType::Ref,
+        }
+    }
+
+    /// The element kind that holds a value of the given C value type.
+    fn from_ctype(ct: CType) -> ElemKind {
+        match ct {
+            CType::Int | CType::Bool => ElemKind::Int,
+            CType::Float => ElemKind::Float,
+            CType::Str => ElemKind::Str,
+            CType::Ref | CType::Array(_) => ElemKind::Ref,
+        }
+    }
+}
+
 /// A C-level value type for an Aria value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CType {
-    Int,   // int64_t
-    Bool,  // int64_t (0/1)
-    Float, // double
-    Ref,   // void* — heap ADT cell
-    Str,   // void* — heap String object
+    Int,             // int64_t
+    Bool,            // int64_t (0/1)
+    Float,           // double
+    Ref,             // void* — heap ADT cell
+    Str,             // void* — heap String object
+    Array(ElemKind), // void* — heap AriaArray of the given element kind
 }
 
 impl CType {
@@ -62,7 +118,7 @@ impl CType {
         match self {
             CType::Int | CType::Bool => "int64_t",
             CType::Float => "double",
-            CType::Ref | CType::Str => "void*",
+            CType::Ref | CType::Str | CType::Array(_) => "void*",
         }
     }
 
@@ -74,15 +130,37 @@ impl CType {
             Ty::Bool => Ok(CType::Bool),
             Ty::Float => Ok(CType::Float),
             Ty::Str => Ok(CType::Str),
+            Ty::Named(n, args) if n == "Array" && args.len() == 1 => {
+                let elem = CType::from_ty(&args[0])?;
+                Ok(CType::Array(ElemKind::from_ctype(elem)))
+            }
             Ty::Named(_, args) if args.is_empty() => Ok(CType::Ref),
             // A closure value is a heap cell (tag = lambda id, fields = captures).
             Ty::Fn(_, _) => Ok(CType::Ref),
             other => Err(format!(
-                "c backend: unsupported type `{:?}` (subset: Int/Bool/Float/String and non-generic ADTs)",
+                "c backend: unsupported type `{:?}` (subset: Int/Bool/Float/String, Array, and non-generic ADTs)",
                 other
             )),
         }
     }
+}
+
+/// Parse a suffixed array-builtin name (`array_get$r`, `array_lit$f`, …) into its
+/// base operation and concrete element kind. The UNSUFFIXED names never reach the
+/// backend (they are interpreter/IR-only). Returns `None` if not an array builtin.
+fn parse_array_builtin(name: &str) -> Option<(&'static str, ElemKind)> {
+    let (base, tag) = name.rsplit_once('$')?;
+    let kind = ElemKind::from_tag(tag.chars().next()?).ok()?;
+    let base = match base {
+        "array_new" => "array_new",
+        "array_lit" => "array_lit",
+        "array_len" => "array_len",
+        "array_get" => "array_get",
+        "array_set" => "array_set",
+        "array_push" => "array_push",
+        _ => return None,
+    };
+    Some((base, kind))
 }
 
 /// A function's C-level signature, derived from the typed AST.
@@ -310,6 +388,9 @@ fn bind_type(bind: &Bind, env: &Env) -> Result<CType, String> {
             UnOp::Not => Ok(CType::Bool),
         },
         Bind::Call(name, _) => {
+            if let Some((base, kind)) = parse_array_builtin(name) {
+                return Ok(array_builtin_ret(base, kind));
+            }
             if let Some(t) = builtin_ret(name) {
                 return Ok(t);
             }
@@ -468,7 +549,18 @@ fn builtin_ret(name: &str) -> Option<CType> {
 }
 
 fn is_builtin(name: &str) -> bool {
-    builtin_ret(name).is_some()
+    builtin_ret(name).is_some() || parse_array_builtin(name).is_some()
+}
+
+/// The C result type of an array builtin: builders yield an `Array(kind)`,
+/// `array_get` the element ctype, `array_len` an Int.
+fn array_builtin_ret(base: &str, kind: ElemKind) -> CType {
+    match base {
+        "array_new" | "array_lit" | "array_set" | "array_push" => CType::Array(kind),
+        "array_get" => kind.elem_ctype(),
+        "array_len" => CType::Int,
+        _ => CType::Array(kind),
+    }
 }
 
 // ---- code generation -----------------------------------------------------
@@ -507,6 +599,9 @@ fn emit_iexpr(
                 CType::Str => {
                     let _ = writeln!(out, "{}aria_str_dup({});", ind, cvar(v));
                 }
+                CType::Array(_) => {
+                    let _ = writeln!(out, "{}aria_array_dup({});", ind, cvar(v));
+                }
                 _ => {}
             }
             emit_iexpr(body, result, result_ty, env, ind, out)
@@ -518,6 +613,9 @@ fn emit_iexpr(
                 }
                 CType::Str => {
                     let _ = writeln!(out, "{}aria_str_drop({});", ind, cvar(v));
+                }
+                CType::Array(_) => {
+                    let _ = writeln!(out, "{}aria_array_drop({});", ind, cvar(v));
                 }
                 _ => {}
             }
@@ -636,7 +734,7 @@ fn emit_make_closure(
             CType::Float => {
                 let _ = writeln!(out, "{}aria_field({}, {}) = aria_f2i({});", ind, dst, i, ex);
             }
-            CType::Ref | CType::Str => {
+            CType::Ref | CType::Str | CType::Array(_) => {
                 let _ = writeln!(out, "{}aria_field({}, {}) = (int64_t)(uintptr_t)({});", ind, dst, i, ex);
             }
         }
@@ -875,6 +973,9 @@ fn emit_builtin(
     ind: &str,
     out: &mut String,
 ) -> Result<(), String> {
+    if let Some((base, kind)) = parse_array_builtin(name) {
+        return emit_array_builtin(base, kind, args, dst, env, ind, out);
+    }
     match name {
         "concat" => {
             if args.len() != 2
@@ -937,6 +1038,121 @@ fn emit_builtin(
     }
 }
 
+/// Encode an evaluated element value (C expression `ex` of type `t`) into the
+/// int64 slot representation used by `AriaArray.elems[]`, per the array's kind.
+fn encode_elem_slot(kind: ElemKind, t: CType, ex: &str) -> Result<String, String> {
+    if t != kind.elem_ctype() {
+        return Err(format!(
+            "c backend: array element type mismatch (got {:?}, expected {:?})",
+            t,
+            kind.elem_ctype()
+        ));
+    }
+    Ok(match kind {
+        ElemKind::Int => format!("(int64_t)({})", ex),
+        ElemKind::Float => format!("aria_f2i({})", ex),
+        ElemKind::Str | ElemKind::Ref => format!("(int64_t)(uintptr_t)({})", ex),
+    })
+}
+
+/// Decode an int64 slot C expression `slot` back to the element's C value type.
+fn decode_elem_slot(kind: ElemKind, slot: &str) -> String {
+    match kind {
+        ElemKind::Int => slot.to_string(),
+        ElemKind::Float => format!("aria_i2f({})", slot),
+        ElemKind::Str | ElemKind::Ref => format!("(void*)(uintptr_t)({})", slot),
+    }
+}
+
+/// Emit a native array builtin. The monomorphizer suffixes each name with the
+/// concrete element kind; we dispatch to the `aria_array_*` runtime, encoding
+/// Float via f2i and Str/Ref via pointer casts.
+fn emit_array_builtin(
+    base: &str,
+    kind: ElemKind,
+    args: &[Atom],
+    dst: &str,
+    env: &mut Env,
+    ind: &str,
+    out: &mut String,
+) -> Result<(), String> {
+    match base {
+        "array_new" => {
+            if !args.is_empty() {
+                return Err("c backend: array_new expects no arguments".into());
+            }
+            let _ = writeln!(out, "{}{} = aria_array_new(INT64_C({}));", ind, dst, kind.code());
+            Ok(())
+        }
+        "array_lit" => {
+            // Build an array, then push each element. Each element's ownership
+            // moves into the array (the IR does not dup them), so storing the
+            // raw slot is correct.
+            let _ = writeln!(out, "{}{} = aria_array_new(INT64_C({}));", ind, dst, kind.code());
+            for a in args {
+                let (t, ex) = emit_atom(a, env, out)?;
+                let slot = encode_elem_slot(kind, t, &ex)?;
+                let _ = writeln!(
+                    out,
+                    "{}{} = aria_array_push({}, {}, INT64_C({}));",
+                    ind, dst, dst, slot, kind.code()
+                );
+            }
+            Ok(())
+        }
+        "array_len" => {
+            if args.len() != 1 {
+                return Err("c backend: array_len expects one array".into());
+            }
+            let (_, arr) = emit_atom(&args[0], env, out)?;
+            let _ = writeln!(out, "{}{} = aria_array_len({});", ind, dst, arr);
+            Ok(())
+        }
+        "array_get" => {
+            if args.len() != 2 {
+                return Err("c backend: array_get expects (array, index)".into());
+            }
+            let (_, arr) = emit_atom(&args[0], env, out)?;
+            let (it, idx) = emit_atom(&args[1], env, out)?;
+            if it != CType::Int {
+                return Err("c backend: array_get index must be Int".into());
+            }
+            let slot = format!("aria_array_get({}, {})", arr, idx);
+            let _ = writeln!(out, "{}{} = {};", ind, dst, decode_elem_slot(kind, &slot));
+            Ok(())
+        }
+        "array_set" => {
+            if args.len() != 3 {
+                return Err("c backend: array_set expects (array, index, value)".into());
+            }
+            let (_, arr) = emit_atom(&args[0], env, out)?;
+            let (it, idx) = emit_atom(&args[1], env, out)?;
+            if it != CType::Int {
+                return Err("c backend: array_set index must be Int".into());
+            }
+            let (t, ex) = emit_atom(&args[2], env, out)?;
+            let slot = encode_elem_slot(kind, t, &ex)?;
+            let _ = writeln!(out, "{}{} = aria_array_set({}, {}, {});", ind, dst, arr, idx, slot);
+            Ok(())
+        }
+        "array_push" => {
+            if args.len() != 2 {
+                return Err("c backend: array_push expects (array, value)".into());
+            }
+            let (_, arr) = emit_atom(&args[0], env, out)?;
+            let (t, ex) = emit_atom(&args[1], env, out)?;
+            let slot = encode_elem_slot(kind, t, &ex)?;
+            let _ = writeln!(
+                out,
+                "{}{} = aria_array_push({}, {}, INT64_C({}));",
+                ind, dst, arr, slot, kind.code()
+            );
+            Ok(())
+        }
+        _ => Err(format!("c backend: unsupported array builtin `{}`", base)),
+    }
+}
+
 fn check_ctor<'a>(
     name: &str,
     fields: &[Atom],
@@ -981,7 +1197,7 @@ fn emit_store_fields(
             CType::Float => {
                 let _ = writeln!(out, "{}aria_field({}, {}) = aria_f2i({});", ind, cellptr, i, ex);
             }
-            CType::Ref | CType::Str => {
+            CType::Ref | CType::Str | CType::Array(_) => {
                 let _ = writeln!(out, "{}aria_field({}, {}) = (int64_t)(uintptr_t)({});", ind, cellptr, i, ex);
             }
         }
@@ -1090,7 +1306,7 @@ fn emit_arm_body(
                         format!("aria_field({}, {})", sv, idx)
                     }
                     CType::Float => format!("aria_i2f(aria_field({}, {}))", sv, idx),
-                    CType::Ref | CType::Str => {
+                    CType::Ref | CType::Str | CType::Array(_) => {
                         format!("(void*)(uintptr_t)aria_field({}, {})", sv, idx)
                     }
                 };
@@ -1264,6 +1480,128 @@ static void* aria_drop_reuse(void* p) {
         return p;  /* slot retained for a same-arity CtorReuse */
     }
     return NULL;
+}
+
+/* ---- native array: { rc; kind; len; cap; int64_t elems[] } ----
+   kind codes: 0=Int/Bool, 1=Float, 2=Str (heap ref), 3=Ref (boxed heap ref).
+   Elements are stored one per int64 slot: Int directly, Float via aria_f2i, and
+   Str/Ref as the pointer cast through uintptr_t. FBIP: set/push mutate in place
+   when rc==1, else copy-on-write. */
+typedef struct { int64_t rc; int64_t kind; int64_t len; int64_t cap; int64_t elems[]; } AriaArray;
+
+static void* aria_array_alloc(int64_t kind, int64_t cap) {
+    AriaArray* a = (AriaArray*)malloc(sizeof(AriaArray) + (size_t)cap * sizeof(int64_t));
+    if (!a) aria_trap();
+    a->rc = 1; a->kind = kind; a->len = 0; a->cap = cap;
+    aria_live++;
+    return (void*)a;
+}
+static void* aria_array_new(int64_t kind) { return aria_array_alloc(kind, 0); }
+static inline void aria_array_dup(void* p) { ((AriaArray*)p)->rc++; }
+static void aria_array_drop(void* p);  /* defined below */
+static int64_t aria_array_len(void* p) {
+    int64_t n = ((AriaArray*)p)->len;
+    aria_array_drop(p);  /* array_len consumes its array argument */
+    return n;
+}
+
+/* Dup a single element slot (used when copy-on-write clones a buffer). */
+static void aria_array_dup_elem(int64_t kind, int64_t slot) {
+    if (kind == 2) aria_str_dup((void*)(uintptr_t)slot);
+    else if (kind == 3) aria_dup((void*)(uintptr_t)slot);
+}
+/* Drop a single element slot. */
+static void aria_array_drop_elem(int64_t kind, int64_t slot) {
+    if (kind == 2) aria_str_drop((void*)(uintptr_t)slot);
+    else if (kind == 3) aria_drop((void*)(uintptr_t)slot);
+}
+
+static void aria_array_drop(void* p) {
+    AriaArray* a = (AriaArray*)p;
+    if (--a->rc == 0) {
+        if (a->kind == 2) { for (int64_t i = 0; i < a->len; i++) aria_str_drop((void*)(uintptr_t)a->elems[i]); }
+        else if (a->kind == 3) { for (int64_t i = 0; i < a->len; i++) aria_drop((void*)(uintptr_t)a->elems[i]); }
+        aria_live--;
+        free(a);
+    }
+}
+
+static int64_t aria_array_get(void* p, int64_t i) {
+    AriaArray* a = (AriaArray*)p;
+    if (i < 0 || i >= a->len) aria_trap();
+    int64_t slot = a->elems[i];
+    /* The element is still owned by the array; hand the caller its own
+       reference, then release the (consumed) array. */
+    aria_array_dup_elem(a->kind, slot);
+    aria_array_drop(p);
+    return slot;
+}
+
+/* Clone an array's buffer (dup'ing each Str/Ref element) for copy-on-write. */
+static void* aria_array_clone(AriaArray* a) {
+    int64_t cap = a->len > 0 ? a->len : 1;
+    AriaArray* n = (AriaArray*)aria_array_alloc(a->kind, cap);
+    n->len = a->len;
+    for (int64_t i = 0; i < a->len; i++) {
+        n->elems[i] = a->elems[i];
+        aria_array_dup_elem(a->kind, a->elems[i]);
+    }
+    return (void*)n;
+}
+
+static void* aria_array_set(void* p, int64_t i, int64_t x) {
+    AriaArray* a = (AriaArray*)p;
+    if (i < 0 || i >= a->len) aria_trap();
+    if (a->rc == 1) {
+        /* FBIP: overwrite in place; drop the displaced element. */
+        aria_array_drop_elem(a->kind, a->elems[i]);
+        a->elems[i] = x;
+        aria_reuses++;
+        return p;
+    }
+    /* Copy-on-write: clone (dup'ing each element), then overwrite slot i with x
+       (releasing the freshly-dup'd element that x replaces), drop original. */
+    AriaArray* n = (AriaArray*)aria_array_clone(a);
+    aria_array_drop_elem(n->kind, n->elems[i]);
+    n->elems[i] = x;
+    aria_array_drop(p);
+    return (void*)n;
+}
+
+/* Grow an array (rc==1, owned) so it has room for at least one more element.
+   When `cap==0` (a fresh `array_new`) start at a sane minimum (4). The WHOLE
+   AriaArray object (header + inline `elems[]`) is reallocated together, so the
+   returned pointer may have moved — callers must use it. */
+static AriaArray* aria_array_grow(AriaArray* a) {
+    if (a->len < a->cap) return a;
+    int64_t ncap = a->cap > 0 ? a->cap * 2 : 4;
+    AriaArray* g = (AriaArray*)realloc(a, sizeof(AriaArray) + (size_t)ncap * sizeof(int64_t));
+    if (!g) aria_trap();
+    g->cap = ncap;
+    return g;
+}
+
+/* `kind` is the AUTHORITATIVE element kind from the (correctly-suffixed) push
+   call site. An empty `array_new` may have been tagged with a stale kind by the
+   monomorphizer; reconcile the header here while the array still has no live
+   element references (len==0), so the kind-aware dup/drop stay correct. */
+static void* aria_array_push(void* p, int64_t x, int64_t kind) {
+    AriaArray* a = (AriaArray*)p;
+    if (a->len == 0) a->kind = kind;
+    if (a->rc == 1) {
+        /* FBIP: realloc-grow the whole object in place. */
+        a = aria_array_grow(a);
+        a->elems[a->len++] = x;
+        aria_reuses++;
+        return (void*)a;
+    }
+    /* Copy-on-write: clone, append x, drop original. */
+    AriaArray* n = (AriaArray*)aria_array_clone(a);
+    n->kind = kind;
+    n = aria_array_grow(n);
+    n->elems[n->len++] = x;
+    aria_array_drop(p);
+    return (void*)n;
 }
 
 /* ---- structural equality (per-tag, emitted below) ---- */
@@ -1576,6 +1914,11 @@ fn emit_eq_helper(ctors: &CtorTable, out: &mut String) {
                 CType::Ref => {
                     let _ = writeln!(out, "        eq = eq && aria_eq((void*)(uintptr_t)aria_field(a, {}), (void*)(uintptr_t)aria_field(b, {}));", i, i);
                 }
+                CType::Array(_) => {
+                    // Array fields compare by pointer identity (structural array
+                    // equality is outside the subset).
+                    let _ = writeln!(out, "        eq = eq && (aria_field(a, {}) == aria_field(b, {}));", i, i);
+                }
             }
         }
         out.push_str("        return eq;\n");
@@ -1627,7 +1970,7 @@ fn emit_lambda(
         let load = match ct {
             CType::Int | CType::Bool => format!("(int64_t)aria_field(__aria_clo, {})", i),
             CType::Float => format!("aria_i2f(aria_field(__aria_clo, {}))", i),
-            CType::Ref | CType::Str => format!("(void*)(uintptr_t)aria_field(__aria_clo, {})", i),
+            CType::Ref | CType::Str | CType::Array(_) => format!("(void*)(uintptr_t)aria_field(__aria_clo, {})", i),
         };
         let _ = writeln!(out, "    {} {} = {};", ct.decl(), cvar(cn), load);
         match ct {
@@ -1636,6 +1979,9 @@ fn emit_lambda(
             }
             CType::Str => {
                 let _ = writeln!(out, "    aria_str_dup({});", cvar(cn));
+            }
+            CType::Array(_) => {
+                let _ = writeln!(out, "    aria_array_dup({});", cvar(cn));
             }
             _ => {}
         }
@@ -1675,7 +2021,7 @@ fn emit_drop_children_helper(
             .field_types
             .iter()
             .enumerate()
-            .filter(|(_, t)| matches!(t, CType::Ref | CType::Str))
+            .filter(|(_, t)| matches!(t, CType::Ref | CType::Str | CType::Array(_)))
             .map(|(i, t)| (i, *t))
             .collect();
         if managed.is_empty() {
@@ -1683,15 +2029,7 @@ fn emit_drop_children_helper(
         }
         let _ = writeln!(out, "    if (tag == INT64_C({})) {{", info.tag);
         for (i, t) in managed {
-            match t {
-                CType::Ref => {
-                    let _ = writeln!(out, "        aria_drop((void*)(uintptr_t)aria_field(p, {}));", i);
-                }
-                CType::Str => {
-                    let _ = writeln!(out, "        aria_str_drop((void*)(uintptr_t)aria_field(p, {}));", i);
-                }
-                _ => {}
-            }
+            emit_drop_managed_field(t, i, out);
         }
         out.push_str("        return;\n");
         out.push_str("    }\n");
@@ -1705,7 +2043,7 @@ fn emit_drop_children_helper(
         let managed: Vec<(usize, CType)> = cap_cts
             .iter()
             .enumerate()
-            .filter(|(_, t)| matches!(t, CType::Ref | CType::Str))
+            .filter(|(_, t)| matches!(t, CType::Ref | CType::Str | CType::Array(_)))
             .map(|(i, t)| (i, *t))
             .collect();
         if managed.is_empty() {
@@ -1714,15 +2052,7 @@ fn emit_drop_children_helper(
         let tag = closures.tags[name];
         let _ = writeln!(out, "    if (tag == INT64_C({})) {{", tag);
         for (i, t) in managed {
-            match t {
-                CType::Ref => {
-                    let _ = writeln!(out, "        aria_drop((void*)(uintptr_t)aria_field(p, {}));", i);
-                }
-                CType::Str => {
-                    let _ = writeln!(out, "        aria_str_drop((void*)(uintptr_t)aria_field(p, {}));", i);
-                }
-                _ => {}
-            }
+            emit_drop_managed_field(t, i, out);
         }
         out.push_str("        return;\n");
         out.push_str("    }\n");
@@ -1730,6 +2060,22 @@ fn emit_drop_children_helper(
     out.push_str("    (void)tag;\n");
     out.push_str("}\n\n");
     Ok(())
+}
+
+/// Emit the release of a managed (heap-ref) field `i` from a dead cell, per type.
+fn emit_drop_managed_field(t: CType, i: usize, out: &mut String) {
+    match t {
+        CType::Ref => {
+            let _ = writeln!(out, "        aria_drop((void*)(uintptr_t)aria_field(p, {}));", i);
+        }
+        CType::Str => {
+            let _ = writeln!(out, "        aria_str_drop((void*)(uintptr_t)aria_field(p, {}));", i);
+        }
+        CType::Array(_) => {
+            let _ = writeln!(out, "        aria_array_drop((void*)(uintptr_t)aria_field(p, {}));", i);
+        }
+        _ => {}
+    }
 }
 
 // ---- differential tests --------------------------------------------------
@@ -1756,6 +2102,7 @@ mod tests {
         typeck::check(&prog).map_err(|e| e.join("; "))?;
         Ok(prog)
     }
+
 
     /// The interpreter's canonical result string (the reference oracle). Run on
     /// a large-stack thread so deep (but finite) recursion in the battery does
@@ -2034,6 +2381,168 @@ mod tests {
             "expected in-place reuse to fire, stderr: {}",
             stderr.trim()
         );
+    }
+
+    // ---- native arrays -------------------------------------------------
+
+    #[test]
+    fn array_set_compiles_and_runs() {
+        // The headline example: build, set index 1 to 99, then read back. Returns
+        // 10 + 99 + 30 = 139 (the task brief's "129" is an arithmetic slip; we
+        // assert the value the interpreter oracle also produces). `differential`
+        // also checks it is garbage-free.
+        differential(
+            "fn main() -> Int = { let a = array_set([10,20,30], 1, 99); a[0] + a[1] + a[2] }",
+        );
+        let src = "fn main() -> Int = { let a = array_set([10,20,30], 1, 99); a[0] + a[1] + a[2] }";
+        let c_src = compile_src(src).expect("array program should compile");
+        if !cc_available() {
+            return;
+        }
+        let (stdout, _) = build_and_run(&c_src).expect("build+run native array");
+        assert_eq!(stdout.lines().next().unwrap_or(""), "139");
+    }
+
+    #[test]
+    fn tuples_compile_and_are_garbage_free() {
+        // Tuples desugar to synthetic generic ADTs: construction, tuple-typed fn
+        // params/returns, and destructuring patterns must compile, match the
+        // interpreter, and be garbage-free in native.
+        differential(
+            "fn swap(p: (Int, Bool)) -> (Bool, Int) = match p { (a, b) => (b, a), }\n\
+             fn third(t: (Int, Int, Int)) -> Int = match t { (a, b, c) => c, }\n\
+             fn main() -> Int = {\n\
+               let s = swap((7, true));\n\
+               third((10, 20, 30)) + match s { (b, n) => n, }\n\
+             }",
+        );
+    }
+
+    #[test]
+    fn records_compile_and_are_garbage_free() {
+        // Records desugar (in monomorphize) to positional ADT cells: literal,
+        // field access, functional update, record patterns, and a GENERIC record
+        // must all compile, match the interpreter, and be garbage-free in native.
+        differential(
+            "type Box[T] = { value: T, tag: Int }\n\
+             type P = { x: Int, y: Int }\n\
+             fn unwrap[T](b: Box[T]) -> T = b.value\n\
+             fn describe(p: P) -> Int = match p { P { x, y } => x * 100 + y, }\n\
+             fn main() -> Int = {\n\
+               let b = Box { value: 7, tag: 1 };\n\
+               let p = P { x: 2, y: 3 };\n\
+               let q = { p | x = 9 };\n\
+               unwrap(b) + describe(p) + describe(q) + b.tag\n\
+             }",
+        );
+    }
+
+    #[test]
+    fn array_int_get_set_push_sum() {
+        // get/set/push and a recursive sum over an Int array, garbage-free.
+        differential(
+            "fn sum(a: Array[Int], i: Int, acc: Int) -> Int =\n\
+               if i == array_len(a) { acc } else { sum(a, i + 1, acc + a[i]) }\n\
+             fn main() -> Int = {\n\
+               let a = array_push(array_push(array_set([1,2,3], 0, 10), 4), 5);\n\
+               sum(a, 0, 0)\n\
+             }",
+        );
+    }
+
+    #[test]
+    fn array_new_inline_push() {
+        // `array_push(array_new(), x)` where a callee parameter fixes the element
+        // type: the monomorphizer threads `E` into the nested `array_new()`, so it
+        // resolves to `$i`. (When the empty `array_new()` is instead tagged `$r`,
+        // e.g. via a bare annotated `let`, the runtime reconciles the header kind
+        // from the push call site — see `empty_array_grow_from_array_new`.)
+        differential(
+            "fn first(a: Array[Int]) -> Int = a[0]\n\
+             fn main() -> Int = first(array_push(array_new(), 42))",
+        );
+    }
+
+    #[test]
+    fn empty_array_grow_from_array_new() {
+        // Regression: `let a: Array[Int] = array_new()` then TWO pushes used to
+        // segfault. The monomorphizer can tag the empty `array_new` with a stale
+        // element kind (`$r`); the runtime now reconciles the header `kind` from
+        // the authoritative push call site (and grows cap 0 -> 4 by reallocating
+        // the whole header+elems object), so dup/drop on the grown array stay
+        // correct. Must agree with the interpreter AND be garbage-free.
+        differential(
+            "fn main() -> Int = {\n\
+               let a: Array[Int] = array_new();\n\
+               let b = array_push(array_push(a, 7), 8);\n\
+               array_len(b) + b[1]\n\
+             }",
+        );
+        // Build from empty to length 10 by repeated push, then sum (= 55).
+        differential(
+            "fn build(a: Array[Int], n: Int) -> Array[Int] =\n\
+               if n == 0 { a } else { build(array_push(a, n), n - 1) }\n\
+             fn sum(a: Array[Int], i: Int, acc: Int) -> Int =\n\
+               if i == array_len(a) { acc } else { sum(a, i + 1, acc + a[i]) }\n\
+             fn main() -> Int = {\n\
+               let a: Array[Int] = array_new();\n\
+               sum(build(a, 10), 0, 0)\n\
+             }",
+        );
+        // An empty Array[String] grown by pushes from array_new — every String
+        // element must be released on drop (aria_live=0).
+        differential(
+            "fn main() -> String = {\n\
+               let a: Array[String] = array_new();\n\
+               let b = array_push(array_push(array_push(a, \"x\"), \"y\"), \"z\");\n\
+               concat(concat(b[0], b[1]), b[2])\n\
+             }",
+        );
+        // array_len of a freshly-annotated empty array is 0.
+        differential(
+            "fn main() -> Int = { let a: Array[Int] = array_new(); array_len(a) }",
+        );
+    }
+
+    #[test]
+    fn array_string_garbage_free() {
+        // An Array[String]: build, read, concat — drop must release every String
+        // element (aria_live=0).
+        differential(
+            "fn main() -> String = {\n\
+               let a = array_push([\"hello\", \"world\"], \"!\");\n\
+               concat(concat(a[0], a[1]), a[2])\n\
+             }",
+        );
+    }
+
+    #[test]
+    fn array_of_adt_garbage_free() {
+        // An Array of an ADT (`$r` elements): drop must recursively release each
+        // boxed cell, leaving no garbage.
+        differential(
+            "type Color = | Red | Green | Blue | Shade(Int)\n\
+             fn rank(c: Color) -> Int = match c { Red => 1, Green => 2, Blue => 3, Shade(n) => n, }\n\
+             fn main() -> Int = {\n\
+               let a = array_push([Red, Green, Shade(40)], Blue);\n\
+               rank(a[0]) + rank(a[1]) + rank(a[2]) + rank(a[3])\n\
+             }",
+        );
+    }
+
+    #[test]
+    fn array_build_drop_is_garbage_free() {
+        // Building an array and then dropping it (the result is an unrelated Int)
+        // must leave aria_live=0.
+        if !cc_available() {
+            return;
+        }
+        let src = "fn use_it(a: Array[Int]) -> Int = 99\n\
+                   fn main() -> Int = { let a = array_push([1,2,3], 4); use_it(a) }";
+        let c_src = compile_src(src).expect("compile");
+        let (stdout, stderr) = build_and_run(&c_src).expect("build+run");
+        assert_eq!(stdout.lines().next().unwrap_or(""), "99");
+        assert!(stderr.contains("aria_live=0"), "expected garbage-free, got `{}`", stderr.trim());
     }
 
     #[test]

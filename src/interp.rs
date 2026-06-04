@@ -15,6 +15,11 @@ pub enum Value {
     Bool(bool),
     Str(String),
     Data { ctor: String, fields: Vec<Value> },
+    /// A functional array (`Array[T]`). The interpreter is the reference oracle,
+    /// so it uses a plain `Vec` with copy-on-write semantics; the FBIP in-place
+    /// reuse that the compiled backends perform is an optimization that cannot
+    /// change observable results, so the oracle need not model it.
+    Array(Vec<Value>),
     /// An opaque AI-runtime tensor handle, built and queried via builtins.
     Tensor(crate::tensor::Tensor),
     /// A first-class function value. A lambda captures the environment in which
@@ -48,6 +53,10 @@ impl Value {
                 }
             }
             Value::Unit => "()".to_string(),
+            Value::Array(xs) => {
+                let inner: Vec<String> = xs.iter().map(|v| v.display()).collect();
+                format!("[{}]", inner.join(", "))
+            }
             Value::Closure(c) => {
                 format!("<closure/{}>", c.params.len())
             }
@@ -77,6 +86,9 @@ pub struct Interp {
     fns: HashMap<String, FnDecl>,
     /// constructor name -> arity
     ctors: HashMap<String, usize>,
+    /// record constructor name -> declared field names (in declared order), used
+    /// to reorder record-literal fields and resolve `.field` access by index.
+    record_fields: HashMap<String, Vec<String>>,
     /// Current Aria call-stack depth, to turn runaway recursion into a
     /// catchable error instead of a native stack overflow.
     depth: std::cell::Cell<usize>,
@@ -91,6 +103,7 @@ impl Interp {
     pub fn new(program: &Program) -> Result<Self, String> {
         let mut fns = HashMap::new();
         let mut ctors = HashMap::new();
+        let mut record_fields = HashMap::new();
         for item in &program.items {
             match item {
                 Item::Fn(f) => {
@@ -103,11 +116,14 @@ impl Interp {
                         if ctors.insert(v.name.clone(), v.fields.len()).is_some() {
                             return Err(format!("duplicate constructor `{}`", v.name));
                         }
+                        if let Some(names) = &v.field_names {
+                            record_fields.insert(v.name.clone(), names.clone());
+                        }
                     }
                 }
             }
         }
-        Ok(Interp { fns, ctors, depth: std::cell::Cell::new(0) })
+        Ok(Interp { fns, ctors, record_fields, depth: std::cell::Cell::new(0) })
     }
 
     pub fn run_main(&self) -> Result<Value, String> {
@@ -171,6 +187,79 @@ impl Interp {
                     ctor: name.clone(),
                     fields,
                 })
+            }
+
+            Expr::Record(name, fields) => {
+                let decl = self
+                    .record_fields
+                    .get(name)
+                    .ok_or_else(|| format!("unknown record type `{}`", name))?
+                    .clone();
+                // Evaluate field values in SOURCE (left-to-right) order so side
+                // effects are observed as written, then assemble the positional
+                // `Data` in DECLARED field order (the canonical layout).
+                let mut evaled: Vec<(String, Value)> = Vec::with_capacity(fields.len());
+                for (fname, val_expr) in fields {
+                    evaled.push((fname.clone(), self.eval(val_expr, scope)?));
+                }
+                let mut vals = Vec::with_capacity(decl.len());
+                for fname in &decl {
+                    let v = evaled
+                        .iter()
+                        .find(|(n, _)| n == fname)
+                        .ok_or_else(|| format!("record `{}`: missing field `{}`", name, fname))?
+                        .1
+                        .clone();
+                    vals.push(v);
+                }
+                Ok(Value::Data { ctor: name.clone(), fields: vals })
+            }
+
+            Expr::Field(obj, field) => {
+                let v = self.eval(obj, scope)?;
+                match v {
+                    Value::Data { ctor, fields } => {
+                        let decl = self
+                            .record_fields
+                            .get(&ctor)
+                            .ok_or_else(|| format!("type `{}` is not a record", ctor))?;
+                        let idx = decl
+                            .iter()
+                            .position(|n| n == field)
+                            .ok_or_else(|| format!("type `{}` has no field `{}`", ctor, field))?;
+                        Ok(fields[idx].clone())
+                    }
+                    other => Err(format!(
+                        "field access `.{}` on a non-record value {}",
+                        field,
+                        other.display()
+                    )),
+                }
+            }
+
+            Expr::Update(base, updates) => {
+                let v = self.eval(base, scope)?;
+                match v {
+                    Value::Data { ctor, mut fields } => {
+                        let decl = self
+                            .record_fields
+                            .get(&ctor)
+                            .ok_or_else(|| format!("type `{}` is not a record", ctor))?
+                            .clone();
+                        for (fname, val_expr) in updates {
+                            let idx = decl
+                                .iter()
+                                .position(|n| n == fname)
+                                .ok_or_else(|| format!("type `{}` has no field `{}`", ctor, fname))?;
+                            fields[idx] = self.eval(val_expr, scope)?;
+                        }
+                        Ok(Value::Data { ctor, fields })
+                    }
+                    other => Err(format!(
+                        "record update on a non-record value {}",
+                        other.display()
+                    )),
+                }
             }
 
             Expr::Call(name, args) => {
@@ -245,7 +334,7 @@ impl Interp {
                 let v = self.eval(scrut, scope)?;
                 for arm in arms {
                     let mut binds = HashMap::new();
-                    if match_pattern(&arm.pat, &v, &mut binds) {
+                    if match_pattern(&arm.pat, &v, &mut binds, &self.record_fields) {
                         scope.push(binds);
                         let result = self.eval(&arm.body, scope);
                         scope.pop();
@@ -377,7 +466,7 @@ impl Interp {
                 let v = self.eval(scrut, scope)?;
                 for arm in arms {
                     let mut binds = HashMap::new();
-                    if match_pattern(&arm.pat, &v, &mut binds) {
+                    if match_pattern(&arm.pat, &v, &mut binds, &self.record_fields) {
                         scope.push(binds);
                         let result = self.eval_tail(self_name, &arm.body, scope);
                         scope.pop();
@@ -577,6 +666,9 @@ fn values_equal(a: &Value, b: &Value) -> bool {
                 fields: f2,
             },
         ) => c1 == c2 && f1.len() == f2.len() && f1.iter().zip(f2).all(|(x, y)| values_equal(x, y)),
+        (Value::Array(x), Value::Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(a, b)| values_equal(a, b))
+        }
         // Tensors compare structurally (shape + contents). Without this arm,
         // `t == t` fell through to `false`, silently disagreeing with the type
         // checker which accepts `==` on Tensor.
@@ -591,7 +683,12 @@ fn values_equal(a: &Value, b: &Value) -> bool {
     }
 }
 
-fn match_pattern(pat: &Pattern, val: &Value, binds: &mut HashMap<String, Value>) -> bool {
+fn match_pattern(
+    pat: &Pattern,
+    val: &Value,
+    binds: &mut HashMap<String, Value>,
+    record_fields: &HashMap<String, Vec<String>>,
+) -> bool {
     match pat {
         Pattern::Wild => true,
         Pattern::Var(name) => {
@@ -604,7 +701,22 @@ fn match_pattern(pat: &Pattern, val: &Value, binds: &mut HashMap<String, Value>)
             Value::Data { ctor, fields } if ctor == name && fields.len() == subs.len() => subs
                 .iter()
                 .zip(fields)
-                .all(|(p, f)| match_pattern(p, f, binds)),
+                .all(|(p, f)| match_pattern(p, f, binds, record_fields)),
+            _ => false,
+        },
+        Pattern::Record(name, sub_fields) => match val {
+            Value::Data { ctor, fields } if ctor == name => {
+                let decl = match record_fields.get(name) {
+                    Some(d) => d,
+                    None => return false,
+                };
+                sub_fields.iter().all(|(fname, subpat)| {
+                    match decl.iter().position(|n| n == fname) {
+                        Some(i) => match_pattern(subpat, &fields[i], binds, record_fields),
+                        None => false,
+                    }
+                })
+            }
             _ => false,
         },
     }
@@ -770,6 +882,61 @@ fn builtin(name: &str, args: &[Value]) -> Result<Option<Value>, String> {
             }
             _ => Err("neural_bits_per_byte expects (String)".into()),
         },
+
+        // ---- Arrays --------------------------------------------------------
+        // Functional API: `set`/`push` return a new array (the oracle copies;
+        // the compiled backends reuse in place when the array is unique).
+        // Out-of-bounds `get`/`set` are runtime errors (the type checker cannot
+        // bound an index), matching how tensor get/set guard their indices.
+        "array_new" => match args {
+            [] => Ok(Some(Value::Array(Vec::new()))),
+            _ => Err("array_new expects no arguments".into()),
+        },
+        "array_len" => match args {
+            [Value::Array(xs)] => Ok(Some(Value::Int(xs.len() as i64))),
+            _ => Err("array_len expects (Array)".into()),
+        },
+        "array_get" => match args {
+            [Value::Array(xs), Value::Int(i)] => {
+                if *i < 0 || *i as usize >= xs.len() {
+                    return Err(format!(
+                        "array_get index {} out of range for array of length {}",
+                        i,
+                        xs.len()
+                    ));
+                }
+                Ok(Some(xs[*i as usize].clone()))
+            }
+            _ => Err("array_get expects (Array, Int)".into()),
+        },
+        "array_set" => match args {
+            [Value::Array(xs), Value::Int(i), v] => {
+                if *i < 0 || *i as usize >= xs.len() {
+                    return Err(format!(
+                        "array_set index {} out of range for array of length {}",
+                        i,
+                        xs.len()
+                    ));
+                }
+                let mut out = xs.clone();
+                out[*i as usize] = v.clone();
+                Ok(Some(Value::Array(out)))
+            }
+            _ => Err("array_set expects (Array, Int, T)".into()),
+        },
+        "array_push" => match args {
+            [Value::Array(xs), v] => {
+                let mut out = xs.clone();
+                out.push(v.clone());
+                Ok(Some(Value::Array(out)))
+            }
+            _ => Err("array_push expects (Array, T)".into()),
+        },
+        // Array literal: variadic, desugared by the parser to a single flat
+        // `Call("array_lit", [e0,...,en])`. Builds the array from all argument
+        // values in order; empty args -> empty array. Not in `signatures()`
+        // (it is variadic), so it bypasses the drift table/test.
+        "array_lit" => Ok(Some(Value::Array(args.to_vec()))),
         _ => Ok(None),
     }
 }
@@ -786,6 +953,51 @@ mod tests {
         typeck::check(&prog).expect("typeck");
         let interp = Interp::new(&prog).expect("interp::new");
         interp.run_main().expect("run")
+    }
+
+    #[test]
+    fn record_literal_field_access_and_order_independence() {
+        // Field order in the literal must not matter; `.field` reads by name.
+        let src = "type P = { x: Int, y: Int }\n\
+                   fn main() -> Int = { let p = P { y: 20, x: 10 }; p.x + p.y * 2 }";
+        assert_eq!(run(src).display(), "50");
+    }
+
+    #[test]
+    fn generic_record_field_through_type_param() {
+        let src = "type Box[T] = { value: T, tag: Int }\n\
+                   fn unwrap[T](b: Box[T]) -> T = b.value\n\
+                   fn main() -> Int = { let b = Box { value: 7, tag: 1 }; unwrap(b) + b.tag }";
+        assert_eq!(run(src).display(), "8");
+    }
+
+    #[test]
+    fn functional_update_is_non_destructive() {
+        let src = "type P = { x: Int, y: Int }\n\
+                   fn main() -> Int = {\n\
+                     let p = P { x: 1, y: 2 };\n\
+                     let q = { p | y = 9 };\n\
+                     p.y * 100 + q.y\n\
+                   }";
+        assert_eq!(run(src).display(), "209"); // p.y=2 unchanged, q.y=9
+    }
+
+    #[test]
+    fn record_pattern_binds_fields() {
+        let src = "type P = { a: Int, b: Int, c: Int }\n\
+                   fn f(p: P) -> Int = match p { P { a: 0, b, c } => b + c, P { a, b, c } => a, }\n\
+                   fn main() -> Int = f(P { a: 0, b: 3, c: 4 }) + f(P { a: 5, b: 0, c: 0 })";
+        assert_eq!(run(src).display(), "12"); // 7 + 5
+    }
+
+    #[test]
+    fn record_literals_not_confused_with_match_arms() {
+        // Regression: `match` on a nullary ctor must parse as a match, not a
+        // record literal `Nil { .. }`.
+        let src = "type L = | Nil | Cons(Int, L)\n\
+                   fn empty(xs: L) -> Int = match xs { Nil => 1, Cons(h, t) => 0, }\n\
+                   fn main() -> Int = empty(Nil)";
+        assert_eq!(run(src).display(), "1");
     }
 
     #[test]
@@ -817,6 +1029,13 @@ mod tests {
             Str => Value::Str(String::new()),
             Unit => Value::Unit,
             Named(n, _) if n == "Tensor" => Value::Tensor(crate::tensor::Tensor::zeros(&[1, 1])),
+            Named(n, args) if n == "Array" => {
+                // A one-element array of the (concrete) element type, so generic
+                // array builtins have something to index/return.
+                Value::Array(vec![dummy(&args[0])])
+            }
+            // A generic element position: any concrete value will do.
+            Var(_) => Value::Int(0),
             other => panic!("drift test has no dummy for {}", crate::typeck::show(other)),
         }
     }
@@ -831,6 +1050,10 @@ mod tests {
             Value::Str(_) => Str,
             Value::Unit => Unit,
             Value::Tensor(_) => Named("Tensor".into(), vec![]),
+            Value::Array(xs) => Named(
+                "Array".into(),
+                vec![xs.first().map(value_ty).unwrap_or(Var("T".into()))],
+            ),
             Value::Data { ctor, .. } => Named(ctor.clone(), vec![]),
             Value::Closure(c) => {
                 Fn(c.params.iter().map(|_| Unit).collect(), Box::new(Unit))
@@ -838,22 +1061,113 @@ mod tests {
         }
     }
 
+    // --- Substitution machinery for the drift guard -----------------------
+    //
+    // To check a generic builtin's declared return type we infer how its type
+    // variables are instantiated by unifying its declared *parameter* types
+    // against the (concrete) types of the dummy arguments, apply the resulting
+    // substitution to the declared return type, and require an EXACT structural
+    // match against the actual returned value's type. A declared `Var` only
+    // matches a `Var` if it stays genuinely free after substitution (e.g.
+    // `array_new`'s element type, which has no argument to constrain it).
+
+    use std::collections::HashMap;
+
+    type Subst = HashMap<String, crate::ast::Ty>;
+
+    // Unify a declared type against a concrete actual type, accumulating
+    // variable bindings into `s`. Returns false on a structural mismatch.
+    fn unify(declared: &crate::ast::Ty, actual: &crate::ast::Ty, s: &mut Subst) -> bool {
+        use crate::ast::Ty::*;
+        match (declared, actual) {
+            (Var(v), _) => match s.get(v) {
+                Some(bound) => bound == actual,
+                None => {
+                    s.insert(v.clone(), actual.clone());
+                    true
+                }
+            },
+            (Named(n, a), Named(m, b)) => {
+                n == m && a.len() == b.len() && a.iter().zip(b).all(|(x, y)| unify(x, y, s))
+            }
+            (Fn(p1, r1), Fn(p2, r2)) => {
+                p1.len() == p2.len()
+                    && p1.iter().zip(p2).all(|(x, y)| unify(x, y, s))
+                    && unify(r1, r2, s)
+            }
+            (Int, Int) | (Float, Float) | (Bool, Bool) | (Str, Str) | (Unit, Unit) => true,
+            _ => false,
+        }
+    }
+
+    // Apply a substitution to a type, leaving unbound variables in place.
+    fn apply(ty: &crate::ast::Ty, s: &Subst) -> crate::ast::Ty {
+        use crate::ast::Ty::*;
+        match ty {
+            Var(v) => s.get(v).cloned().unwrap_or_else(|| ty.clone()),
+            Named(n, a) => Named(n.clone(), a.iter().map(|t| apply(t, s)).collect()),
+            Fn(p, r) => Fn(
+                p.iter().map(|t| apply(t, s)).collect(),
+                Box::new(apply(r, s)),
+            ),
+            Int | Float | Bool | Str | Unit => ty.clone(),
+        }
+    }
+
+    // Exact structural type equality, with the single relaxation that a
+    // declared free `Var` matches an actual free `Var` (the element type is
+    // genuinely unconstrained, e.g. `array_new`'s `Array[T]`).
+    fn ty_exact(expected: &crate::ast::Ty, actual: &crate::ast::Ty) -> bool {
+        use crate::ast::Ty::*;
+        match (expected, actual) {
+            (Var(_), Var(_)) => true,
+            (Named(n, a), Named(m, b)) => {
+                n == m && a.len() == b.len() && a.iter().zip(b).all(|(x, y)| ty_exact(x, y))
+            }
+            (Fn(p1, r1), Fn(p2, r2)) => {
+                p1.len() == p2.len()
+                    && p1.iter().zip(p2).all(|(x, y)| ty_exact(x, y))
+                    && ty_exact(r1, r2)
+            }
+            (Int, Int) | (Float, Float) | (Bool, Bool) | (Str, Str) | (Unit, Unit) => true,
+            _ => false,
+        }
+    }
+
     #[test]
     fn declared_builtins_implemented_with_matching_signature() {
         // Drift guard, both directions: every builtin in the shared table must
         // be implemented AND return a value of its declared type when driven
-        // with correctly-typed arguments.
+        // with correctly-typed arguments. The return type is checked by first
+        // inferring the type-variable substitution from the (concrete) dummy
+        // argument types, applying it to the declared return type, and then
+        // requiring an exact match. This catches a generic builtin declared to
+        // return `T` (e.g. `array_get` over `Array[Int]` -> `Int`) that instead
+        // returns the wrong concrete type, while still letting a genuinely
+        // unconstrained return var (e.g. `array_new` -> `Array[T]`) pass.
         for (name, params, ret) in crate::builtins::signatures() {
             let args: Vec<Value> = params.iter().map(dummy).collect();
             match builtin(name, &args) {
                 Ok(Some(v)) => {
-                    assert_eq!(
-                        value_ty(&v),
-                        ret,
-                        "builtin `{}` returned {:?}, declared {}",
+                    // Infer the substitution from declared params vs. dummy types.
+                    let mut s: Subst = HashMap::new();
+                    for (p, a) in params.iter().zip(&args) {
+                        assert!(
+                            unify(p, &value_ty(a), &mut s),
+                            "builtin `{}`: dummy arg type does not unify with declared param {}",
+                            name,
+                            crate::typeck::show(p)
+                        );
+                    }
+                    let expected = apply(&ret, &s);
+                    assert!(
+                        ty_exact(&expected, &value_ty(&v)),
+                        "builtin `{}` returned {:?} (type {}), declared {} (instantiated {})",
                         name,
                         v.display(),
-                        crate::typeck::show(&ret)
+                        crate::typeck::show(&value_ty(&v)),
+                        crate::typeck::show(&ret),
+                        crate::typeck::show(&expected)
                     );
                 }
                 Ok(None) => panic!("builtin `{}` is declared but not implemented in interp", name),

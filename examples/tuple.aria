@@ -1,0 +1,16 @@
+-- Tuples: `(a, b, ..)` is an anonymous product type. They desugar to synthetic
+-- generic ADTs, so they get reference counting + every backend for free.
+-- Access is by destructuring in `match` (Aria has no positional `.0`).
+
+fn swap(p: (Int, Bool)) -> (Bool, Int) = match p { (a, b) => (b, a), }
+
+fn dist2(p: (Int, Int)) -> Int = match p { (x, y) => x * x + y * y, }
+
+fn main() -> Int = {
+  let p = (3, 4);
+  print_int(dist2(p));                    -- 25
+  let s = swap((7, true));
+  print_int(match s { (b, n) => n, });    -- 7
+  let triple = (1, 2, 3);
+  match triple { (a, b, c) => a + b + c, } -- 6 (result / exit code)
+}

@@ -63,6 +63,7 @@ struct CtorSig {
     type_params: Vec<String>, // generic params of the owning type
     fields: Vec<Ty>,          // field types (may mention the params as Ty::Var)
     tyname: String,           // owning type name
+    field_names: Option<Vec<String>>, // Some iff a record constructor
 }
 
 // A function's declared signature, retaining its generic parameters.
@@ -110,6 +111,7 @@ pub fn check(program: &Program) -> Result<(), Vec<String>> {
                                 type_params: t.params.clone(),
                                 fields: v.fields.clone(),
                                 tyname: t.name.clone(),
+                                field_names: v.field_names.clone(),
                             },
                         )
                         .is_some()
@@ -125,6 +127,15 @@ pub fn check(program: &Program) -> Result<(), Vec<String>> {
                 }
             }
             Item::Fn(f) => {
+                // A user function may not shadow a built-in: a same-named user
+                // `fn` (e.g. `array_get`, `concat`) would silently never run,
+                // since calls resolve to the builtin first.
+                if crate::builtins::lookup(&f.name).is_some() {
+                    errors.push(format!(
+                        "cannot redefine built-in function `{}`",
+                        f.name
+                    ));
+                }
                 let params = f.params.iter().map(|p| p.ty.clone()).collect();
                 if fns
                     .insert(
@@ -154,14 +165,20 @@ pub fn check(program: &Program) -> Result<(), Vec<String>> {
     ) {
         match t {
             Ty::Named(n, args) if BUILTIN_TYPES.contains(&n.as_str()) => {
-                // Built-in nullary types (e.g. `Tensor`) take no arguments.
-                if !args.is_empty() {
+                // Built-in types have a fixed arity: `Array[T]` takes one type
+                // argument; the others (e.g. `Tensor`) are nullary handles.
+                let expected = if n == "Array" { 1 } else { 0 };
+                if args.len() != expected {
                     errs.push(format!(
-                        "{}: built-in type `{}` takes no type arguments, got {}",
+                        "{}: built-in type `{}` takes {} type argument(s), got {}",
                         ctx,
                         n,
+                        expected,
                         args.len()
                     ));
+                }
+                for a in args {
+                    known(a, types, params, errs, ctx);
                 }
             }
             Ty::Named(n, args) => {
@@ -183,7 +200,14 @@ pub fn check(program: &Program) -> Result<(), Vec<String>> {
                     known(a, types, params, errs, ctx);
                 }
             }
-            Ty::Var(_) => {} // a declared generic parameter; fine
+            Ty::Var(n) => {
+                // A type variable in a SOURCE annotation must be one of the
+                // declared generic parameters in scope. (Source types never
+                // contain fresh `?N` unification vars, so this is safe.)
+                if !params.contains(n) {
+                    errs.push(format!("{}: unknown type parameter `{}`", ctx, n));
+                }
+            }
             Ty::Fn(fn_params, ret) => {
                 for p in fn_params {
                     known(p, types, params, errs, ctx);
@@ -320,6 +344,7 @@ pub fn annotate_lambda_params(program: &mut Program) {
                         type_params: t.params.clone(),
                         fields: v.fields.clone(),
                         tyname: t.name.clone(),
+                        field_names: v.field_names.clone(),
                     });
                 }
                 types.entry(t.name.clone()).or_insert((t.params.clone(), variants));
@@ -402,6 +427,18 @@ fn annotate_expr(e: &mut Expr, resolved: &HashMap<String, Ty>) {
                 annotate_expr(a, resolved);
             }
         }
+        Expr::Record(_, fields) => {
+            for (_, v) in fields {
+                annotate_expr(v, resolved);
+            }
+        }
+        Expr::Field(obj, _) => annotate_expr(obj, resolved),
+        Expr::Update(base, updates) => {
+            annotate_expr(base, resolved);
+            for (_, v) in updates {
+                annotate_expr(v, resolved);
+            }
+        }
         Expr::Unary(_, inner) => annotate_expr(inner, resolved),
         Expr::Binary(_, l, r) => {
             annotate_expr(l, resolved);
@@ -456,6 +493,18 @@ fn collect_calls(e: &Expr, out: &mut HashSet<String>) {
             collect_calls(callee, out);
             for a in args {
                 collect_calls(a, out);
+            }
+        }
+        Expr::Record(_, fields) => {
+            for (_, v) in fields {
+                collect_calls(v, out);
+            }
+        }
+        Expr::Field(obj, _) => collect_calls(obj, out),
+        Expr::Update(base, updates) => {
+            collect_calls(base, out);
+            for (_, v) in updates {
+                collect_calls(v, out);
             }
         }
         Expr::Unary(_, x) => collect_calls(x, out),
@@ -541,6 +590,32 @@ fn infer_io(program: &Program) -> HashSet<String> {
 // Builtin function signatures and built-in type names come from the shared
 // `crate::builtins` source of truth so typeck and interp cannot drift.
 use crate::builtins::{lookup as builtin_sig, BUILTIN_TYPES};
+
+/// Collect the distinct type-variable names appearing in a builtin's signature,
+/// in order of first appearance. A builtin is generic over exactly these vars,
+/// so the checker instantiates them fresh per call site (like a generic `fn`'s
+/// `type_params`). Non-generic builtins return an empty list.
+fn builtin_type_params(params: &[Ty], ret: &Ty) -> Vec<String> {
+    fn walk(ty: &Ty, acc: &mut Vec<String>) {
+        match ty {
+            Ty::Var(n) => {
+                if !acc.contains(n) {
+                    acc.push(n.clone());
+                }
+            }
+            Ty::Named(_, args) => args.iter().for_each(|a| walk(a, acc)),
+            Ty::Fn(ps, r) => {
+                ps.iter().for_each(|p| walk(p, acc));
+                walk(r, acc);
+            }
+            _ => {}
+        }
+    }
+    let mut acc = Vec::new();
+    params.iter().for_each(|p| walk(p, &mut acc));
+    walk(ret, &mut acc);
+    acc
+}
 
 impl Checker {
     fn lookup_var(scope: &Scope, name: &str) -> Option<Ty> {
@@ -726,6 +801,122 @@ impl Checker {
                 Ok(Ty::Named(sig.tyname.clone(), type_args))
             }
 
+            Expr::Record(name, fields) => {
+                let sig = self
+                    .ctors
+                    .get(name)
+                    .cloned()
+                    .ok_or_else(|| format!("unknown record type `{}`", name))?;
+                let decl_names = sig.field_names.clone().ok_or_else(|| {
+                    format!("`{}` is not a record type (use `{}(..)` constructor syntax)", name, name)
+                })?;
+                // The provided field-name set must exactly match the declared one
+                // (no missing, extra, or duplicate fields).
+                for fname in &decl_names {
+                    let count = fields.iter().filter(|(n, _)| n == fname).count();
+                    if count == 0 {
+                        return Err(format!("record `{}`: missing field `{}`", name, fname));
+                    }
+                    if count > 1 {
+                        return Err(format!("record `{}`: duplicate field `{}`", name, fname));
+                    }
+                }
+                for (n, _) in fields {
+                    if !decl_names.contains(n) {
+                        return Err(format!("record `{}` has no field `{}`", name, n));
+                    }
+                }
+                // Instantiate the type's parameters, then check each named field's
+                // value against its declared (substituted) type.
+                let map = self.instantiate_map(&sig.type_params);
+                for (fname, fty) in decl_names.iter().zip(sig.fields.iter()) {
+                    let val = &fields.iter().find(|(n, _)| n == fname).unwrap().1;
+                    let at = self.synth(val, scope)?;
+                    let expected = Self::apply_map(fty, &map);
+                    self.unify(&expected, &at)
+                        .map_err(|e| format!("record `{}` field `{}`: {}", name, fname, e))?;
+                }
+                let type_args: Vec<Ty> =
+                    sig.type_params.iter().map(|p| map.get(p).cloned().unwrap()).collect();
+                Ok(Ty::Named(sig.tyname.clone(), type_args))
+            }
+
+            Expr::Field(obj, field) => {
+                let ot = self.synth(obj, scope)?;
+                let ot = self.prune(&ot);
+                let (tyname, type_args) = match &ot {
+                    Ty::Named(n, args) => (n.clone(), args.clone()),
+                    _ => {
+                        return Err(format!(
+                            "field access `.{}` on a non-record value of type {}",
+                            field,
+                            show(&self.resolve(&ot))
+                        ))
+                    }
+                };
+                // The record type has a single constructor named after the type.
+                let sig = self
+                    .ctors
+                    .get(&tyname)
+                    .cloned()
+                    .ok_or_else(|| format!("type `{}` is not a record", tyname))?;
+                let decl_names = sig
+                    .field_names
+                    .clone()
+                    .ok_or_else(|| format!("type `{}` is not a record", tyname))?;
+                let idx = decl_names
+                    .iter()
+                    .position(|n| n == field)
+                    .ok_or_else(|| format!("type `{}` has no field `{}`", tyname, field))?;
+                // Substitute the object's concrete type arguments through the
+                // declared field type (e.g. `Box[Int].value : Int`).
+                let map: HashMap<String, Ty> =
+                    sig.type_params.iter().cloned().zip(type_args).collect();
+                Ok(Self::apply_map(&sig.fields[idx], &map))
+            }
+
+            Expr::Update(base, updates) => {
+                let bt = self.synth(base, scope)?;
+                let bt = self.prune(&bt);
+                let (tyname, type_args) = match &bt {
+                    Ty::Named(n, args) => (n.clone(), args.clone()),
+                    _ => {
+                        return Err(format!(
+                            "record update on a non-record value of type {}",
+                            show(&self.resolve(&bt))
+                        ))
+                    }
+                };
+                let sig = self
+                    .ctors
+                    .get(&tyname)
+                    .cloned()
+                    .ok_or_else(|| format!("type `{}` is not a record", tyname))?;
+                let decl_names = sig
+                    .field_names
+                    .clone()
+                    .ok_or_else(|| format!("type `{}` is not a record", tyname))?;
+                let map: HashMap<String, Ty> =
+                    sig.type_params.iter().cloned().zip(type_args).collect();
+                for (i, (fname, val)) in updates.iter().enumerate() {
+                    // Reject a field updated more than once (matches the record
+                    // literal's duplicate-field rejection).
+                    if updates[..i].iter().any(|(n, _)| n == fname) {
+                        return Err(format!("record update: duplicate field `{}`", fname));
+                    }
+                    let idx = decl_names
+                        .iter()
+                        .position(|n| n == fname)
+                        .ok_or_else(|| format!("type `{}` has no field `{}`", tyname, fname))?;
+                    let at = self.synth(val, scope)?;
+                    let expected = Self::apply_map(&sig.fields[idx], &map);
+                    self.unify(&expected, &at)
+                        .map_err(|e| format!("record update field `{}`: {}", fname, e))?;
+                }
+                // Update is type-preserving.
+                Ok(bt)
+            }
+
             Expr::Call(name, args) => {
                 // A local binding shadowing a name (e.g. a function-valued
                 // parameter `f`) is applied as a function VALUE, not a by-name
@@ -733,9 +924,33 @@ impl Checker {
                 if let Some(local) = Checker::lookup_var(scope, name) {
                     return self.synth_apply(&local, args, scope, &format!("`{}`", name));
                 }
+                // `array_lit` is a variadic internal builtin (the desugaring of an
+                // array literal `[e0, .., en]`). It is NOT in the signature table,
+                // so handle it before the `builtin_sig`/`self.fns` lookup: every
+                // element must share one element type `T`, and the result is
+                // `Array[T]`.
+                if name == "array_lit" {
+                    let elem = self.fresh();
+                    for (i, arg) in args.iter().enumerate() {
+                        let at = self.synth(arg, scope)?;
+                        self.unify(&elem, &at).map_err(|_| {
+                            format!(
+                                "array literal element {} has type {} but expected {}",
+                                i,
+                                show(&self.resolve(&at)),
+                                show(&self.resolve(&elem))
+                            )
+                        })?;
+                    }
+                    return Ok(Ty::Named("Array".to_string(), vec![elem]));
+                }
                 let (params, ret, type_params) =
                     if let Some((p, r)) = builtin_sig(name) {
-                        (p, r, Vec::new())
+                        // A builtin whose signature mentions type variables
+                        // (e.g. `array_get: (Array[T], Int) -> T`) is generic:
+                        // collect those vars so they instantiate fresh per call.
+                        let tps = builtin_type_params(&p, &r);
+                        (p, r, tps)
                     } else if let Some(sig) = self.fns.get(name).cloned() {
                         (sig.params, sig.ret, sig.type_params)
                     } else {
@@ -984,7 +1199,11 @@ impl Checker {
         for arm in arms {
             match &arm.pat {
                 Pattern::Wild | Pattern::Var(_) => saw_wild = true,
-                Pattern::Ctor(name, _) => covered_ctors.push(name.clone()),
+                // A record pattern covers its sole constructor (same as `Ctor`),
+                // so matching it is automatically exhaustive.
+                Pattern::Ctor(name, _) | Pattern::Record(name, _) => {
+                    covered_ctors.push(name.clone())
+                }
                 Pattern::Bool(true) => saw_true = true,
                 Pattern::Bool(false) => saw_false = true,
                 Pattern::Int(_) => {}
@@ -1100,6 +1319,36 @@ impl Checker {
                 }
                 for (sp, ft) in subs.iter().zip(sig.fields.iter()) {
                     let fty = Self::apply_map(ft, &map);
+                    self.check_pattern(sp, &fty, binds)?;
+                }
+                Ok(())
+            }
+            Pattern::Record(name, sub_fields) => {
+                let sig = self
+                    .ctors
+                    .get(name)
+                    .cloned()
+                    .ok_or_else(|| format!("unknown record type `{}`", name))?;
+                let decl_names = sig.field_names.clone().ok_or_else(|| {
+                    format!("`{}` is not a record type", name)
+                })?;
+                let map = self.instantiate_map(&sig.type_params);
+                let type_args: Vec<Ty> =
+                    sig.type_params.iter().map(|p| map.get(p).cloned().unwrap()).collect();
+                let owner = Ty::Named(sig.tyname.clone(), type_args);
+                self.unify(&owner, expected).map_err(|_| {
+                    format!(
+                        "record pattern `{}` matched against {}",
+                        name,
+                        show(&self.resolve(expected))
+                    )
+                })?;
+                for (fname, sp) in sub_fields {
+                    let idx = decl_names
+                        .iter()
+                        .position(|n| n == fname)
+                        .ok_or_else(|| format!("record `{}` has no field `{}`", name, fname))?;
+                    let fty = Self::apply_map(&sig.fields[idx], &map);
                     self.check_pattern(sp, &fty, binds)?;
                 }
                 Ok(())

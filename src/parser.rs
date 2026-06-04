@@ -16,15 +16,56 @@ pub struct Parser {
     /// Counter for naming the inferred type variable of an unannotated lambda
     /// parameter (`\x -> ...`). Kept unique per parse.
     lambda_counter: usize,
+    /// When true, an `Upper {` is NOT parsed as a record literal — used while
+    /// parsing the head of `if`/`match`, where the `{` opens the block/arms (so
+    /// `match Nil { .. }` is a match on `Nil`, not a record literal `Nil { .. }`).
+    /// Reset to false inside any delimited sub-expression (parens, args, blocks,
+    /// array/record literals), so `if (P { x: 1 }).x { .. }` still works.
+    no_record_literal: bool,
+    /// Tuple arities used anywhere in the source, so `parse_program` can inject a
+    /// synthetic `$TupleN` ADT for exactly those (and no others).
+    tuple_arities: std::collections::HashSet<usize>,
 }
 
 fn is_upper(name: &str) -> bool {
     name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
 }
 
+/// The synthetic ADT name/constructor for an `n`-tuple (`$` prefix can't collide
+/// with a user identifier).
+fn tuple_type_name(n: usize) -> String {
+    format!("$Tuple{}", n)
+}
+
+/// The synthetic generic ADT declaration for an `n`-tuple, e.g.
+/// `type $Tuple2[$t0, $t1] = | $Tuple2($t0, $t1)`. Tuples desugar into values of
+/// these, so they flow through the whole existing ADT machinery.
+fn synthetic_tuple_type(n: usize) -> Item {
+    let params: Vec<String> = (0..n).map(|i| format!("$t{}", i)).collect();
+    let fields: Vec<Ty> = params.iter().map(|p| Ty::Var(p.clone())).collect();
+    Item::Type(TypeDecl {
+        name: tuple_type_name(n),
+        params,
+        variants: vec![Variant { name: tuple_type_name(n), fields, field_names: None }],
+    })
+}
+
 impl Parser {
     pub fn new(toks: Vec<Token>) -> Self {
-        Parser { toks, pos: 0, type_params: Vec::new(), lambda_counter: 0 }
+        Parser {
+            toks,
+            pos: 0,
+            type_params: Vec::new(),
+            lambda_counter: 0,
+            no_record_literal: false,
+            tuple_arities: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Record that an `n`-tuple is used and return its synthetic ADT name.
+    fn tuple_name(&mut self, n: usize) -> String {
+        self.tuple_arities.insert(n);
+        tuple_type_name(n)
     }
 
     fn peek(&self) -> &Tok {
@@ -74,7 +115,16 @@ impl Parser {
         while *self.peek() != Tok::Eof {
             items.push(self.parse_item()?);
         }
-        Ok(Program { items })
+        // Prepend a synthetic tuple ADT for each arity ACTUALLY used (`(a, b)`
+        // desugars to `$Tuple2(a, b)`). Tuples reuse the entire ADT pipeline —
+        // generics, reference counting, every backend — with no downstream
+        // special-casing. Injecting only used arities keeps tuple-free programs
+        // unchanged (so they still take the no-generics fast path).
+        let mut arities: Vec<usize> = self.tuple_arities.iter().cloned().collect();
+        arities.sort_unstable();
+        let mut all: Vec<Item> = arities.into_iter().map(synthetic_tuple_type).collect();
+        all.extend(items);
+        Ok(Program { items: all })
     }
 
     fn parse_item(&mut self) -> Result<Item, String> {
@@ -159,8 +209,34 @@ impl Parser {
         let name = self.expect_ident()?;
         let params = self.parse_type_params()?;
         self.expect(&Tok::Eq)?;
-        // Canonical form: the first variant must be preceded by `|`, so a sum
-        // type has exactly one spelling (no optional leading pipe).
+        // A `{` after `=` introduces a RECORD type: a single constructor (named
+        // after the type) with named fields. Otherwise it is a sum type, whose
+        // first variant must be preceded by `|` (canonical form, one spelling).
+        if *self.peek() == Tok::LBrace {
+            self.advance();
+            let mut fields = Vec::new();
+            let mut names = Vec::new();
+            if *self.peek() != Tok::RBrace {
+                loop {
+                    let fname = self.expect_ident()?;
+                    self.expect(&Tok::Colon)?;
+                    let fty = self.parse_type(&params)?;
+                    names.push(fname);
+                    fields.push(fty);
+                    if *self.peek() == Tok::Comma {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+            }
+            self.expect(&Tok::RBrace)?;
+            return Ok(TypeDecl {
+                name: name.clone(),
+                params,
+                variants: vec![Variant { name, fields, field_names: Some(names) }],
+            });
+        }
         self.expect(&Tok::Pipe)?;
         let mut variants = Vec::new();
         loop {
@@ -180,7 +256,7 @@ impl Parser {
                 }
                 self.expect(&Tok::RParen)?;
             }
-            variants.push(Variant { name: vname, fields });
+            variants.push(Variant { name: vname, fields, field_names: None });
             if *self.peek() == Tok::Pipe {
                 self.advance();
             } else {
@@ -215,9 +291,19 @@ impl Parser {
                 }
             }
             self.expect(&Tok::RParen)?;
-            self.expect(&Tok::Arrow)?;
-            let ret = self.parse_type(tparams)?;
-            return Ok(Ty::Fn(params, Box::new(ret)));
+            // `(T1, ..) -> R` is a function type; without the arrow, the paren
+            // list is a TUPLE type `(A, B, ..)` (>= 2 elements), a grouped type
+            // `(T)` (1 element), or `()` = Unit (0 elements).
+            if *self.peek() == Tok::Arrow {
+                self.advance();
+                let ret = self.parse_type(tparams)?;
+                return Ok(Ty::Fn(params, Box::new(ret)));
+            }
+            return Ok(match params.len() {
+                0 => Ty::Unit,
+                1 => params.into_iter().next().unwrap(),
+                n => Ty::Named(self.tuple_name(n), params),
+            });
         }
         let name = self.expect_ident()?;
         // A bare builtin name (no brackets) stays a concrete builtin type.
@@ -353,10 +439,27 @@ impl Parser {
         // `parse_atom` already consumes the first `(args)` for `name(args)`
         // (yielding a by-name Call/Ctor). Any further `(args)` here — or an
         // application of a non-name expression such as `(\x -> ...)(5)` — is a
-        // general application of the callee value.
-        while *self.peek() == Tok::LParen {
-            let args = self.parse_args()?;
-            e = Expr::Apply(Box::new(e), args, None);
+        // general application of the callee value. A trailing `[i]` is array
+        // indexing, desugared to `array_get(e, i)`. Both chain: `f(x)[0][1]`.
+        loop {
+            match self.peek() {
+                Tok::LParen => {
+                    let args = self.parse_args()?;
+                    e = Expr::Apply(Box::new(e), args, None);
+                }
+                Tok::LBracket => {
+                    self.advance(); // `[`
+                    let idx = self.parse_sub_expr(0)?;
+                    self.expect(&Tok::RBracket)?;
+                    e = Expr::Call("array_get".to_string(), vec![e, idx]);
+                }
+                Tok::Dot => {
+                    self.advance(); // `.`
+                    let field = self.expect_ident()?;
+                    e = Expr::Field(Box::new(e), field);
+                }
+                _ => break,
+            }
         }
         Ok(e)
     }
@@ -374,7 +477,7 @@ impl Parser {
         let mut args = Vec::new();
         if *self.peek() != Tok::RParen {
             loop {
-                args.push(self.parse_expr(0)?);
+                args.push(self.parse_sub_expr(0)?);
                 if *self.peek() == Tok::Comma {
                     self.advance();
                 } else {
@@ -384,6 +487,28 @@ impl Parser {
         }
         self.expect(&Tok::RParen)?;
         Ok(args)
+    }
+
+    /// `Name { field: expr, ... }` — a record literal. The leading `Name` and the
+    /// opening `{` have already been recognized by `parse_atom`.
+    fn parse_record_literal(&mut self, name: String) -> Result<Expr, String> {
+        self.expect(&Tok::LBrace)?;
+        let mut fields = Vec::new();
+        if *self.peek() != Tok::RBrace {
+            loop {
+                let fname = self.expect_ident()?;
+                self.expect(&Tok::Colon)?;
+                let val = self.parse_sub_expr(0)?;
+                fields.push((fname, val));
+                if *self.peek() == Tok::Comma {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+        }
+        self.expect(&Tok::RBrace)?;
+        Ok(Expr::Record(name, fields))
     }
 
     fn parse_atom(&mut self) -> Result<Expr, String> {
@@ -411,14 +536,58 @@ impl Parser {
             Tok::If => self.parse_if(),
             Tok::Match => self.parse_match(),
             Tok::LBrace => self.parse_block(),
+            // Array literal `[e0, e1, ...]` desugars to a single flat,
+            // variadic `array_lit` builtin call — no new AST node, so the
+            // checker (which special-cases `array_lit` by name), IR and all
+            // backends see only an ordinary builtin call. An empty `[]` is
+            // `array_lit()`.
+            Tok::LBracket => {
+                self.advance(); // `[`
+                let mut elems = Vec::new();
+                if *self.peek() != Tok::RBracket {
+                    loop {
+                        elems.push(self.parse_sub_expr(0)?);
+                        if *self.peek() == Tok::Comma {
+                            self.advance();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                self.expect(&Tok::RBracket)?;
+                Ok(Expr::Call("array_lit".to_string(), elems))
+            }
             Tok::LParen => {
                 self.advance();
-                let e = self.parse_expr(0)?;
+                // `()` = Unit; `(e)` = grouping; `(a, b, ..)` = a tuple value
+                // (the synthetic `$TupleN` constructor).
+                if *self.peek() == Tok::RParen {
+                    self.advance();
+                    return Ok(Expr::Unit);
+                }
+                let mut elems = vec![self.parse_sub_expr(0)?];
+                while *self.peek() == Tok::Comma {
+                    self.advance();
+                    elems.push(self.parse_sub_expr(0)?);
+                }
                 self.expect(&Tok::RParen)?;
-                Ok(e)
+                if elems.len() == 1 {
+                    Ok(elems.into_iter().next().unwrap())
+                } else {
+                    let n = elems.len();
+                    Ok(Expr::Ctor(self.tuple_name(n), elems))
+                }
             }
             Tok::Ident(name) => {
                 self.advance();
+                // `Upper { field: expr, ... }` is a record literal (unless we're
+                // in an `if`/`match` head, where `{` opens the block/arms).
+                if is_upper(&name)
+                    && *self.peek() == Tok::LBrace
+                    && !self.no_record_literal
+                {
+                    return self.parse_record_literal(name);
+                }
                 let has_args = *self.peek() == Tok::LParen;
                 if has_args {
                     let args = self.parse_args()?;
@@ -441,9 +610,29 @@ impl Parser {
         }
     }
 
+    /// Parse an expression with record literals SUPPRESSED (`if`/`match` head),
+    /// restoring the previous setting afterward.
+    fn parse_head_expr(&mut self) -> Result<Expr, String> {
+        let prev = self.no_record_literal;
+        self.no_record_literal = true;
+        let r = self.parse_expr(0);
+        self.no_record_literal = prev;
+        r
+    }
+
+    /// Parse an expression with record literals ALLOWED (inside a delimited
+    /// sub-expression: parens, args, blocks, array/record literals).
+    fn parse_sub_expr(&mut self, min_bp: u8) -> Result<Expr, String> {
+        let prev = self.no_record_literal;
+        self.no_record_literal = false;
+        let r = self.parse_expr(min_bp);
+        self.no_record_literal = prev;
+        r
+    }
+
     fn parse_if(&mut self) -> Result<Expr, String> {
         self.expect(&Tok::If)?;
-        let cond = self.parse_expr(0)?;
+        let cond = self.parse_head_expr()?;
         let then = self.parse_block()?;
         self.expect(&Tok::Else)?;
         let els = self.parse_block()?;
@@ -452,13 +641,15 @@ impl Parser {
 
     fn parse_match(&mut self) -> Result<Expr, String> {
         self.expect(&Tok::Match)?;
-        let scrut = self.parse_expr(0)?;
+        let scrut = self.parse_head_expr()?;
         self.expect(&Tok::LBrace)?;
         let mut arms = Vec::new();
         while *self.peek() != Tok::RBrace {
             let pat = self.parse_pattern()?;
             self.expect(&Tok::FatArrow)?;
-            let body = self.parse_expr(0)?;
+            // An arm body is a fresh expression context: record literals are
+            // allowed even when the enclosing `match` is in an `if`/`match` head.
+            let body = self.parse_sub_expr(0)?;
             arms.push(Arm { pat, body });
             if *self.peek() == Tok::Comma {
                 self.advance();
@@ -475,6 +666,23 @@ impl Parser {
 
     fn parse_pattern(&mut self) -> Result<Pattern, String> {
         match self.peek().clone() {
+            // Tuple pattern `(p, q, ..)` -> the synthetic `$TupleN` ctor pattern;
+            // `(p)` is just grouping.
+            Tok::LParen => {
+                self.advance();
+                let mut subs = vec![self.parse_pattern()?];
+                while *self.peek() == Tok::Comma {
+                    self.advance();
+                    subs.push(self.parse_pattern()?);
+                }
+                self.expect(&Tok::RParen)?;
+                if subs.len() == 1 {
+                    Ok(subs.into_iter().next().unwrap())
+                } else {
+                    let n = subs.len();
+                    Ok(Pattern::Ctor(self.tuple_name(n), subs))
+                }
+            }
             Tok::Underscore => {
                 self.advance();
                 Ok(Pattern::Wild)
@@ -494,6 +702,31 @@ impl Parser {
             Tok::Ident(name) => {
                 self.advance();
                 if is_upper(&name) {
+                    // Record pattern `Name { x, y }` (shorthand binds each field
+                    // to a same-named var) or `Name { x: pat, ... }`.
+                    if *self.peek() == Tok::LBrace {
+                        self.advance();
+                        let mut fields = Vec::new();
+                        if *self.peek() != Tok::RBrace {
+                            loop {
+                                let fname = self.expect_ident()?;
+                                let sub = if *self.peek() == Tok::Colon {
+                                    self.advance();
+                                    self.parse_pattern()?
+                                } else {
+                                    Pattern::Var(fname.clone())
+                                };
+                                fields.push((fname, sub));
+                                if *self.peek() == Tok::Comma {
+                                    self.advance();
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                        self.expect(&Tok::RBrace)?;
+                        return Ok(Pattern::Record(name, fields));
+                    }
                     let mut subs = Vec::new();
                     if *self.peek() == Tok::LParen {
                         self.advance();
@@ -520,11 +753,43 @@ impl Parser {
 
     fn parse_block(&mut self) -> Result<Expr, String> {
         self.expect(&Tok::LBrace)?;
+        // Inside a block, record literals are allowed again (an `if`/`match` head
+        // suppressed them only up to its block).
+        let saved_no_rec = self.no_record_literal;
+        self.no_record_literal = false;
+        let result = self.parse_block_body();
+        self.no_record_literal = saved_no_rec;
+        result
+    }
+
+    fn parse_block_body(&mut self) -> Result<Expr, String> {
         let mut stmts = Vec::new();
         // Empty block evaluates to Unit.
         if *self.peek() == Tok::RBrace {
             self.advance();
             return Ok(Expr::Block(stmts, Box::new(Expr::Unit)));
+        }
+        // Functional record update `{ base | field = expr, ... }`: if the block
+        // does not start with `let`, parse the first expression; a following `|`
+        // (single pipe, never a binary operator) marks an update. `parse_expr`
+        // stops at the `|` since it is not an operator.
+        if *self.peek() != Tok::Let {
+            let first = self.parse_expr(0)?;
+            if *self.peek() == Tok::Pipe {
+                return self.parse_update_tail(first);
+            }
+            // Not an update: `first` is a statement (`;`) or the block result.
+            if *self.peek() == Tok::Semi {
+                self.advance();
+                stmts.push(Stmt::Expr(first));
+                if *self.peek() == Tok::RBrace {
+                    self.advance();
+                    return Ok(Expr::Block(stmts, Box::new(Expr::Unit)));
+                }
+            } else {
+                self.expect(&Tok::RBrace)?;
+                return Ok(Expr::Block(stmts, Box::new(first)));
+            }
         }
         let final_expr;
         loop {
@@ -553,6 +818,10 @@ impl Parser {
                     break;
                 }
                 continue;
+            } else if *self.peek() == Tok::Pipe {
+                // `{ stmts...; base | f = v, ... }` — the block result is an update.
+                let upd = self.parse_update_tail(e)?;
+                return Ok(Expr::Block(stmts, Box::new(upd)));
             } else {
                 final_expr = e;
                 break;
@@ -560,6 +829,27 @@ impl Parser {
         }
         self.expect(&Tok::RBrace)?;
         Ok(Expr::Block(stmts, Box::new(final_expr)))
+    }
+
+    /// Parse the tail of a functional update `| field = expr, ... }` given the
+    /// already-parsed `base`. The leading `|` is the next token; consumes through
+    /// the closing `}`.
+    fn parse_update_tail(&mut self, base: Expr) -> Result<Expr, String> {
+        self.expect(&Tok::Pipe)?;
+        let mut updates = Vec::new();
+        loop {
+            let fname = self.expect_ident()?;
+            self.expect(&Tok::Eq)?;
+            let val = self.parse_expr(0)?;
+            updates.push((fname, val));
+            if *self.peek() == Tok::Comma {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        self.expect(&Tok::RBrace)?;
+        Ok(Expr::Update(Box::new(base), updates))
     }
 }
 

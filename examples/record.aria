@@ -1,0 +1,33 @@
+-- Records: immutable "data classes" with named fields.
+-- `type P = { f: T, .. }` declares a record; `P { f: v, .. }` builds one
+-- (fields may be written in any order); `p.f` reads a field.
+
+type Point = { x: Float, y: Float }
+
+-- Records are generic, too.
+type Box[T] = { value: T, tag: Int }
+
+fn dist2(p: Point) -> Float = p.x * p.x + p.y * p.y
+
+fn unwrap[T](b: Box[T]) -> T = b.value
+
+-- Functional update `{ r | f = v }` returns a copy with fields replaced.
+fn move_x(p: Point, dx: Float) -> Point = { p | x = p.x + dx }
+
+-- Record patterns destructure in `match`.
+fn sum_coords(p: Point) -> Float = match p { Point { x, y } => x + y, }
+
+fn main() -> Int = {
+  let p = Point { x: 3.0, y: 4.0 };
+  print_float(p.x);                  -- 3
+  print_float(dist2(p));             -- 25
+  let q = Point { y: 1.0, x: 2.0 };  -- field order doesn't matter
+  print_float(q.x);                  -- 2
+  let p2 = move_x(p, 10.0);          -- functional update
+  print_float(p2.x);                 -- 13
+  print_float(p.x);                  -- 3 (original unchanged)
+  let b = Box { value: 7, tag: 9 };
+  print_int(unwrap(b));              -- 7
+  print_int(b.tag);                  -- 9
+  0
+}

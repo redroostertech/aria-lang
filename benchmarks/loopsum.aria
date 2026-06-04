@@ -1,0 +1,2 @@
+fn go(n: Int, acc: Int) -> Int = if n == 0 { acc } else { go(n - 1, acc + n) }
+fn main() -> Int = { print_int(go(100000000, 0)); 0 }

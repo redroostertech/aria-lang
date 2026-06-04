@@ -378,13 +378,26 @@ mod tests {
     use crate::{interp, ir, lexer, parser, typeck};
 
     /// Lower, insert RC (with reuse), run, and return (result string, metrics).
+    ///
+    /// Runs on a large-stack thread, exactly like `ast_result` (see main.rs): the
+    /// IR interpreter recurses with the Aria call stack, so a deep (but legal)
+    /// recursion would otherwise overflow the small default test stack and abort
+    /// the whole test run.
     fn run_rc(src: &str) -> (String, ir::Metrics) {
-        let prog = parser::parse(lexer::lex(src).unwrap()).unwrap();
-        typeck::check(&prog).expect("typeck");
-        let fns = insert_rc(&ir::lower_program(&prog).unwrap());
-        let mut runner = ir::IrInterp::new(fns);
-        let v = runner.run_main().expect("ir run");
-        (runner.render(&v), runner.metrics.clone())
+        let src = src.to_string();
+        std::thread::Builder::new()
+            .stack_size(1 << 30)
+            .spawn(move || {
+                let prog = parser::parse(lexer::lex(&src).unwrap()).unwrap();
+                typeck::check(&prog).expect("typeck");
+                let fns = insert_rc(&ir::lower_program(&prog).unwrap());
+                let mut runner = ir::IrInterp::new(fns);
+                let v = runner.run_main().expect("ir run");
+                (runner.render(&v), runner.metrics.clone())
+            })
+            .unwrap()
+            .join()
+            .unwrap()
     }
 
     fn ast_result(src: &str) -> String {
@@ -518,6 +531,55 @@ mod tests {
         assert!(
             m.allocations < m.allocations + m.reuses,
             "reuse should reduce fresh allocations below the gross total"
+        );
+    }
+
+    #[test]
+    fn array_push_set_unique_reuses_in_place() {
+        // Building and updating a UNIQUE array must reuse its buffer in place
+        // (FBIP): only the initial `array_new` allocates, every push/set reuses,
+        // and the program is garbage-free.
+        let src = "fn build(n: Int, a: Array[Int]) -> Array[Int] =\n\
+                     if n == 0 { a } else { build(n - 1, array_push(a, n)) }\n\
+                   fn sumr(a: Array[Int], i: Int, acc: Int) -> Int =\n\
+                     if i == array_len(a) { acc } else { sumr(a, i + 1, acc + array_get(a, i)) }\n\
+                   fn main() -> Int = {\n\
+                     let a = build(10, array_new());\n\
+                     let b = array_set(a, 0, 100);\n\
+                     sumr(b, 0, 0)\n\
+                   }";
+        let (res, m) = run_rc(src);
+        assert_eq!(res, ast_result(src));
+        assert_eq!(m.live, 0, "arrays must be garbage-free");
+        // 10 in-place pushes + 1 in-place set on the unique array.
+        assert!(m.reuses >= 11, "expected >= 11 in-place reuses, got {}", m.reuses);
+        // Only the single `array_new` cell is freshly allocated.
+        assert_eq!(m.allocations, 1, "expected 1 fresh allocation, got {}", m.allocations);
+    }
+
+    #[test]
+    fn array_shared_set_is_copy_on_write_and_garbage_free() {
+        // When the array is still used after `set`, it is shared, so `set` must
+        // copy (leaving the original intact) and stay garbage-free.
+        assert_garbage_free(
+            "fn main() -> Int = {\n\
+               let a = array_push(array_push(array_new(), 5), 6);\n\
+               let b = array_set(a, 0, 99);\n\
+               array_get(a, 0) + array_get(b, 0)\n\
+             }",
+        );
+    }
+
+    #[test]
+    fn array_of_heap_elements_is_garbage_free() {
+        // Arrays holding boxed ADT cells: dropping the array must recursively
+        // drop each element.
+        assert_garbage_free(
+            "type L = | Nil | Cons(Int, L)\n\
+             fn main() -> Int = {\n\
+               let a = array_push(array_push(array_new(), Cons(1, Nil)), Cons(2, Nil));\n\
+               match array_get(a, 1) { Nil => 0, Cons(h, t) => h, }\n\
+             }",
         );
     }
 

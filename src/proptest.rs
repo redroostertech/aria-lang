@@ -61,6 +61,9 @@ enum Ty {
     Float,
     Str,
     List,
+    /// `Array[Int]`. The generator only ever builds NON-empty arrays, so
+    /// index-0 `get`/`set` never trap and the garbage-free check stays active.
+    Array,
 }
 
 /// The fixed prelude prepended to every generated program. Only these functions
@@ -124,6 +127,7 @@ impl<'a> Gen<'a> {
             Ty::Float => self.gen_float(fuel),
             Ty::Str => self.gen_str(fuel),
             Ty::List => self.gen_list(fuel),
+            Ty::Array => self.gen_array(fuel),
         }
     }
 
@@ -169,6 +173,14 @@ impl<'a> Gen<'a> {
                     "Nil".to_string()
                 }
             }
+            Ty::Array => {
+                if let Some(v) = self.var_of(Ty::Array) {
+                    v
+                } else {
+                    // A non-empty single-element array literal.
+                    format!("[{}]", self.rng.below(10))
+                }
+            }
         }
     }
 
@@ -186,27 +198,31 @@ impl<'a> Gen<'a> {
 
     fn random_ty(&mut self) -> Ty {
         if self.wasm_subset {
-            // Restricted universe: Int/Bool/IntList AND String (Phase 2d). No
+            // Restricted universe: Int/Bool/IntList/String AND Array[Int]. No
             // Float, which stays outside the wasm backend's compilable subset.
-            return match self.rng.below(4) {
+            return match self.rng.below(5) {
                 0 => Ty::Int,
                 1 => Ty::Bool,
                 2 => Ty::Str,
-                _ => Ty::List,
+                3 => Ty::List,
+                _ => Ty::Array,
             };
         }
-        match self.rng.below(5) {
+        match self.rng.below(6) {
             0 => Ty::Int,
             1 => Ty::Bool,
             2 => Ty::Float,
             3 => Ty::Str,
-            _ => Ty::List,
+            4 => Ty::List,
+            _ => Ty::Array,
         }
     }
 
     fn gen_int(&mut self, fuel: u32) -> String {
         // Weighted toward leaves to keep programs small; `below` picks a rule.
-        match self.rng.below(9) {
+        // Arrays are now supported by every backend, so the array consumers run
+        // in both the full and wasm-subset generators.
+        match self.rng.below(11) {
             0 | 1 => self.leaf(Ty::Int),
             2 => {
                 let op = ["+", "-", "*"][self.rng.choice(3)];
@@ -236,6 +252,10 @@ impl<'a> Gen<'a> {
                     scrut, nil_arm, h, r, cons_arm
                 )
             }
+            // Array consumers. Generated arrays are always non-empty, so the
+            // index-0 `get` never traps.
+            8 => format!("array_len({})", self.expr(Ty::Array, fuel - 1)),
+            9 => format!("array_get({}, 0)", self.expr(Ty::Array, fuel - 1)),
             _ => self.let_block(Ty::Int, fuel),
         }
     }
@@ -342,6 +362,39 @@ impl<'a> Gen<'a> {
                 self.expr(Ty::List, fuel - 1)
             ),
             _ => self.let_block(Ty::List, fuel),
+        }
+    }
+
+    /// Generate an `Array[Int]` expression. Every rule yields a NON-empty array
+    /// (so index-0 `get`/`set` never trap), exercising literals, FBIP `push`/
+    /// `set`, branching, and binding.
+    fn gen_array(&mut self, fuel: u32) -> String {
+        match self.rng.below(7) {
+            0 | 1 => self.leaf(Ty::Array),
+            2 => {
+                // A 1-3 element literal (always non-empty).
+                let n = 1 + self.rng.below(3);
+                let elems: Vec<String> =
+                    (0..n).map(|_| self.expr(Ty::Int, fuel - 1)).collect();
+                format!("[{}]", elems.join(", "))
+            }
+            3 => format!(
+                "array_push({}, {})",
+                self.expr(Ty::Array, fuel - 1),
+                self.expr(Ty::Int, fuel - 1)
+            ),
+            4 => format!(
+                "array_set({}, 0, {})",
+                self.expr(Ty::Array, fuel - 1),
+                self.expr(Ty::Int, fuel - 1)
+            ),
+            5 => format!(
+                "if {} {{ {} }} else {{ {} }}",
+                self.expr(Ty::Bool, fuel - 1),
+                self.expr(Ty::Array, fuel - 1),
+                self.expr(Ty::Array, fuel - 1)
+            ),
+            _ => self.let_block(Ty::Array, fuel),
         }
     }
 }
@@ -800,5 +853,122 @@ fn wasm_matches_interpreter_fuzz() {
         checked,
         skipped,
         overflow
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 7) Compiled-backend differential: native C vs. interpreter (oracle).
+//    Uses the FULL generator (includes arrays), so this is the only fuzzer that
+//    exercises the native array runtime (AriaArray, FBIP) end to end.
+// ---------------------------------------------------------------------------
+
+fn cc_available() -> bool {
+    std::process::Command::new("cc")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Build C source with `cc -O2`, run it, and return `(main_result, live_cells)`.
+/// The native binary prints `main`'s value to stdout and `aria_live=N` to
+/// stderr; a runtime trap (overflow / div-by-zero / OOB → `abort`) surfaces as
+/// `("TRAP", 0)`.
+fn run_native_live(c_src: &str) -> Result<(String, i64), String> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir();
+    let cpath = dir.join(format!("aria_ptc_{}_{}.c", std::process::id(), n));
+    let exe = dir.join(format!("aria_pte_{}_{}", std::process::id(), n));
+    std::fs::write(&cpath, c_src).map_err(|e| e.to_string())?;
+    let cc = std::process::Command::new("cc")
+        .arg("-O2").arg("-std=c11").arg("-o").arg(&exe).arg(&cpath)
+        .output().map_err(|e| e.to_string())?;
+    let _ = std::fs::remove_file(&cpath);
+    if !cc.status.success() {
+        let _ = std::fs::remove_file(&exe);
+        return Err(format!("cc failed: {}", String::from_utf8_lossy(&cc.stderr)));
+    }
+    let run = std::process::Command::new(&exe).output().map_err(|e| e.to_string())?;
+    let _ = std::fs::remove_file(&exe);
+    if !run.status.success() {
+        // Non-zero exit / signal = a defined Aria runtime error trapped via abort.
+        return Ok(("TRAP".to_string(), 0));
+    }
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    let result = stdout.lines().last().unwrap_or("").trim().to_string();
+    let live = stderr
+        .split("aria_live=")
+        .nth(1)
+        .and_then(|s| s.split_whitespace().next())
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(-1);
+    Ok((result, live))
+}
+
+#[test]
+fn native_matches_interpreter_fuzz() {
+    // cc-gated: skip gracefully when no C compiler is available.
+    if !cc_available() {
+        return;
+    }
+    // Each seed shells out to `cc` + runs a binary, so sample a bounded count.
+    const SEEDS: u64 = 80;
+    let (mut skipped, mut overflow, mut checked) = (0u64, 0u64, 0u64);
+
+    for seed in 0..SEEDS {
+        let src = gen_program(seed); // full generator: includes arrays
+        if !well_typed(&src) {
+            skipped += 1;
+            continue;
+        }
+        let prog = parser::parse(lexer::lex(&src).expect("lex")).expect("parse");
+        let c_src = match crate::c_backend::compile(&prog) {
+            Ok(c) => c,
+            // Out of the native subset (e.g. compression builtins) — expected.
+            Err(_) => {
+                skipped += 1;
+                continue;
+            }
+        };
+        let interp = ast_run(&src);
+        let (nat, live) = run_native_live(&c_src)
+            .unwrap_or_else(|e| panic!("seed {}: native runner failed: {}\n{}", seed, e, src));
+
+        match interp {
+            Ok(expected) => {
+                assert_eq!(
+                    expected, nat,
+                    "seed {}: native != interpreter\n--- program ---\n{}\n--- interp={:?} native={:?}",
+                    seed, src, expected, nat
+                );
+                assert_eq!(
+                    live, 0,
+                    "seed {}: native leaked {} live cell(s)\n--- program ---\n{}",
+                    seed, live, src
+                );
+                checked += 1;
+            }
+            Err(_) => {
+                assert_eq!(
+                    nat, "TRAP",
+                    "seed {}: interpreter errored but native did not trap (={:?})\n{}",
+                    seed, nat, src
+                );
+                overflow += 1;
+            }
+        }
+    }
+
+    eprintln!(
+        "native_matches_interpreter_fuzz: {} seeds -> {} checked, {} trap, {} skipped",
+        SEEDS, checked, overflow, skipped
+    );
+    assert!(
+        checked >= 15,
+        "too few programs exercised through native: {} (skipped {})",
+        checked, skipped
     );
 }

@@ -11,15 +11,41 @@
 //! which would type-check and then fail at runtime).
 
 use crate::ast::Ty;
+use std::sync::OnceLock;
 
 /// Built-in (opaque) type names that need no user `type` declaration.
-pub const BUILTIN_TYPES: &[&str] = &["Tensor"];
+/// `Array` is generic (`Array[T]`); `Tensor` is a nullary opaque handle.
+pub const BUILTIN_TYPES: &[&str] = &["Tensor", "Array"];
+
+/// Cached signature table, built once on first access. The table is on a hot
+/// path (`lookup`/`names` are called per call-expression during lowering and
+/// type-checking), so we avoid rebuilding (and re-allocating the owned `Ty`
+/// strings) on every call.
+static SIGNATURES: OnceLock<Vec<(&'static str, Vec<Ty>, Ty)>> = OnceLock::new();
+
+/// Borrow the cached signature table, building it once on first use.
+fn signatures_cached() -> &'static Vec<(&'static str, Vec<Ty>, Ty)> {
+    SIGNATURES.get_or_init(build_signatures)
+}
 
 /// Every built-in function as `(name, parameter types, return type)`.
+///
+/// Returns a clone of the cached table for backward-compatible behavior; this
+/// is called rarely, so the clone is acceptable.
 pub fn signatures() -> Vec<(&'static str, Vec<Ty>, Ty)> {
+    signatures_cached().clone()
+}
+
+/// Construct the signature table. Called once via `signatures_cached`.
+fn build_signatures() -> Vec<(&'static str, Vec<Ty>, Ty)> {
     use Ty::*;
     // The opaque tensor handle, shared across all tensor builtins.
     let tensor = || Named("Tensor".to_string(), vec![]);
+    // Generic array element type `T` and the array type `Array[T]`. A builtin
+    // signature mentioning a `Ty::Var` is treated as generic by the checker,
+    // which instantiates the var fresh per call site (see typeck `Expr::Call`).
+    let elem = || Var("T".to_string());
+    let array = || Named("Array".to_string(), vec![elem()]);
     vec![
         ("print_int", vec![Int], Unit),
         ("print_float", vec![Float], Unit),
@@ -40,18 +66,24 @@ pub fn signatures() -> Vec<(&'static str, Vec<Ty>, Ty)> {
         ("embed_similarity", vec![Str, Str], Float),
         ("compressed_size", vec![Str], Int),
         ("neural_bits_per_byte", vec![Str], Float),
+        // ---- Arrays (generic, functional with FBIP in-place reuse) ---------
+        ("array_new", vec![], array()),
+        ("array_len", vec![array()], Int),
+        ("array_get", vec![array(), Int], elem()),
+        ("array_set", vec![array(), Int, elem()], array()),
+        ("array_push", vec![array(), elem()], array()),
     ]
 }
 
 /// Look up a builtin's signature by name.
 pub fn lookup(name: &str) -> Option<(Vec<Ty>, Ty)> {
-    signatures()
-        .into_iter()
+    signatures_cached()
+        .iter()
         .find(|(n, _, _)| *n == name)
-        .map(|(_, params, ret)| (params, ret))
+        .map(|(_, params, ret)| (params.clone(), ret.clone()))
 }
 
 /// All built-in function names.
 pub fn names() -> Vec<&'static str> {
-    signatures().into_iter().map(|(n, _, _)| n).collect()
+    signatures_cached().iter().map(|(n, _, _)| *n).collect()
 }

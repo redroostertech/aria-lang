@@ -1,0 +1,8 @@
+outputs verified identical across aria/python/node
+
+benchmark   aria(ms)  python(ms)  node(ms)  py/aria node/aria
+fib            246.5      7987.1     876.6    32.4x      3.6x
+loopsum         43.7     21983.7     274.1   503.3x      6.3x
+collatz        350.0     18013.5    2557.9    51.5x      7.3x
+listsum       2681.1     18799.1    2244.3     7.0x      0.8x
+DONE

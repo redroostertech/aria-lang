@@ -1,0 +1,17 @@
+-- Arrays: a first-class, functional collection (Array[T]).
+-- Literals `[..]` and indexing `a[i]` are sugar for the array builtins;
+-- `set`/`push` return a new array but reuse the buffer in place when the
+-- array is uniquely owned (FBIP) — mutable speed with immutable semantics.
+
+fn sum(a: Array[Int], i: Int, acc: Int) -> Int =
+  if i == array_len(a) { acc } else { sum(a, i + 1, acc + a[i]) }
+
+fn main() -> Int = {
+  let xs  = [10, 20, 30, 40];
+  let xs2 = array_set(xs, 1, 99);     -- a fresh array; xs is unchanged
+  print_int(array_len(xs));           -- 4
+  print_int(xs[1]);                   -- 20  (original intact)
+  print_int(xs2[1]);                  -- 99  (updated copy)
+  print_int(sum(array_push(xs, 50), 0, 0));  -- 150
+  0
+}

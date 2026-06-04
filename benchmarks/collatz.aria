@@ -1,0 +1,5 @@
+fn steps(n: Int, c: Int) -> Int =
+  if n == 1 { c } else { if n % 2 == 0 { steps(n / 2, c + 1) } else { steps(3 * n + 1, c + 1) } }
+fn outer(i: Int, n: Int, total: Int) -> Int =
+  if i > n { total } else { outer(i + 1, n, total + steps(i, 0)) }
+fn main() -> Int = { print_int(outer(1, 1000000, 0)); 0 }

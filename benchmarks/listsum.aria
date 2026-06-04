@@ -1,0 +1,4 @@
+type L = | Nil | Cons(Int, L)
+fn build(n: Int, a: L) -> L = if n == 0 { a } else { build(n - 1, Cons(n, a)) }
+fn suml(xs: L, acc: Int) -> Int = match xs { Nil => acc, Cons(h, t) => suml(t, acc + h), }
+fn main() -> Int = { print_int(suml(build(20000000, Nil), 0)); 0 }

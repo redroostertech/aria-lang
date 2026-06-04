@@ -17,7 +17,7 @@ Re-run the checks with `cargo test`, `aria bench`, and the probes noted below.
 | **Generics with HM inference** | `examples/generic.aria` + typeck tests (instantiation, mismatch caught, rigid params) | ✅ |
 | **AI primitives callable from Aria** | `examples/ai.aria` runs `matmul`/`embed_similarity`/`compressed_size`; interp tests | ✅ |
 | **One canonical form — no optional syntax** | Was **false**: both `type T = A\|B` and `type T = \| A\|B` parsed. | 🔧 Leading `\|` is now **required**; one spelling. Trailing-comma optionality remains and is deferred to the grammar spec. |
-| **Regular grammar → GBNF "model can't emit a syntax error"** | GBNF export is not implemented | ⚠️ Reworded as design intent (planned), not a current fact |
+| **Regular grammar → GBNF "model can't emit a syntax error"** | `aria gbnf` emits a complete GBNF grammar; `gbnf.rs` ships its own acceptor and tests that the grammar accepts the real example programs and rejects malformed input | ✅ **Now implemented and validated against the parser** (was previously unbuilt) |
 
 ## Compression
 
@@ -34,8 +34,8 @@ Re-run the checks with `cargo test`, `aria bench`, and the probes noted below.
 | Claim | Reality | Verdict |
 |---|---|---|
 | **Compile-time tensor shape checking** | `src/shape.rs` is a standalone demo IR, reachable only via `aria demo shape`; it is *not* wired into the language type checker | 🔧 README marks it a prototype |
-| **Memory model (Perceus-RC) "decided"** | researched + documented in `docs/MEMORY.md`, but **not implemented**; whole-program ownership inference is an explicit unproven bet | ⚠️ Honest in MEMORY.md; remains the project's biggest open risk |
-| **"compiled" language** | runs on a tree-walking interpreter; no compiled backend yet | ✅ README does not claim "compiled" — it says compiler is the next milestone |
+| **Memory model (Perceus-RC)** | **implemented** in `rc.rs` over the typed IR: zero-annotation `dup`/`drop` + reuse analysis, garbage-free verified at runtime, cross-checked vs the interpreter, and lowered to *both* compiled backends | ✅ **Now real** (was "researched, not implemented") — 50% allocations eliminated on the map benchmark |
+| **"compiled" language** | **two compiling backends exist**: hand-emitted WASM (`wasm.rs`) and native-via-C (`c_backend.rs`, `cc -O2`), both consuming the same checked IR and agreeing under differential fuzzing | ✅ **Now real** (was "interpreter only; compiler is the next milestone") |
 | **`aria mem` / memory POC** | lowers the Int/Bool/ADT subset to ANF IR, inserts precise Perceus-style `dup`/`drop` **+ reuse analysis**, runs it (cross-checked against the tree-walker), and reports fresh allocations / reuses / frees / peak-live | ✅ Garbage-free (no cell live at exit, zero annotations) verified across list-sum, map-then-sum, shared refs, unused values, branch-only-use, scrutinee-used-after-match, heap-field-after-borrow, and trees. **Reuse eliminates 50% of allocations** on the map benchmark (unique cells mutated in place). Scope: the functional subset + an IR interpreter — *not* the whole language or a native backend yet. |
 
 ## Compiled backend (WASM, Phase 2a)
@@ -60,3 +60,54 @@ the *compression size* claims are all supported by code and reproducible. The
 items that outran reality — optional leading pipe, the pinned speed multiple,
 GBNF, shape-checking-as-a-language-feature, and "the language knows the shape" —
 were either fixed or reworded to match what the code actually does.
+
+---
+
+## v0 adversarial audit (latest pass)
+
+A fresh end-to-end audit — every README claim re-checked against the source and
+by running the tools (5 parallel auditors). Verdicts: ✅ true · ⚠️ partial /
+overstated · ❌ false.
+
+### Confirmed real (often under-claimed)
+
+| Claim | Evidence | Verdict |
+|---|---|---|
+| Static type checker (HM generics, exhaustive `match`, rigid type params) | `typeck.rs`; `aria check examples/broken.aria` reports 3 batched errors; 214 tests pass (with `RUST_MIN_STACK` bump) | ✅ + a **purity effect system** the README under-credits |
+| **Generics with HM inference** | `examples/generic.aria` runs; rigid (skolem) params prevent a body constraining its own `T` | ✅ README's `[ ]` checkbox was **misleading** — fixed; only `let`-generalization is unfinished |
+| Typed ANF IR, differentially checked vs tree-walker | check runs on **every** `aria mem`, not just in tests | ✅ stronger than implied |
+| Perceus RC, zero-annotation, garbage-free | `aria mem examples/mem_bench.aria` → garbage-free, **50.0% reuse (1001/2002)** | ✅ |
+| Native backend (Aria → C → `cc -O2`) | self-tail-recursion → `goto` loop; ADTs use RC; ~9 KB binaries | ✅ **~30–500× CPython, ~3–7× Node** on integer code (benchmarked) |
+| WASM backend (2a + 2b) | real `.wasm`, ADTs/strings on linear memory, overflow traps, fuzzed vs interpreter | ✅ |
+| rANS coder; **type-aware codec 2.5× gzip -9** | `aria bench` reproduces 406,180 vs 1,021,751 = 2.52×, deterministic; ~30–40× faster | ✅ |
+| Transformer forward pass | `aria demo transformer` — real causal attention + MLP + layernorm | ✅ **but tiny & untrained** (random weights) — a correctness demo |
+| Context-mixing predictor (`neural_bits_per_byte`, `aria demo predict`) | real PAQ-style integer predictor with online logistic mixer | ✅ (it is *statistical*, not a neural net) |
+| GBNF export | `aria gbnf`; validated against parser on examples | ✅ |
+| INT8 quantization, shape checker (`shape.rs`) | real; shape checker honest that it's standalone, not wired into typeck | ✅ |
+
+### Overstated / corrected this pass
+
+| Claim | Reality measured | Action |
+|---|---|---|
+| Neural codec "roughly on par with `gzip -9`" | **~21% larger** than gzip on the 143 KB corpus; only **~1 MB/s** throughput | ⚠️ README corrected to "does not yet match gzip"; speed caveat added |
+| "Embeddings" (`embed_similarity`, RAG) | **FNV-1a token hashing** — lexical bag-of-words, not a learned/semantic model | ⚠️ documented as lexical; never exposed as a value |
+| "Type-aware" compression win | hand-coded transform for **one synthetic dataset**; off-domain (source/text/random) order-0 rANS **loses 1.5–3.7× to gzip** | ⚠️ disclosed in README; the win is not type-system-driven |
+| README line 30 "GBNF … not yet built" vs line 251 "[x] GBNF" | internal contradiction; GBNF **is** built | 🔧 line 30 fixed |
+| Benchmark absolute ms | drift up to ~60% run-to-run on a thermally-variable laptop | 🔧 README reports **ratio ranges** across 5 runs, not single numbers |
+
+### The structural gap (not a claim, but the key finding)
+
+For an "AI-native" language the **data model is the weakest part**: no loops, no
+arrays/lists/maps/sets/tuples/records, no `Bytes`, no first-class vector/embedding
+type (only the opaque interpreter+WASM `Tensor`), and the compression engine is a
+standalone Rust library reachable only via two `Str`-only interpreter builtins.
+The AI primitives are real *kernels* wired to the interpreter, not a programmable
+first-class data layer. Closing this is Tier 0 of [ROADMAP.md](ROADMAP.md).
+
+### Honesty issues to fix in the repo itself
+
+- `cargo test` does **not** pass out-of-the-box — needs `RUST_MIN_STACK=67108864`
+  (a debug-mode deep-recursion test overflows the default stack; the CLI itself is
+  fine because it runs on a large-stack thread).
+- Native release binaries print an `aria_live=… aria_reuses=…` diagnostic to
+  stderr — should be suppressed outside debug/`mem`.

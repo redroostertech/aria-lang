@@ -30,6 +30,7 @@ pub enum Tok {
     Comma,
     Semi,
     Colon,
+    Dot, // .  (record field access)
     Pipe,
     Underscore,
     Arrow,    // ->
@@ -122,6 +123,9 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             ',' => Some(Tok::Comma),
             ';' => Some(Tok::Semi),
             ':' => Some(Tok::Colon),
+            // A bare `.` (the number scanner has already consumed any `.` that is
+            // part of a float literal, and rejects a trailing one) is field access.
+            '.' => Some(Tok::Dot),
             '|' => Some(Tok::Pipe),
             '=' => Some(Tok::Eq),
             '+' => Some(Tok::Plus),

@@ -55,6 +55,83 @@ use std::collections::HashMap;
 use crate::ast::{BinOp, Item, Program, Ty, UnOp};
 use crate::ir::{self, Atom, Bind, IExpr, IFn};
 
+/// The concrete element kind of an `Array[T]`, mirroring the one-char suffix the
+/// monomorphizer attaches to every array builtin (`array_get$i`, `array_lit$f`,
+/// ...). It drives whether array elements are heap references needing a recursive
+/// drop, and how each element is encoded into / decoded out of its 8-byte slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ElemKind {
+    Int,   // Int/Bool — stored directly in an i64 slot
+    Float, // Float — f64 bits reinterpreted into an i64 slot
+    Str,   // heap String object (ref counted, recursive drop)
+    Ref,   // boxed heap value: ADT cell / closure (recursive drop)
+}
+
+impl ElemKind {
+    /// Parse the monomorphizer's one-char element-kind suffix.
+    fn from_tag(c: char) -> Result<ElemKind, String> {
+        match c {
+            'i' => Ok(ElemKind::Int),
+            'f' => Ok(ElemKind::Float),
+            's' => Ok(ElemKind::Str),
+            'r' => Ok(ElemKind::Ref),
+            other => Err(format!("wasm backend: bad array element-kind tag `{}`", other)),
+        }
+    }
+
+    /// The header `kind` code stored in the Array object (drives the kind-aware
+    /// runtime dup/drop). Must match the codes the helpers below test for.
+    fn code(self) -> i64 {
+        match self {
+            ElemKind::Int => 0,
+            ElemKind::Float => 1,
+            ElemKind::Str => 2,
+            ElemKind::Ref => 3,
+        }
+    }
+
+    /// The wasm value type an element of this kind occupies on the operand stack.
+    fn elem_wtype(self) -> WType {
+        match self {
+            ElemKind::Int => WType::I64,
+            ElemKind::Float => WType::F64,
+            ElemKind::Str => WType::Str,
+            ElemKind::Ref => WType::Ref,
+        }
+    }
+
+    /// The element kind that holds a value of the given wasm value type. (Bool is
+    /// an i32 that lives in the Int/i64 slot family; a nested Array is a heap ref.)
+    fn from_wtype(t: WType) -> ElemKind {
+        match t {
+            WType::I64 | WType::I32 => ElemKind::Int,
+            WType::F64 => ElemKind::Float,
+            WType::Str => ElemKind::Str,
+            WType::Ref | WType::Array(_) | WType::Tensor => ElemKind::Ref,
+            WType::F32 => ElemKind::Float,
+        }
+    }
+}
+
+/// Parse a suffixed array-builtin name (`array_get$r`, `array_lit$f`, ...) into
+/// its base operation and concrete element kind. The UNSUFFIXED names never reach
+/// the backend (they are interpreter/IR-only). Returns `None` if not an array
+/// builtin.
+fn parse_array_builtin(name: &str) -> Option<(&'static str, ElemKind)> {
+    let (base, tag) = name.rsplit_once('$')?;
+    let kind = ElemKind::from_tag(tag.chars().next()?).ok()?;
+    let base = match base {
+        "array_new" => "array_new",
+        "array_lit" => "array_lit",
+        "array_len" => "array_len",
+        "array_get" => "array_get",
+        "array_set" => "array_set",
+        "array_push" => "array_push",
+        _ => return None,
+    };
+    Some((base, kind))
+}
+
 /// A wasm-level value type. On the operand stack we keep `Int` as i64, `Bool`
 /// as i32, and a heap reference (`Ref`) as i32 (a wasm32 linear-memory address).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -65,6 +142,7 @@ enum WType {
     Ref, // pointer into linear memory (i32 address) — Phase 2b ADT cell
     Str, // pointer into linear memory (i32 address) — Phase 2d String object
     Tensor, // pointer into linear memory (i32 address) — Phase 2f Tensor object
+    Array(ElemKind), // pointer into linear memory (i32 address) — heap Array object
     F32, // INTERNAL ONLY: a scalar f32 used for Tensor-helper locals/scratch.
          // No Aria value ever has this type (Tensor data is f32 but is read out
          // as f64); it exists purely so helper bodies can declare f32 locals.
@@ -78,7 +156,7 @@ impl WType {
             WType::I64 => 0x7E,
             WType::F64 => 0x7C,
             WType::F32 => 0x7D,
-            WType::I32 | WType::Ref | WType::Str | WType::Tensor => 0x7F,
+            WType::I32 | WType::Ref | WType::Str | WType::Tensor | WType::Array(_) => 0x7F,
         }
     }
 
@@ -96,6 +174,20 @@ impl WType {
             // builtin ADT name `Tensor`; distinguish it before the generic
             // named-ADT case so it gets its own heap object kind.
             Ty::Named(n, args) if n == "Tensor" && args.is_empty() => Ok(WType::Tensor),
+            // A heap Array object of a concrete element kind. Distinguish before
+            // the generic named-ADT case so it gets its own heap object kind.
+            Ty::Named(n, args) if n == "Array" && args.len() == 1 => {
+                let elem = WType::from_ty(&args[0])?;
+                // A nested Array element ($r) would be dropped via the ADT `__drop`
+                // (wrong heap-object kind -> leak/corruption). Reject cleanly; the
+                // kind-aware Array drop only recurses through Str/ADT elements.
+                if matches!(elem, WType::Array(_)) {
+                    return Err(
+                        "wasm backend: nested Array[Array[..]] is outside the wasm subset".into(),
+                    );
+                }
+                Ok(WType::Array(ElemKind::from_wtype(elem)))
+            }
             // A named ADT becomes a heap reference. (Generics — args present —
             // are out of the 2b subset and rejected below.)
             Ty::Named(_, args) if args.is_empty() => Ok(WType::Ref),
@@ -191,6 +283,15 @@ impl CtorTable {
                     if field_types.contains(&WType::Tensor) {
                         return Err(format!(
                             "wasm backend: type `{}` ctor `{}` has a Tensor field (outside the subset)",
+                            t.name, v.name
+                        ));
+                    }
+                    // An Array field inside an ADT cell is outside the subset:
+                    // __drop has no per-tag knowledge to release Array children
+                    // kind-aware, so reject cleanly (never a panic / leak).
+                    if field_types.iter().any(|t| matches!(t, WType::Array(_))) {
+                        return Err(format!(
+                            "wasm backend: type `{}` ctor `{}` has an Array field (outside the subset)",
                             t.name, v.name
                         ));
                     }
@@ -306,6 +407,29 @@ const TENSOR_HEADER: u64 = 24; // rc(8) + rows(8) + cols(8)
 /// decrements `__live` but is not bucketed (still garbage-free by `__live`).
 const TENSOR_MAX_CLASS: u64 = 256;
 
+// ---- Array heap objects --------------------------------------------------
+//
+// An Array is a growable, reference-counted heap object modeled exactly on the
+// Tensor object: it gets its OWN runtime helpers and reuses the SAME segregated
+// free-list `__alloc`/`__free` machinery and the SAME `__live` counter — WITHOUT
+// changing any allocator constant or the free-list array's size. Layout at `p`:
+//   [p+0]   rc    (i64)
+//   [p+8]   len   (i64)   — number of live elements
+//   [p+16]  cap   (i64)   — slot capacity
+//   [p+24]  kind  (i64)   — ElemKind code (0=Int,1=Float,2=Str,3=Ref)
+//   [p+32 .. p+32+8*cap]  elements, one per 8-byte slot
+// Each element occupies one i64 slot: Int directly, Float as f64 bits, Str/Ref as
+// the (zero-extended) i32 pointer. Only kind 2/3 elements are heap refs and need
+// a recursive dup/drop. FBIP: set/push mutate in place when rc==1, else copy.
+//
+// A size class is `(round8(32 + 8*cap) - CELL_HEADER) / SLOT = cap + 2`, clamped
+// to TENSOR_MAX_CLASS — so it always fits the EXISTING free-list array (sized to
+// max(max_arity, STR_MAX_CLASS, TENSOR_MAX_CLASS) + 1) without enlarging it.
+const ARRAY_HEADER: u64 = 32; // rc(8) + len(8) + cap(8) + kind(8)
+/// Minimum capacity an empty array grows to on its first push (mirrors the native
+/// backend's `cap==0 -> 4`, avoiding the native bug of growing to cap 1).
+const ARRAY_MIN_CAP: i64 = 4;
+
 /// The emitted checked-arithmetic helper functions. Each detects signed-i64
 /// overflow and executes `unreachable` (a wasm trap) on overflow; otherwise it
 /// returns the wrapped result. They are appended to the module after all user
@@ -381,10 +505,18 @@ enum HeapHelper {
     Softmax,     // (t:i32) -> ptr:i32   row-wise softmax (uses env.exp), consumes t
     EmbedSim,    // (a:i32, b:i32) -> f64  embed_similarity, consumes both Strings
     HashEmbed,   // (s:i32, vec_addr:i32) -> () write a dim-64 normalized embedding to vec_addr
+    // ---- Array runtime ----
+    AllocArray, // (kind:i32, cap:i32) -> ptr:i32   alloc an Array (rc=1, len=0, hdr set)
+    DupArray,   // (ptr:i32) -> i32   rc++ on an Array
+    DropArray,  // (ptr:i32) -> i32   rc--; at 0, kind-aware drop elems then free
+    ArrayLen,   // (ptr:i32) -> i64   len header, consumes the array
+    ArrayGet,   // (ptr:i32, i:i64) -> i64   read+dup elem (kind from hdr), consumes array
+    ArraySet,   // (ptr:i32, i:i64, x:i64) -> ptr:i32   FBIP set, returns array
+    ArrayPush,  // (ptr:i32, x:i64, kind:i32) -> ptr:i32   FBIP push/grow, returns array
 }
 
 impl HeapHelper {
-    const ALL: [HeapHelper; 29] = [
+    const ALL: [HeapHelper; 36] = [
         HeapHelper::Alloc,
         HeapHelper::Free,
         HeapHelper::Dup,
@@ -414,6 +546,13 @@ impl HeapHelper {
         HeapHelper::Softmax,
         HeapHelper::EmbedSim,
         HeapHelper::HashEmbed,
+        HeapHelper::AllocArray,
+        HeapHelper::DupArray,
+        HeapHelper::DropArray,
+        HeapHelper::ArrayLen,
+        HeapHelper::ArrayGet,
+        HeapHelper::ArraySet,
+        HeapHelper::ArrayPush,
     ];
 
     fn offset(self) -> u32 {
@@ -447,6 +586,13 @@ impl HeapHelper {
             HeapHelper::Softmax => 26,
             HeapHelper::EmbedSim => 27,
             HeapHelper::HashEmbed => 28,
+            HeapHelper::AllocArray => 29,
+            HeapHelper::DupArray => 30,
+            HeapHelper::DropArray => 31,
+            HeapHelper::ArrayLen => 32,
+            HeapHelper::ArrayGet => 33,
+            HeapHelper::ArraySet => 34,
+            HeapHelper::ArrayPush => 35,
         }
     }
 
@@ -486,6 +632,13 @@ impl HeapHelper {
             HeapHelper::Softmax => (vec![WType::I32], WType::I32),
             HeapHelper::EmbedSim => (vec![WType::I32, WType::I32], WType::F64),
             HeapHelper::HashEmbed => (vec![WType::I32, WType::I32], WType::I32),
+            HeapHelper::AllocArray => (vec![WType::I32, WType::I32], WType::I32),
+            HeapHelper::DupArray => (vec![WType::I32], WType::I32),
+            HeapHelper::DropArray => (vec![WType::I32], WType::I32),
+            HeapHelper::ArrayLen => (vec![WType::I32], WType::I64),
+            HeapHelper::ArrayGet => (vec![WType::I32, WType::I64], WType::I64),
+            HeapHelper::ArraySet => (vec![WType::I32, WType::I64, WType::I64], WType::I32),
+            HeapHelper::ArrayPush => (vec![WType::I32, WType::I64, WType::I32], WType::I32),
         }
     }
 }
@@ -794,6 +947,9 @@ fn bind_type(bind: &Bind, env: &LocalEnv) -> Result<WType, String> {
             }
             if let Some(ret) = tensor_builtin_ret(name) {
                 return Ok(ret);
+            }
+            if let Some((base, kind)) = parse_array_builtin(name) {
+                return Ok(array_builtin_ret(base, kind));
             }
             let sig = env
                 .sigs
@@ -1146,7 +1302,8 @@ fn emit_bind(bind: &Bind, env: &mut LocalEnv, code: &mut Vec<u8>) -> Result<WTyp
                         code.push(0x9A); // f64.neg
                         Ok(WType::F64)
                     }
-                    WType::I32 | WType::Ref | WType::Str | WType::Tensor | WType::F32 => {
+                    WType::I32 | WType::Ref | WType::Str | WType::Tensor | WType::Array(_)
+                    | WType::F32 => {
                         Err("wasm backend: numeric negation requires an Int or Float".into())
                     }
                 }
@@ -1170,6 +1327,11 @@ fn emit_bind(bind: &Bind, env: &mut LocalEnv, code: &mut Vec<u8>) -> Result<WTyp
             // helpers (they consume their heap arguments, matching the rc pass).
             if tensor_builtin_ret(name).is_some() {
                 return emit_tensor_builtin(name, args, env, code);
+            }
+            // Array builtins are emitted as calls into the array heap helpers
+            // (they consume their heap arguments, matching the rc pass).
+            if let Some((base, kind)) = parse_array_builtin(name) {
+                return emit_array_builtin(base, kind, args, env, code);
             }
             let sig_ret;
             let sig_params;
@@ -1278,7 +1440,7 @@ fn emit_store_cell_fields(
         match fty {
             WType::F64 => f64_store(off, code),
             WType::I64 => i64_store(off, code),
-            WType::I32 | WType::Ref | WType::Str | WType::Tensor => {
+            WType::I32 | WType::Ref | WType::Str | WType::Tensor | WType::Array(_) => {
                 code.push(0xAD); // i64.extend_i32_u
                 i64_store(off, code);
             }
@@ -1510,6 +1672,195 @@ fn emit_tensor_builtin(
     Ok(ret)
 }
 
+/// The wasm result type of a (parsed) array builtin: `array_get$k` yields the
+/// element type, `array_len$k` an Int, every other op an `Array(kind)`.
+fn array_builtin_ret(base: &str, kind: ElemKind) -> WType {
+    match base {
+        "array_len" => WType::I64,
+        "array_get" => kind.elem_wtype(),
+        _ => WType::Array(kind),
+    }
+}
+
+/// Encode a stack value of `kind`'s element type into the i64 slot representation
+/// used by the array's `elems[]`. `got` is the value's actual wasm type (checked).
+fn encode_array_elem(kind: ElemKind, got: WType, code: &mut Vec<u8>) -> Result<(), String> {
+    // A nested Array element ($r holding an Array) would be dropped via the ADT
+    // `__drop` (wrong heap-object kind -> leak/corruption); reject cleanly.
+    if matches!(got, WType::Array(_)) {
+        return Err(
+            "wasm backend: nested Array[Array[..]] is outside the wasm subset".into(),
+        );
+    }
+    // Bool (i32) is accepted where Int is expected; both occupy the i64 slot.
+    let ok = match kind {
+        ElemKind::Int => got == WType::I64 || got == WType::I32,
+        ElemKind::Float => got == WType::F64,
+        ElemKind::Str => got == WType::Str,
+        ElemKind::Ref => matches!(got, WType::Ref | WType::Tensor),
+    };
+    if !ok {
+        return Err(format!(
+            "wasm backend: array element type mismatch (got {:?}, kind {:?})",
+            got, kind
+        ));
+    }
+    match kind {
+        ElemKind::Int => {
+            if got == WType::I32 {
+                code.push(0xAD); // i64.extend_i32_u (Bool -> i64 slot)
+            }
+        }
+        ElemKind::Float => code.push(0xBD), // i64.reinterpret_f64
+        ElemKind::Str | ElemKind::Ref => code.push(0xAD), // i64.extend_i32_u (ptr)
+    }
+    Ok(())
+}
+
+/// Decode an i64 slot (an `array_get` result on the stack) back to `kind`'s
+/// element wasm type.
+fn decode_array_elem(kind: ElemKind, code: &mut Vec<u8>) {
+    match kind {
+        ElemKind::Int => {}                  // already i64
+        ElemKind::Float => code.push(0xBF),  // f64.reinterpret_i64
+        ElemKind::Str | ElemKind::Ref => code.push(0xA7), // i32.wrap_i64 (ptr)
+    }
+}
+
+/// Emit an array builtin call. Each maps to the array heap helpers, which CONSUME
+/// their array arguments (matching the rc pass's "Call args are consumed" rule).
+/// `array_lit` is built inline (alloc then raw element stores; ownership of each
+/// element moves into the array, exactly like the IR's `array_lit`).
+fn emit_array_builtin(
+    base: &str,
+    kind: ElemKind,
+    args: &[Atom],
+    env: &mut LocalEnv,
+    code: &mut Vec<u8>,
+) -> Result<WType, String> {
+    match base {
+        "array_new" => {
+            if !args.is_empty() {
+                return Err("wasm backend: array_new expects no arguments".into());
+            }
+            // __array_new(kind, cap=0)
+            code.push(0x41);
+            leb_s(kind.code(), code);
+            code.push(0x41);
+            leb_s(0, code);
+            code.push(0x10);
+            leb_u(env.heap_index(HeapHelper::AllocArray) as u64, code);
+            Ok(WType::Array(kind))
+        }
+        "array_lit" => {
+            let n = args.len() as i64;
+            let arr = env.fresh_i32();
+            // arr = __array_new(kind, n)
+            code.push(0x41);
+            leb_s(kind.code(), code);
+            code.push(0x41);
+            leb_s(n, code);
+            code.push(0x10);
+            leb_u(env.heap_index(HeapHelper::AllocArray) as u64, code);
+            code.push(0x21); // local.set arr
+            leb_u(arr as u64, code);
+            // store each element raw at arr.elems[i] (ownership moves in)
+            for (i, a) in args.iter().enumerate() {
+                code.push(0x20); // local.get arr (address base)
+                leb_u(arr as u64, code);
+                code.push(0x41);
+                leb_s(ARRAY_HEADER as i64, code);
+                code.push(0x6A); // i32.add
+                code.push(0x41);
+                leb_s((SLOT * i as u64) as i64, code);
+                code.push(0x6A); // + 8*i  -> element address
+                let got = emit_atom(a, env, code)?;
+                encode_array_elem(kind, got, code)?;
+                i64_store(0, code);
+            }
+            // arr.len = n
+            code.push(0x20);
+            leb_u(arr as u64, code);
+            code.push(0x42); // i64.const n
+            leb_s(n, code);
+            i64_store(8, code);
+            // result = arr
+            code.push(0x20);
+            leb_u(arr as u64, code);
+            Ok(WType::Array(kind))
+        }
+        "array_len" => {
+            if args.len() != 1 {
+                return Err("wasm backend: array_len expects one array".into());
+            }
+            let got = emit_atom(&args[0], env, code)?;
+            check_is_array(got, kind)?;
+            code.push(0x10);
+            leb_u(env.heap_index(HeapHelper::ArrayLen) as u64, code);
+            Ok(WType::I64)
+        }
+        "array_get" => {
+            if args.len() != 2 {
+                return Err("wasm backend: array_get expects (array, index)".into());
+            }
+            let got = emit_atom(&args[0], env, code)?;
+            check_is_array(got, kind)?;
+            let it = emit_atom(&args[1], env, code)?;
+            if it != WType::I64 {
+                return Err("wasm backend: array_get index must be Int".into());
+            }
+            code.push(0x10);
+            leb_u(env.heap_index(HeapHelper::ArrayGet) as u64, code);
+            decode_array_elem(kind, code);
+            Ok(kind.elem_wtype())
+        }
+        "array_set" => {
+            if args.len() != 3 {
+                return Err("wasm backend: array_set expects (array, index, value)".into());
+            }
+            let got = emit_atom(&args[0], env, code)?;
+            check_is_array(got, kind)?;
+            let it = emit_atom(&args[1], env, code)?;
+            if it != WType::I64 {
+                return Err("wasm backend: array_set index must be Int".into());
+            }
+            let vt = emit_atom(&args[2], env, code)?;
+            encode_array_elem(kind, vt, code)?;
+            code.push(0x10);
+            leb_u(env.heap_index(HeapHelper::ArraySet) as u64, code);
+            Ok(WType::Array(kind))
+        }
+        "array_push" => {
+            if args.len() != 2 {
+                return Err("wasm backend: array_push expects (array, value)".into());
+            }
+            let got = emit_atom(&args[0], env, code)?;
+            check_is_array(got, kind)?;
+            let vt = emit_atom(&args[1], env, code)?;
+            encode_array_elem(kind, vt, code)?;
+            // kind argument (i32)
+            code.push(0x41);
+            leb_s(kind.code(), code);
+            code.push(0x10);
+            leb_u(env.heap_index(HeapHelper::ArrayPush) as u64, code);
+            Ok(WType::Array(kind))
+        }
+        _ => Err(format!("wasm backend: unsupported array builtin `{}`", base)),
+    }
+}
+
+/// Verify a value is an `Array` of the given element kind (the array argument to
+/// a suffixed array builtin).
+fn check_is_array(got: WType, kind: ElemKind) -> Result<(), String> {
+    match got {
+        WType::Array(k) if k == kind => Ok(()),
+        other => Err(format!(
+            "wasm backend: array builtin expected Array[{:?}], got {:?}",
+            kind, other
+        )),
+    }
+}
+
 /// Emit a String `==` / `!=`. Both operands are evaluated into fresh i32 temps
 /// (so a literal operand's pointer is captured), `__streq` compares them, the
 /// result is negated for `!=`, and BOTH operands are then dropped via
@@ -1677,7 +2028,7 @@ fn emit_make_closure(
         match t {
             WType::F64 => f64_store(off, code),
             WType::I64 => i64_store(off, code),
-            WType::I32 | WType::Ref | WType::Str | WType::Tensor => {
+            WType::I32 | WType::Ref | WType::Str | WType::Tensor | WType::Array(_) => {
                 code.push(0xAD); // i64.extend_i32_u
                 i64_store(off, code);
             }
@@ -1907,7 +2258,7 @@ fn emit_arm_body(
                 match fty {
                     WType::F64 => f64_load(off, code),
                     WType::I64 => i64_load(off, code),
-                    WType::I32 | WType::Ref | WType::Str | WType::Tensor => {
+                    WType::I32 | WType::Ref | WType::Str | WType::Tensor | WType::Array(_) => {
                         i64_load(off, code);
                         code.push(0xA7); // i32.wrap_i64
                     }
@@ -2027,6 +2378,13 @@ fn emit_prim(op: BinOp, lt: WType, rt: WType, code: &mut Vec<u8>) -> Result<WTyp
                         "wasm backend: `==`/`!=` on Tensor is outside the wasm subset".into(),
                     )
                 }
+                // Array structural `==` would need an elementwise compare;
+                // outside the wasm subset (clean Err, never a panic).
+                WType::Array(_) => {
+                    return Err(
+                        "wasm backend: `==`/`!=` on Array is outside the wasm subset".into(),
+                    )
+                }
                 WType::F32 => unreachable!("F32 is not an Aria value type"),
             }
             Ok(WType::I32)
@@ -2089,6 +2447,7 @@ fn emit_iexpr(e: &IExpr, env: &mut LocalEnv, code: &mut Vec<u8>) -> Result<WType
                 WType::Ref => Some(HeapHelper::Dup),
                 WType::Str => Some(HeapHelper::DupStr),
                 WType::Tensor => Some(HeapHelper::DupTensor),
+                WType::Array(_) => Some(HeapHelper::DupArray),
                 _ => None,
             };
             if let Some(h) = h {
@@ -2105,6 +2464,7 @@ fn emit_iexpr(e: &IExpr, env: &mut LocalEnv, code: &mut Vec<u8>) -> Result<WType
                 WType::Ref => Some(HeapHelper::Drop),
                 WType::Str => Some(HeapHelper::DropStr),
                 WType::Tensor => Some(HeapHelper::DropTensor),
+                WType::Array(_) => Some(HeapHelper::DropArray),
                 _ => None,
             };
             if let Some(h) = h {
@@ -2432,6 +2792,10 @@ fn emit_heap_helper(
     let alloc_tensor_idx = heap_base + HeapHelper::AllocTensor.offset();
     let drop_tensor_idx = heap_base + HeapHelper::DropTensor.offset();
     let hash_embed_idx = heap_base + HeapHelper::HashEmbed.offset();
+    let alloc_array_idx = heap_base + HeapHelper::AllocArray.offset();
+    let drop_array_idx = heap_base + HeapHelper::DropArray.offset();
+    let dup_str_idx = heap_base + HeapHelper::DupStr.offset();
+    let dup_idx = heap_base + HeapHelper::Dup.offset();
 
     let mut body: Vec<u8> = Vec::new();
     match h {
@@ -2657,6 +3021,7 @@ fn emit_heap_helper(
                     body.push(CALL);
                     let idx = match t {
                         WType::Str => drop_str_idx,
+                        WType::Array(_) => drop_array_idx,
                         _ => drop_idx,
                     };
                     leb_u(idx as u64, &mut body);
@@ -3345,10 +3710,10 @@ fn emit_heap_helper(
                             body.push(CALL);
                             leb_u(eq_idx as u64, &mut body);
                         }
-                        // Tensor fields are rejected from ADTs (CtorTable::build),
-                        // so this arm is unreachable; emit a constant-true to keep
-                        // the match exhaustive without affecting any real program.
-                        WType::Tensor => {
+                        // Tensor and Array fields are rejected from ADTs
+                        // (CtorTable::build), so these arms are unreachable; emit a
+                        // constant-true to keep the match exhaustive.
+                        WType::Tensor | WType::Array(_) => {
                             body.push(I32_CONST);
                             leb_s(1, &mut body);
                         }
@@ -4747,7 +5112,995 @@ fn emit_heap_helper(
                 body,
             )
         }
+
+        // ---- Array runtime ----------------------------------------------
+        HeapHelper::AllocArray => {
+            // (kind:i32, cap:i32) -> ptr:i32. Alloc an Array object (rc=1, len=0,
+            // header set, elems UNINITIALIZED). cls = (round8(32 + 8*cap) -
+            // CELL_HEADER)/SLOT = cap + 2, clamped to TENSOR_MAX_CLASS.
+            // Locals: cls(2,i32), ptr(3,i32).
+            // cls = cap + 2
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body); // cap
+            body.push(I32_CONST);
+            leb_s(2, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_TEE);
+            leb_u(2, &mut body); // cls
+            // clamp to TENSOR_MAX_CLASS
+            body.push(I32_CONST);
+            leb_s(TENSOR_MAX_CLASS as i64, &mut body);
+            body.push(0x4B); // i32.gt_u
+            body.push(IF);
+            body.push(BT_VOID);
+            body.push(I32_CONST);
+            leb_s(TENSOR_MAX_CLASS as i64, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(2, &mut body);
+            body.push(END);
+            // ptr = __alloc(cls)   (sets rc=1, live++)
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body);
+            body.push(CALL);
+            leb_u(alloc_idx as u64, &mut body);
+            body.push(LOCAL_TEE);
+            leb_u(3, &mut body); // ptr
+            // [ptr+8] = len = 0
+            body.push(I64_CONST);
+            leb_s(0, &mut body);
+            i64_store(8, &mut body);
+            // [ptr+16] = cap
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body); // cap
+            body.push(I64_EXTEND_I32_U);
+            i64_store(16, &mut body);
+            // [ptr+24] = kind
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body); // kind
+            body.push(I64_EXTEND_I32_U);
+            i64_store(24, &mut body);
+            // return ptr
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            helper_entry(&[WType::I32, WType::I32], body)
+        }
+        HeapHelper::DupArray => {
+            // (ptr:i32) -> i32. rc++.
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(0, &mut body);
+            body.push(I64_CONST);
+            leb_s(1, &mut body);
+            body.push(I64_ADD);
+            i64_store(0, &mut body);
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            helper_entry(&[], body)
+        }
+        HeapHelper::DropArray => {
+            // (ptr:i32) -> i32. rc--; at 0, kind-aware drop each Str/Ref element,
+            // then free with cls = cap + 2 (clamped). Locals: rc(1,i64),
+            // kind(2,i64), len(3,i32), i(4,i32), cls(2-reuse? no)…
+            // Locals: rc(1,i64), kind(2,i64), n(3,i32), i(4,i32), cls(5,i32),
+            //         slot(6,i32).
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(0, &mut body);
+            body.push(I64_CONST);
+            leb_s(1, &mut body);
+            body.push(I64_SUB);
+            body.push(LOCAL_TEE);
+            leb_u(1, &mut body); // rc
+            i64_store(0, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body);
+            body.push(I64_EQZ);
+            body.push(IF);
+            body.push(BT_VOID);
+            // kind = [ptr+24]; n = [ptr+8] (len, as i32)
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(24, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(2, &mut body); // kind
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(8, &mut body);
+            body.push(I32_WRAP_I64);
+            body.push(LOCAL_SET);
+            leb_u(3, &mut body); // n
+            // if kind == 2 || kind == 3: loop drop each element
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body);
+            body.push(I64_CONST);
+            leb_s(2, &mut body);
+            body.push(0x51); // i64.eq
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body);
+            body.push(I64_CONST);
+            leb_s(3, &mut body);
+            body.push(0x51); // i64.eq
+            body.push(0x72); // i32.or
+            body.push(IF);
+            body.push(BT_VOID);
+            // i = 0
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(4, &mut body); // i
+            body.push(0x03); // loop
+            body.push(BT_VOID);
+            // if i < n
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            body.push(0x48); // i32.lt_s
+            body.push(IF);
+            body.push(BT_VOID);
+            // slot = i32.wrap(i64.load[ptr + 32 + 8*i])
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body); // ptr
+            body.push(I32_CONST);
+            leb_s(ARRAY_HEADER as i64, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body); // i
+            body.push(I32_CONST);
+            leb_s(SLOT as i64, &mut body);
+            body.push(I32_MUL);
+            body.push(I32_ADD); // addr
+            i64_load(0, &mut body);
+            body.push(I32_WRAP_I64);
+            body.push(LOCAL_SET);
+            leb_u(6, &mut body); // slot ptr
+            // if kind==2 __drop_str(slot) else __drop(slot)
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body);
+            body.push(I64_CONST);
+            leb_s(2, &mut body);
+            body.push(I64_EQ);
+            body.push(IF);
+            body.push(BT_VOID);
+            body.push(LOCAL_GET);
+            leb_u(6, &mut body);
+            body.push(CALL);
+            leb_u(drop_str_idx as u64, &mut body);
+            body.push(DROP);
+            body.push(ELSE);
+            body.push(LOCAL_GET);
+            leb_u(6, &mut body);
+            body.push(CALL);
+            leb_u(drop_idx as u64, &mut body);
+            body.push(DROP);
+            body.push(END);
+            // i++
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body);
+            body.push(I32_CONST);
+            leb_s(1, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_SET);
+            leb_u(4, &mut body);
+            body.push(0x0C); // br loop
+            leb_u(1, &mut body);
+            body.push(END); // end if i<n
+            body.push(END); // end loop
+            body.push(END); // end if kind==2||3
+            // cls = cap + 2 (clamped); cap = [ptr+16]
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(16, &mut body);
+            body.push(I32_WRAP_I64);
+            body.push(I32_CONST);
+            leb_s(2, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_TEE);
+            leb_u(5, &mut body); // cls
+            body.push(I32_CONST);
+            leb_s(TENSOR_MAX_CLASS as i64, &mut body);
+            body.push(0x4B); // i32.gt_u
+            body.push(IF);
+            body.push(BT_VOID);
+            body.push(I32_CONST);
+            leb_s(TENSOR_MAX_CLASS as i64, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(5, &mut body);
+            body.push(END);
+            // __free(ptr, cls)   (live--)
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(5, &mut body);
+            body.push(CALL);
+            leb_u(free_idx as u64, &mut body);
+            body.push(DROP);
+            body.push(END); // end if rc==0
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            helper_entry(
+                &[WType::I64, WType::I64, WType::I32, WType::I32, WType::I32, WType::I32],
+                body,
+            )
+        }
+        HeapHelper::ArrayLen => {
+            // (ptr:i32) -> i64. Returns len; CONSUMES the array (drop). Local:
+            // n(1,i64).
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(8, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(1, &mut body); // n
+            // __drop_array(ptr)
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(CALL);
+            leb_u(drop_array_idx as u64, &mut body);
+            body.push(DROP);
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body);
+            helper_entry(&[WType::I64], body)
+        }
+        HeapHelper::ArrayGet => {
+            // (ptr:i32, i:i64) -> i64. Bounds-check (trap OOB), read slot, dup it
+            // kind-aware, drop the (consumed) array, return slot. Locals:
+            // slot(2,i64), kind(3,i64), elemp(4,i32).
+            // if i < 0 || i >= len -> trap
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body); // i
+            body.push(I64_CONST);
+            leb_s(0, &mut body);
+            body.push(0x53); // i64.lt_s
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body); // i
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body); // ptr
+            i64_load(8, &mut body); // len
+            body.push(0x59); // i64.ge_s
+            body.push(0x72); // i32.or
+            body.push(IF);
+            body.push(BT_VOID);
+            body.push(0x00); // unreachable
+            body.push(END);
+            // slot = i64.load[ptr + 32 + 8*i]
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body); // ptr
+            body.push(I32_CONST);
+            leb_s(ARRAY_HEADER as i64, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body); // i (i64)
+            body.push(I32_WRAP_I64);
+            body.push(I32_CONST);
+            leb_s(SLOT as i64, &mut body);
+            body.push(I32_MUL);
+            body.push(I32_ADD);
+            i64_load(0, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(2, &mut body); // slot
+            // kind = [ptr+24]
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(24, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(3, &mut body); // kind
+            // dup elem if kind==2 (__dup_str) / kind==3 (__dup)
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            body.push(I64_CONST);
+            leb_s(2, &mut body);
+            body.push(I64_EQ);
+            body.push(IF);
+            body.push(BT_VOID);
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body);
+            body.push(I32_WRAP_I64);
+            body.push(CALL);
+            leb_u(dup_str_idx as u64, &mut body);
+            body.push(DROP);
+            body.push(END);
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            body.push(I64_CONST);
+            leb_s(3, &mut body);
+            body.push(I64_EQ);
+            body.push(IF);
+            body.push(BT_VOID);
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body);
+            body.push(I32_WRAP_I64);
+            body.push(CALL);
+            leb_u(dup_idx as u64, &mut body);
+            body.push(DROP);
+            body.push(END);
+            // __drop_array(ptr)
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(CALL);
+            leb_u(drop_array_idx as u64, &mut body);
+            body.push(DROP);
+            // return slot
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body);
+            helper_entry(&[WType::I64, WType::I64, WType::I32], body)
+        }
+        HeapHelper::ArraySet => {
+            // (ptr:i32, i:i64, x:i64) -> ptr:i32. Bounds-check (trap OOB). FBIP:
+            // if rc==1 overwrite in place (drop displaced elem, reuses++); else
+            // copy-on-write: clone (dup retained elems), overwrite slot i, drop
+            // original. Locals: kind(3,i64), n(4,i32), elemaddr(5,i32),
+            // np(6,i32), j(7,i32), s(8,i64), cap(9,i32).
+            // bounds: if i<0 || i>=len trap
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body);
+            body.push(I64_CONST);
+            leb_s(0, &mut body);
+            body.push(0x53); // i64.lt_s
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(8, &mut body); // len
+            body.push(0x59); // i64.ge_s
+            body.push(0x72);
+            body.push(IF);
+            body.push(BT_VOID);
+            body.push(0x00); // unreachable
+            body.push(END);
+            // kind = [ptr+24]
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(24, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(3, &mut body); // kind
+            // if rc==1 { in place } else { COW }
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(0, &mut body);
+            body.push(I64_CONST);
+            leb_s(1, &mut body);
+            body.push(I64_EQ);
+            body.push(IF);
+            body.push(0x7F); // blocktype result = i32 (ptr)
+            // ---- in place ----
+            // elemaddr = ptr + 32 + 8*i
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(I32_CONST);
+            leb_s(ARRAY_HEADER as i64, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body);
+            body.push(I32_WRAP_I64);
+            body.push(I32_CONST);
+            leb_s(SLOT as i64, &mut body);
+            body.push(I32_MUL);
+            body.push(I32_ADD);
+            body.push(LOCAL_SET);
+            leb_u(5, &mut body); // elemaddr
+            // drop displaced elem kind-aware
+            array_drop_elem(&mut body, 3, 5, dup_str_idx, drop_str_idx, drop_idx, dup_idx, true);
+            // [elemaddr] = x
+            body.push(LOCAL_GET);
+            leb_u(5, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body); // x
+            i64_store(0, &mut body);
+            // reuses++
+            body.push(I32_CONST);
+            leb_s(REUSES_ADDR as i64, &mut body);
+            body.push(I32_CONST);
+            leb_s(REUSES_ADDR as i64, &mut body);
+            i64_load(0, &mut body);
+            body.push(I64_CONST);
+            leb_s(1, &mut body);
+            body.push(I64_ADD);
+            i64_store(0, &mut body);
+            // return ptr
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(ELSE);
+            // ---- copy-on-write ----
+            // n = len, cap = n (clone exact size, min 1 handled by alloc cap)
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(8, &mut body);
+            body.push(I32_WRAP_I64);
+            body.push(LOCAL_SET);
+            leb_u(4, &mut body); // n
+            // np = __array_new(kind, n)  (cap = n)
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            body.push(I32_WRAP_I64);
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body);
+            body.push(CALL);
+            leb_u(alloc_array_idx as u64, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(6, &mut body); // np
+            // np.len = n
+            body.push(LOCAL_GET);
+            leb_u(6, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body);
+            body.push(I64_EXTEND_I32_U);
+            i64_store(8, &mut body);
+            // copy & dup-retained: j=0; while j<n { s = old[j]; new[j]=s; if j!=i dup s kind-aware }
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(7, &mut body); // j
+            body.push(0x03); // loop
+            body.push(BT_VOID);
+            body.push(LOCAL_GET);
+            leb_u(7, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body);
+            body.push(0x48); // i32.lt_s
+            body.push(IF);
+            body.push(BT_VOID);
+            // s = old.elems[j]
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(I32_CONST);
+            leb_s(ARRAY_HEADER as i64, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_GET);
+            leb_u(7, &mut body);
+            body.push(I32_CONST);
+            leb_s(SLOT as i64, &mut body);
+            body.push(I32_MUL);
+            body.push(I32_ADD);
+            i64_load(0, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(8, &mut body); // s
+            // new.elems[j] = s
+            body.push(LOCAL_GET);
+            leb_u(6, &mut body);
+            body.push(I32_CONST);
+            leb_s(ARRAY_HEADER as i64, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_GET);
+            leb_u(7, &mut body);
+            body.push(I32_CONST);
+            leb_s(SLOT as i64, &mut body);
+            body.push(I32_MUL);
+            body.push(I32_ADD);
+            body.push(LOCAL_GET);
+            leb_u(8, &mut body);
+            i64_store(0, &mut body);
+            // if j != i: dup s kind-aware (retained in original)
+            body.push(LOCAL_GET);
+            leb_u(7, &mut body);
+            body.push(I64_EXTEND_I32_U);
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body); // i
+            body.push(0x52); // i64.ne
+            body.push(IF);
+            body.push(BT_VOID);
+            array_dup_slot(&mut body, 3, 8, dup_str_idx, dup_idx);
+            body.push(END);
+            // j++
+            body.push(LOCAL_GET);
+            leb_u(7, &mut body);
+            body.push(I32_CONST);
+            leb_s(1, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_SET);
+            leb_u(7, &mut body);
+            body.push(0x0C);
+            leb_u(1, &mut body);
+            body.push(END); // end if j<n
+            body.push(END); // end loop
+            // overwrite new.elems[i] = x
+            body.push(LOCAL_GET);
+            leb_u(6, &mut body);
+            body.push(I32_CONST);
+            leb_s(ARRAY_HEADER as i64, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body);
+            body.push(I32_WRAP_I64);
+            body.push(I32_CONST);
+            leb_s(SLOT as i64, &mut body);
+            body.push(I32_MUL);
+            body.push(I32_ADD);
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body); // x
+            i64_store(0, &mut body);
+            // drop original
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(CALL);
+            leb_u(drop_array_idx as u64, &mut body);
+            body.push(DROP);
+            // return np
+            body.push(LOCAL_GET);
+            leb_u(6, &mut body);
+            body.push(END); // end if rc==1
+            helper_entry(
+                &[WType::I64, WType::I32, WType::I32, WType::I32, WType::I32, WType::I64, WType::I32],
+                body,
+            )
+        }
+        HeapHelper::ArrayPush => {
+            // (ptr:i32, x:i64, kind:i32) -> ptr:i32. If len==0, reconcile header
+            // kind (stale empty arrays). FBIP: if rc==1, grow-if-full in place
+            // (reuses++); else copy-on-write append. Locals: len(3,i32),
+            // cap(4,i32), np(5,i32), ncap(6,i32), j(7,i32), s(8,i64).
+            // if len==0 { [ptr+24] = kind }
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(8, &mut body);
+            body.push(I32_WRAP_I64);
+            body.push(LOCAL_TEE);
+            leb_u(3, &mut body); // len
+            body.push(0x45); // i32.eqz
+            body.push(IF);
+            body.push(BT_VOID);
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body); // kind
+            body.push(I64_EXTEND_I32_U);
+            i64_store(24, &mut body);
+            body.push(END);
+            // cap = [ptr+16]
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(16, &mut body);
+            body.push(I32_WRAP_I64);
+            body.push(LOCAL_SET);
+            leb_u(4, &mut body); // cap
+            // if rc==1 { in-place (grow if full) } else { COW }
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(0, &mut body);
+            body.push(I64_CONST);
+            leb_s(1, &mut body);
+            body.push(I64_EQ);
+            body.push(IF);
+            body.push(0x7F); // result i32
+            // if len < cap { write in place } else { grow }
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body);
+            body.push(0x48); // i32.lt_s
+            body.push(IF);
+            body.push(0x7F);
+            // in place: ptr.elems[len] = x; ptr.len = len+1; reuses++
+            array_store_at(&mut body, 0, 3, 1);
+            array_bump_len(&mut body, 0, 3);
+            array_reuses_inc(&mut body);
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(ELSE);
+            // grow: ncap = cap>0 ? cap*2 : ARRAY_MIN_CAP
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body);
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            body.push(0x4A); // i32.gt_s
+            body.push(IF);
+            body.push(0x7F);
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body);
+            body.push(I32_CONST);
+            leb_s(2, &mut body);
+            body.push(I32_MUL);
+            body.push(ELSE);
+            body.push(I32_CONST);
+            leb_s(ARRAY_MIN_CAP, &mut body);
+            body.push(END);
+            body.push(LOCAL_SET);
+            leb_u(6, &mut body); // ncap
+            // np = __array_new(kind, ncap); np.len = len
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(6, &mut body);
+            body.push(CALL);
+            leb_u(alloc_array_idx as u64, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(5, &mut body); // np
+            body.push(LOCAL_GET);
+            leb_u(5, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            body.push(I64_EXTEND_I32_U);
+            i64_store(8, &mut body);
+            // copy elements raw (ownership transfers; no dup), j=0..len
+            array_copy_loop(&mut body, 0, 5, 3, 7, 8);
+            // np.elems[len] = x; np.len = len+1
+            array_store_at(&mut body, 5, 3, 1);
+            array_bump_len(&mut body, 5, 3);
+            // free old object only (NOT its elements; they moved). cls=cap+2.
+            array_free_shallow(&mut body, 0, 4, free_idx);
+            // reuses++ (grow is still an in-place reuse semantically)
+            array_reuses_inc(&mut body);
+            body.push(LOCAL_GET);
+            leb_u(5, &mut body);
+            body.push(END); // end if len<cap
+            body.push(ELSE);
+            // ---- copy-on-write append ----
+            // ncap = len + 1 (exact)
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            body.push(I32_CONST);
+            leb_s(1, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_SET);
+            leb_u(6, &mut body); // ncap
+            // np = __array_new(kind, ncap); np.len = len
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(6, &mut body);
+            body.push(CALL);
+            leb_u(alloc_array_idx as u64, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(5, &mut body); // np
+            body.push(LOCAL_GET);
+            leb_u(5, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            body.push(I64_EXTEND_I32_U);
+            i64_store(8, &mut body);
+            // copy + dup each retained element (j=0..len)
+            array_copy_dup_loop(&mut body, 0, 5, 3, 7, 8, 2, dup_str_idx, dup_idx);
+            // np.elems[len] = x; np.len = len+1
+            array_store_at(&mut body, 5, 3, 1);
+            array_bump_len(&mut body, 5, 3);
+            // drop original
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(CALL);
+            leb_u(drop_array_idx as u64, &mut body);
+            body.push(DROP);
+            body.push(LOCAL_GET);
+            leb_u(5, &mut body);
+            body.push(END); // end if rc==1
+            helper_entry(
+                &[WType::I32, WType::I32, WType::I32, WType::I32, WType::I32, WType::I64],
+                body,
+            )
+        }
     }
+}
+
+/// Emit code to dup the element slot at `slot_local` (an i64 holding the slot)
+/// kind-aware: kind==2 -> `__dup_str`, kind==3 -> `__dup`. `kind_local` is an
+/// i64 local holding the array's element-kind code.
+fn array_dup_slot(
+    body: &mut Vec<u8>,
+    kind_local: u32,
+    slot_local: u32,
+    dup_str_idx: u32,
+    dup_idx: u32,
+) {
+    // if kind==2 __dup_str(slot)
+    body.push(0x20);
+    leb_u(kind_local as u64, body);
+    body.push(0x42);
+    leb_s(2, body);
+    body.push(0x51); // i64.eq
+    body.push(0x04);
+    body.push(0x40);
+    body.push(0x20);
+    leb_u(slot_local as u64, body);
+    body.push(0xA7); // i32.wrap_i64
+    body.push(0x10);
+    leb_u(dup_str_idx as u64, body);
+    body.push(0x1A);
+    body.push(0x0B);
+    // if kind==3 __dup(slot)
+    body.push(0x20);
+    leb_u(kind_local as u64, body);
+    body.push(0x42);
+    leb_s(3, body);
+    body.push(0x51);
+    body.push(0x04);
+    body.push(0x40);
+    body.push(0x20);
+    leb_u(slot_local as u64, body);
+    body.push(0xA7);
+    body.push(0x10);
+    leb_u(dup_idx as u64, body);
+    body.push(0x1A);
+    body.push(0x0B);
+}
+
+/// Emit code to kind-aware DROP the element currently stored at the address held
+/// in `addr_local` (the displaced element in an in-place set). `kind_local` is an
+/// i64 local with the element-kind code. `_with_load` is always true here; the
+/// element pointer is loaded from `[addr_local]`. Uses a scratch by re-loading.
+#[allow(clippy::too_many_arguments)]
+fn array_drop_elem(
+    body: &mut Vec<u8>,
+    kind_local: u32,
+    addr_local: u32,
+    _dup_str_idx: u32,
+    drop_str_idx: u32,
+    drop_idx: u32,
+    _dup_idx: u32,
+    _with_load: bool,
+) {
+    // if kind==2 __drop_str([addr]) ; if kind==3 __drop([addr])
+    // kind==2
+    body.push(0x20);
+    leb_u(kind_local as u64, body);
+    body.push(0x42);
+    leb_s(2, body);
+    body.push(0x51);
+    body.push(0x04);
+    body.push(0x40);
+    body.push(0x20);
+    leb_u(addr_local as u64, body);
+    body.push(0x29); // i64.load
+    leb_u(3, body);
+    leb_u(0, body);
+    body.push(0xA7);
+    body.push(0x10);
+    leb_u(drop_str_idx as u64, body);
+    body.push(0x1A);
+    body.push(0x0B);
+    // kind==3
+    body.push(0x20);
+    leb_u(kind_local as u64, body);
+    body.push(0x42);
+    leb_s(3, body);
+    body.push(0x51);
+    body.push(0x04);
+    body.push(0x40);
+    body.push(0x20);
+    leb_u(addr_local as u64, body);
+    body.push(0x29);
+    leb_u(3, body);
+    leb_u(0, body);
+    body.push(0xA7);
+    body.push(0x10);
+    leb_u(drop_idx as u64, body);
+    body.push(0x1A);
+    body.push(0x0B);
+}
+
+/// `arr.elems[len_local] = x_local` where `arr_local` holds the array ptr.
+fn array_store_at(body: &mut Vec<u8>, arr_local: u32, idx_local: u32, x_local: u32) {
+    body.push(0x20);
+    leb_u(arr_local as u64, body);
+    body.push(0x41);
+    leb_s(ARRAY_HEADER as i64, body);
+    body.push(0x6A); // i32.add
+    body.push(0x20);
+    leb_u(idx_local as u64, body);
+    body.push(0x41);
+    leb_s(SLOT as i64, body);
+    body.push(0x6C); // i32.mul
+    body.push(0x6A); // i32.add
+    body.push(0x20);
+    leb_u(x_local as u64, body);
+    body.push(0x37); // i64.store
+    leb_u(3, body);
+    leb_u(0, body);
+}
+
+/// `arr.len = len_local + 1` (arr_local holds the ptr; len_local the OLD length).
+fn array_bump_len(body: &mut Vec<u8>, arr_local: u32, len_local: u32) {
+    body.push(0x20);
+    leb_u(arr_local as u64, body);
+    body.push(0x20);
+    leb_u(len_local as u64, body);
+    body.push(0x41);
+    leb_s(1, body);
+    body.push(0x6A); // i32.add
+    body.push(0xAD); // i64.extend_i32_u
+    body.push(0x37); // i64.store [arr+8]
+    leb_u(3, body);
+    leb_u(8, body);
+}
+
+/// `__reuses++`.
+fn array_reuses_inc(body: &mut Vec<u8>) {
+    body.push(0x41);
+    leb_s(REUSES_ADDR as i64, body);
+    body.push(0x41);
+    leb_s(REUSES_ADDR as i64, body);
+    body.push(0x29);
+    leb_u(3, body);
+    leb_u(0, body);
+    body.push(0x42);
+    leb_s(1, body);
+    body.push(0x7C); // i64.add
+    body.push(0x37);
+    leb_u(3, body);
+    leb_u(0, body);
+}
+
+/// Copy `len_local` element slots from `src_local` to `dst_local`, raw (no dup).
+/// `j_local`/`s_local` are scratch i32/i64 locals.
+fn array_copy_loop(
+    body: &mut Vec<u8>,
+    src_local: u32,
+    dst_local: u32,
+    len_local: u32,
+    j_local: u32,
+    s_local: u32,
+) {
+    body.push(0x41);
+    leb_s(0, body);
+    body.push(0x21);
+    leb_u(j_local as u64, body);
+    body.push(0x03);
+    body.push(0x40); // loop
+    body.push(0x20);
+    leb_u(j_local as u64, body);
+    body.push(0x20);
+    leb_u(len_local as u64, body);
+    body.push(0x48); // i32.lt_s
+    body.push(0x04);
+    body.push(0x40);
+    // s = src.elems[j]
+    body.push(0x20);
+    leb_u(src_local as u64, body);
+    body.push(0x41);
+    leb_s(ARRAY_HEADER as i64, body);
+    body.push(0x6A);
+    body.push(0x20);
+    leb_u(j_local as u64, body);
+    body.push(0x41);
+    leb_s(SLOT as i64, body);
+    body.push(0x6C);
+    body.push(0x6A);
+    body.push(0x29);
+    leb_u(3, body);
+    leb_u(0, body);
+    body.push(0x21);
+    leb_u(s_local as u64, body);
+    // dst.elems[j] = s
+    array_store_at(body, dst_local, j_local, s_local);
+    // j++
+    body.push(0x20);
+    leb_u(j_local as u64, body);
+    body.push(0x41);
+    leb_s(1, body);
+    body.push(0x6A);
+    body.push(0x21);
+    leb_u(j_local as u64, body);
+    body.push(0x0C);
+    leb_u(1, body);
+    body.push(0x0B); // end if
+    body.push(0x0B); // end loop
+}
+
+/// Copy + kind-aware dup each of `len_local` elements from src to dst.
+#[allow(clippy::too_many_arguments)]
+fn array_copy_dup_loop(
+    body: &mut Vec<u8>,
+    src_local: u32,
+    dst_local: u32,
+    len_local: u32,
+    j_local: u32,
+    s_local: u32,
+    kind_local: u32,
+    dup_str_idx: u32,
+    dup_idx: u32,
+) {
+    body.push(0x41);
+    leb_s(0, body);
+    body.push(0x21);
+    leb_u(j_local as u64, body);
+    body.push(0x03);
+    body.push(0x40);
+    body.push(0x20);
+    leb_u(j_local as u64, body);
+    body.push(0x20);
+    leb_u(len_local as u64, body);
+    body.push(0x48);
+    body.push(0x04);
+    body.push(0x40);
+    // s = src.elems[j]
+    body.push(0x20);
+    leb_u(src_local as u64, body);
+    body.push(0x41);
+    leb_s(ARRAY_HEADER as i64, body);
+    body.push(0x6A);
+    body.push(0x20);
+    leb_u(j_local as u64, body);
+    body.push(0x41);
+    leb_s(SLOT as i64, body);
+    body.push(0x6C);
+    body.push(0x6A);
+    body.push(0x29);
+    leb_u(3, body);
+    leb_u(0, body);
+    body.push(0x21);
+    leb_u(s_local as u64, body);
+    array_store_at(body, dst_local, j_local, s_local);
+    // dup s kind-aware. kind_local here is an i32 param/local; widen to i64
+    // by storing into a temp is unnecessary — array_dup_slot expects an i64
+    // kind local, but our push kind is i32. Inline an i32-kind variant:
+    // if kind==2 __dup_str(s); if kind==3 __dup(s).
+    body.push(0x20);
+    leb_u(kind_local as u64, body);
+    body.push(0x41);
+    leb_s(2, body);
+    body.push(0x46); // i32.eq
+    body.push(0x04);
+    body.push(0x40);
+    body.push(0x20);
+    leb_u(s_local as u64, body);
+    body.push(0xA7);
+    body.push(0x10);
+    leb_u(dup_str_idx as u64, body);
+    body.push(0x1A);
+    body.push(0x0B);
+    body.push(0x20);
+    leb_u(kind_local as u64, body);
+    body.push(0x41);
+    leb_s(3, body);
+    body.push(0x46);
+    body.push(0x04);
+    body.push(0x40);
+    body.push(0x20);
+    leb_u(s_local as u64, body);
+    body.push(0xA7);
+    body.push(0x10);
+    leb_u(dup_idx as u64, body);
+    body.push(0x1A);
+    body.push(0x0B);
+    // j++
+    body.push(0x20);
+    leb_u(j_local as u64, body);
+    body.push(0x41);
+    leb_s(1, body);
+    body.push(0x6A);
+    body.push(0x21);
+    leb_u(j_local as u64, body);
+    body.push(0x0C);
+    leb_u(1, body);
+    body.push(0x0B);
+    body.push(0x0B);
+}
+
+/// Free the array object at `arr_local` WITHOUT dropping its elements (used when
+/// the elements have moved into a new object during an in-place grow). cls is
+/// recomputed from `cap_local` (= cap + 2, clamped). Also decrements `__live`
+/// via `__free`. `free_idx` is the `__free` wasm index.
+fn array_free_shallow(body: &mut Vec<u8>, arr_local: u32, cap_local: u32, free_idx: u32) {
+    // __free(ptr, cls) where cls = clamp(cap+2, MAX). The clamp is computed
+    // branchlessly as cls - (cls>MAX)*(cls-MAX) so no scratch local is needed.
+    let push_cls = |b: &mut Vec<u8>| {
+        b.push(0x20);
+        leb_u(cap_local as u64, b);
+        b.push(0x41);
+        leb_s(2, b);
+        b.push(0x6A); // cap + 2
+    };
+    body.push(0x20);
+    leb_u(arr_local as u64, body); // ptr (1st __free arg)
+    push_cls(body); // cls
+    push_cls(body);
+    body.push(0x41);
+    leb_s(TENSOR_MAX_CLASS as i64, body);
+    body.push(0x4B); // (cls > MAX) as i32 0/1
+    push_cls(body);
+    body.push(0x41);
+    leb_s(TENSOR_MAX_CLASS as i64, body);
+    body.push(0x6B); // cls - MAX
+    body.push(0x6C); // (cls>MAX) * (cls-MAX)
+    body.push(0x6B); // cls - that  -> clamped
+    body.push(0x10);
+    leb_u(free_idx as u64, body);
+    body.push(0x1A); // drop dummy
 }
 
 /// Emit a byte-copy loop: `while i < <len_local> { dst[16 + i] = src[16 + i]; i++ }`,
@@ -5648,6 +7001,7 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
         // dup'ing the reference-counted ones so the body owns them.
         let dup_idx = env.heap_index(HeapHelper::Dup);
         let dup_str_idx = env.heap_index(HeapHelper::DupStr);
+        let dup_array_idx = env.heap_index(HeapHelper::DupArray);
         for (i, (cn, ct)) in ifn.captures.iter().zip(layout.cap_wtys.iter()).enumerate() {
             env.add_local(cn, *ct);
             let slot = env.var_index(cn)?;
@@ -5657,7 +7011,7 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
             match ct {
                 WType::F64 => f64_load(off, &mut body_code),
                 WType::I64 => i64_load(off, &mut body_code),
-                WType::I32 | WType::Ref | WType::Str | WType::Tensor => {
+                WType::I32 | WType::Ref | WType::Str | WType::Tensor | WType::Array(_) => {
                     i64_load(off, &mut body_code);
                     body_code.push(0xA7); // i32.wrap_i64
                 }
@@ -5678,6 +7032,13 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
                     leb_u(slot as u64, &mut body_code);
                     body_code.push(0x10);
                     leb_u(dup_str_idx as u64, &mut body_code);
+                    body_code.push(0x1A); // drop dummy
+                }
+                WType::Array(_) => {
+                    body_code.push(0x20);
+                    leb_u(slot as u64, &mut body_code);
+                    body_code.push(0x10);
+                    leb_u(dup_array_idx as u64, &mut body_code);
                     body_code.push(0x1A); // drop dummy
                 }
                 _ => {}
@@ -5728,7 +7089,7 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
                 .cap_wtys
                 .iter()
                 .enumerate()
-                .filter(|(_, t)| matches!(t, WType::Ref | WType::Str))
+                .filter(|(_, t)| matches!(t, WType::Ref | WType::Str | WType::Array(_)))
                 .map(|(i, t)| (i, *t))
                 .collect(),
         })
@@ -6386,6 +7747,67 @@ mod tests {
              type L = | Nil | Cons(P, L)\n\
              fn cnt(xs: L) -> Int = match xs { Nil => 0, Cons(_, r) => 1 + cnt(r), }\n\
              fn main() -> Int = cnt(Cons(P(1.0, 2.0), Cons(P(3.0, 4.0), Nil)))",
+        );
+    }
+
+    #[test]
+    fn array_int_set_get_matches_and_is_garbage_free() {
+        // array_set on a unique literal array (FBIP in-place), then index it.
+        // -> 139, and the heap ends garbage-free (the consumed array is freed).
+        differential_heap(
+            "fn main() -> Int = { let a = array_set([10,20,30], 1, 99); a[0] + a[1] + a[2] }",
+        );
+        // Copy-on-write set: the original `a` is still live when `b` is derived
+        // from it, so array_set clones. Both arrays end up freed (no leak).
+        differential_heap(
+            "fn main() -> Int = { let a = [1,2,3]; let b = array_set(a, 0, 99); \
+             a[0] + a[1] + a[2] + b[0] + b[1] + b[2] }",
+        );
+    }
+
+    #[test]
+    fn array_build_by_push_then_sum_is_garbage_free() {
+        // Start from an empty array (array_new), push 10 elements (FBIP grow in
+        // place — exercises the empty/cap-0 grow-to-min-cap path), then fold.
+        // -> 55, garbage-free.
+        differential_heap(
+            "fn build(n: Int, a: Array[Int]) -> Array[Int] = \
+               if n==0 {a} else {build(n-1, array_push(a,n))}\n\
+             fn sum(a: Array[Int], i: Int, acc: Int) -> Int = \
+               if i==array_len(a) {acc} else {sum(a,i+1,acc+a[i])}\n\
+             fn main() -> Int = sum(build(10, array_new()), 0, 0)",
+        );
+    }
+
+    #[test]
+    fn array_of_string_built_indexed_and_garbage_free() {
+        // Build an Array[String] by push (each element is a heap String ref:
+        // exercises kind-aware element dup on copy and recursive drop), then
+        // index it. Returning the total byte-length keeps the result an Int.
+        differential_heap(
+            "fn build(n: Int, a: Array[String]) -> Array[String] = \
+               if n==0 {a} else {build(n-1, array_push(a, int_to_str(n)))}\n\
+             fn len_at(a: Array[String], i: Int, acc: Int) -> Int = \
+               if i==array_len(a) {acc} else {len_at(a, i+1, acc+1)}\n\
+             fn main() -> Int = len_at(build(5, array_new()), 0, 0)",
+        );
+        // array_set on a String array (the displaced String element is dropped;
+        // copy-on-write dups the retained String refs) — must be garbage-free.
+        differential_heap(
+            "fn main() -> Int = { \
+               let a = [\"hi\", \"there\", \"world\"]; \
+               let b = array_set(a, 1, \"THERE\"); \
+               array_len(a) + array_len(b) }",
+        );
+    }
+
+    #[test]
+    fn array_of_float_is_garbage_free() {
+        // A Float array (elements stored as f64 bits in the i64 slot): build by
+        // push, sum two elements. main -> Float compared by exact f64 bits.
+        differential_float(
+            "fn main() -> Float = { \
+               let a = array_push(array_push(array_new(), 1.5), 2.25); a[0] + a[1] }",
         );
     }
 

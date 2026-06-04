@@ -145,7 +145,18 @@ const IR_BUILTINS: &[&str] = &[
     "print_str",
     "concat",
     "int_to_str",
+    // Arrays: heap-allocated, reference-counted `$Array` cells handled directly
+    // by the IR interpreter (see `array_builtin`), with FBIP in-place reuse.
+    "array_new",
+    "array_len",
+    "array_get",
+    "array_set",
+    "array_push",
 ];
+
+/// Heap-cell constructor tag for a functional array. Starts with `$` so it can
+/// never collide with a user constructor (those are uppercase identifiers).
+const ARRAY_TAG: &str = "$Array";
 
 /// Builtins the IR interpreter does NOT evaluate, but which the WASM backend
 /// *does* compile (Phase 2f: tensor ops + `embed_similarity`). Lowering lets
@@ -208,6 +219,11 @@ pub(crate) fn pattern_vars(p: &Pattern, acc: &mut std::collections::HashSet<Stri
                 pattern_vars(s, acc);
             }
         }
+        Pattern::Record(_, fields) => {
+            for (_, s) in fields {
+                pattern_vars(s, acc);
+            }
+        }
     }
 }
 
@@ -242,6 +258,18 @@ pub(crate) fn ast_free(e: &Expr, bound: &std::collections::HashSet<String>, acc:
             ast_free(callee, bound, acc);
             for a in args {
                 ast_free(a, bound, acc);
+            }
+        }
+        Expr::Record(_, fields) => {
+            for (_, v) in fields {
+                ast_free(v, bound, acc);
+            }
+        }
+        Expr::Field(obj, _) => ast_free(obj, bound, acc),
+        Expr::Update(base, updates) => {
+            ast_free(base, bound, acc);
+            for (_, v) in updates {
+                ast_free(v, bound, acc);
             }
         }
         Expr::Unary(_, inner) => ast_free(inner, bound, acc),
@@ -343,6 +371,23 @@ impl Lowerer {
             Expr::Bool(b) => Ok(Atom::Bool(*b)),
             Expr::Str(s) => Ok(Atom::Str(s.clone())),
             Expr::Unit => Ok(Atom::Unit),
+            // Records are interpreter-only so far; the IR/compiled backends do
+            // not lower them yet (cleanly rejected, like tensors/arrays).
+            Expr::Record(name, _) => Err(LowerError(format!(
+                "records are not yet supported in the IR/compiled backends \
+                 (use the interpreter `aria run`): record `{}`",
+                name
+            ))),
+            Expr::Field(_, field) => Err(LowerError(format!(
+                "record field access `.{}` is not yet supported in the IR/compiled \
+                 backends (use the interpreter `aria run`)",
+                field
+            ))),
+            Expr::Update(_, _) => Err(LowerError(
+                "record update `{ r | .. }` is not yet supported in the IR/compiled \
+                 backends (use the interpreter `aria run`)"
+                    .to_string(),
+            )),
             Expr::Var(n) => {
                 // A bare top-level function name in value position (it would be an
                 // `Expr::Call` if it were applied) becomes a closure over a
@@ -397,8 +442,17 @@ impl Lowerer {
                 // scope before the global function table, so a local shadows any
                 // same-named top-level function. A non-local name that is neither a
                 // top-level function nor a builtin is likewise a local `Fn` value.
-                if self.bound.contains(name)
-                    || (!self.fn_arities.contains_key(name) && crate::builtins::lookup(name).is_none())
+                // Array builtins are routed to `Bind::Call`, not a closure value:
+                // `array_lit` is a variadic internal builtin with no
+                // `builtins::lookup` signature, and after monomorphization every
+                // array op is renamed with an element-kind suffix (`array_get$i`,
+                // `array_lit$r`, ...) which also has no `lookup` signature. The IR
+                // interpreter's `array_builtin` (unsuffixed) and the native/wasm
+                // backends (suffixed) handle them.
+                if !name.starts_with("array_")
+                    && (self.bound.contains(name)
+                        || (!self.fn_arities.contains_key(name)
+                            && crate::builtins::lookup(name).is_none()))
                 {
                     let atoms = self.lower_all(args, stmts)?;
                     let t = self.fresh();
@@ -805,8 +859,20 @@ pub enum IValue {
     Token(Option<usize>),
 }
 
+/// Discriminant for the kind of heap cell. The interpreter dispatches on this
+/// (e.g. how `render` prints the cell) instead of string-comparing the `ctor`
+/// tag, so each new cell shape (records, maps, …) is forced to be handled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CellKind {
+    /// An ADT constructor or closure cell; `ctor` holds its tag name.
+    Data,
+    /// A functional array; `ctor` is `ARRAY_TAG`, `fields` are its elements.
+    Array,
+}
+
 #[derive(Debug, Clone)]
 struct Cell {
+    kind: CellKind,
     ctor: String,
     fields: Vec<IValue>,
     rc: u32,
@@ -899,11 +965,18 @@ impl IrInterp {
             IValue::Token(_) => "<token>".to_string(), // never a program result
             IValue::Ref(a) => {
                 let c = self.heap[*a].as_ref().expect("render: freed cell escaped");
-                if c.fields.is_empty() {
-                    c.ctor.clone()
-                } else {
-                    let inner: Vec<String> = c.fields.iter().map(|f| self.render(f)).collect();
-                    format!("{}({})", c.ctor, inner.join(", "))
+                match c.kind {
+                    CellKind::Array => {
+                        // Match interp::Value::Array display exactly: `[1, 2, 3]`
+                        // (and `[]` for the empty array).
+                        let inner: Vec<String> = c.fields.iter().map(|f| self.render(f)).collect();
+                        format!("[{}]", inner.join(", "))
+                    }
+                    CellKind::Data if c.fields.is_empty() => c.ctor.clone(),
+                    CellKind::Data => {
+                        let inner: Vec<String> = c.fields.iter().map(|f| self.render(f)).collect();
+                        format!("{}({})", c.ctor, inner.join(", "))
+                    }
                 }
             }
         }
@@ -933,20 +1006,13 @@ impl IrInterp {
                     e = body;
                 }
                 IExpr::Dup(v, body) => {
-                    if let IValue::Ref(a) = self.atom(&Atom::Var(v.clone()), &env)? {
-                        match &mut self.heap[a] {
-                            Some(cell) => cell.rc += 1,
-                            None => return Err(format!("ir: dup of freed cell `{}`", v)),
-                        }
-                        self.metrics.dups += 1;
-                    }
+                    let val = self.atom(&Atom::Var(v.clone()), &env)?;
+                    self.dup_value(&val)?;
                     e = body;
                 }
                 IExpr::Drop(v, body) => {
-                    if let IValue::Ref(a) = self.atom(&Atom::Var(v.clone()), &env)? {
-                        self.metrics.drops += 1;
-                        self.drop_cell(a)?;
-                    }
+                    let val = self.atom(&Atom::Var(v.clone()), &env)?;
+                    self.drop_value(&val)?;
                     e = body;
                 }
                 IExpr::DropReuse(scrut, tok, body) => {
@@ -1047,6 +1113,152 @@ impl IrInterp {
         Ok(())
     }
 
+    /// Allocate a heap cell, updating allocation metrics; returns its address.
+    fn push_cell(&mut self, kind: CellKind, ctor: &str, fields: Vec<IValue>) -> usize {
+        self.metrics.allocations += 1;
+        self.metrics.live += 1;
+        self.metrics.peak_live = self.metrics.peak_live.max(self.metrics.live);
+        self.heap.push(Some(Cell { kind, ctor: ctor.to_string(), fields, rc: 1 }));
+        self.heap.len() - 1
+    }
+
+    /// Increment a value's refcount if it is a heap reference (no-op otherwise).
+    fn dup_value(&mut self, v: &IValue) -> Result<(), String> {
+        if let IValue::Ref(a) = v {
+            match &mut self.heap[*a] {
+                Some(c) => c.rc += 1,
+                None => return Err("ir: dup of freed cell".into()),
+            }
+            self.metrics.dups += 1;
+        }
+        Ok(())
+    }
+
+    /// Drop a value (consuming a reference) if it is a heap reference.
+    fn drop_value(&mut self, v: &IValue) -> Result<(), String> {
+        if let IValue::Ref(a) = v {
+            self.metrics.drops += 1;
+            self.drop_cell(*a)?;
+        }
+        Ok(())
+    }
+
+    /// Array builtins. A `Bind::Call` transfers ownership of its argument Refs to
+    /// the callee, so these consume (drop) the array argument and any consumed
+    /// element, and produce an owned result — keeping the RC pass's dup/drop
+    /// balanced. `set`/`push` perform FBIP in-place reuse when the array is
+    /// uniquely owned (rc == 1), else copy-on-write. Returns `Ok(None)` if `name`
+    /// is not an array builtin.
+    fn array_builtin(&mut self, name: &str, args: &[IValue]) -> Result<Option<IValue>, String> {
+        let as_ref = |v: &IValue| -> Result<usize, String> {
+            match v {
+                IValue::Ref(a) => Ok(*a),
+                _ => Err("ir: array builtin expected an array".into()),
+            }
+        };
+        let as_int = |v: &IValue| -> Result<i64, String> {
+            match v {
+                IValue::Int(n) => Ok(*n),
+                _ => Err("ir: array builtin expected an Int index".into()),
+            }
+        };
+        match name {
+            "array_new" => Ok(Some(IValue::Ref(self.push_cell(CellKind::Array, ARRAY_TAG, Vec::new())))),
+            "array_lit" => {
+                // Array literal desugared (by the parser) to a single flat call
+                // with all elements as arguments. A `Bind::Call` transfers
+                // ownership of its argument Refs in, so each element is moved
+                // straight into the new array cell — do NOT dup them. Builds
+                // exactly one cell (an empty literal builds an empty array).
+                let fields: Vec<IValue> = args.to_vec();
+                Ok(Some(IValue::Ref(self.push_cell(CellKind::Array, ARRAY_TAG, fields))))
+            }
+            "array_len" => {
+                let addr = as_ref(&args[0])?;
+                let len = self.heap[addr].as_ref().ok_or("ir: array_len use-after-free")?.fields.len();
+                self.drop_value(&IValue::Ref(addr))?; // consume the array arg
+                Ok(Some(IValue::Int(len as i64)))
+            }
+            "array_get" => {
+                let addr = as_ref(&args[0])?;
+                let i = as_int(&args[1])?;
+                let cell = self.heap[addr].as_ref().ok_or("ir: array_get use-after-free")?;
+                if i < 0 || i as usize >= cell.fields.len() {
+                    return Err(format!(
+                        "ir: array_get index {} out of range for array of length {}",
+                        i,
+                        cell.fields.len()
+                    ));
+                }
+                let elem = cell.fields[i as usize].clone();
+                // The element is still owned by the array; give the caller its own
+                // reference, then release the (consumed) array.
+                self.dup_value(&elem)?;
+                self.drop_value(&IValue::Ref(addr))?;
+                Ok(Some(elem))
+            }
+            "array_set" => {
+                let addr = as_ref(&args[0])?;
+                let i = as_int(&args[1])?;
+                let x = args[2].clone();
+                let len = self.heap[addr].as_ref().ok_or("ir: array_set use-after-free")?.fields.len();
+                if i < 0 || i as usize >= len {
+                    return Err(format!(
+                        "ir: array_set index {} out of range for array of length {}",
+                        i, len
+                    ));
+                }
+                let unique = self.heap[addr].as_ref().unwrap().rc == 1;
+                if unique {
+                    // FBIP: overwrite in place (x's ownership moves in); drop the
+                    // displaced element. No allocation, no change to live count.
+                    let old = std::mem::replace(
+                        &mut self.heap[addr].as_mut().unwrap().fields[i as usize],
+                        x,
+                    );
+                    self.drop_value(&old)?;
+                    self.metrics.reuses += 1;
+                    Ok(Some(IValue::Ref(addr)))
+                } else {
+                    // Copy-on-write: dup every retained field, move x into slot i
+                    // (the original's old element stays with the still-shared
+                    // original), then release our reference to the original.
+                    let fields = self.heap[addr].as_ref().unwrap().fields.clone();
+                    for (j, f) in fields.iter().enumerate() {
+                        if j != i as usize {
+                            self.dup_value(f)?;
+                        }
+                    }
+                    let mut newfields = fields;
+                    newfields[i as usize] = x;
+                    let naddr = self.push_cell(CellKind::Array, ARRAY_TAG, newfields);
+                    self.drop_value(&IValue::Ref(addr))?;
+                    Ok(Some(IValue::Ref(naddr)))
+                }
+            }
+            "array_push" => {
+                let addr = as_ref(&args[0])?;
+                let x = args[1].clone();
+                let unique = self.heap[addr].as_ref().ok_or("ir: array_push use-after-free")?.rc == 1;
+                if unique {
+                    self.heap[addr].as_mut().unwrap().fields.push(x);
+                    self.metrics.reuses += 1;
+                    Ok(Some(IValue::Ref(addr)))
+                } else {
+                    let mut fields = self.heap[addr].as_ref().unwrap().fields.clone();
+                    for f in &fields {
+                        self.dup_value(f)?;
+                    }
+                    fields.push(x);
+                    let naddr = self.push_cell(CellKind::Array, ARRAY_TAG, fields);
+                    self.drop_value(&IValue::Ref(addr))?;
+                    Ok(Some(IValue::Ref(naddr)))
+                }
+            }
+            _ => Ok(None),
+        }
+    }
+
     fn eval_bind(&mut self, bind: &Bind, env: &Env) -> Result<IValue, String> {
         match bind {
             Bind::Atom(a) => self.atom(a, env),
@@ -1095,11 +1307,7 @@ impl IrInterp {
             }
             Bind::Ctor(name, args) => {
                 let fields = args.iter().map(|a| self.atom(a, env)).collect::<Result<_, _>>()?;
-                self.metrics.allocations += 1;
-                self.metrics.live += 1;
-                self.metrics.peak_live = self.metrics.peak_live.max(self.metrics.live);
-                self.heap.push(Some(Cell { ctor: name.clone(), fields, rc: 1 }));
-                Ok(IValue::Ref(self.heap.len() - 1))
+                Ok(IValue::Ref(self.push_cell(CellKind::Data, name, fields)))
             }
             Bind::CtorReuse(tok, name, args) => {
                 let fields: Vec<IValue> =
@@ -1108,22 +1316,24 @@ impl IrInterp {
                     IValue::Token(Some(addr)) => {
                         // Reuse the freed slot in place — no allocation.
                         self.metrics.reuses += 1;
-                        self.heap[addr] = Some(Cell { ctor: name.clone(), fields, rc: 1 });
+                        self.heap[addr] = Some(Cell { kind: CellKind::Data, ctor: name.clone(), fields, rc: 1 });
                         Ok(IValue::Ref(addr))
                     }
                     _ => {
                         // Token empty (cell was shared): allocate fresh.
-                        self.metrics.allocations += 1;
-                        self.metrics.live += 1;
-                        self.metrics.peak_live = self.metrics.peak_live.max(self.metrics.live);
-                        self.heap.push(Some(Cell { ctor: name.clone(), fields, rc: 1 }));
-                        Ok(IValue::Ref(self.heap.len() - 1))
+                        Ok(IValue::Ref(self.push_cell(CellKind::Data, name, fields)))
                     }
                 }
             }
             Bind::Call(name, args) => {
                 let vals: Vec<IValue> =
                     args.iter().map(|a| self.atom(a, env)).collect::<Result<_, _>>()?;
+                // Array builtins manage heap cells + reference counts directly
+                // (they need `&mut self`), so they are handled here rather than in
+                // the `&self` `builtin` helper used for the unboxed builtins.
+                if let Some(v) = self.array_builtin(name, &vals)? {
+                    return Ok(v);
+                }
                 if let Some(v) = self.builtin(name, &vals)? {
                     return Ok(v);
                 }
@@ -1187,11 +1397,7 @@ impl IrInterp {
             // name and whose fields are the captured values — exactly like `Ctor`.
             Bind::MakeClosure(lam, caps) => {
                 let fields = caps.iter().map(|a| self.atom(a, env)).collect::<Result<_, _>>()?;
-                self.metrics.allocations += 1;
-                self.metrics.live += 1;
-                self.metrics.peak_live = self.metrics.peak_live.max(self.metrics.live);
-                self.heap.push(Some(Cell { ctor: lam.clone(), fields, rc: 1 }));
-                Ok(IValue::Ref(self.heap.len() - 1))
+                Ok(IValue::Ref(self.push_cell(CellKind::Data, lam, fields)))
             }
             // Apply a closure: read its lambda tag, bind the captured fields plus
             // the argument atoms, and run the lifted lambda body. The captures are

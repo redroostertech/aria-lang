@@ -69,6 +69,9 @@ struct CtorInfo {
     type_params: Vec<String>,
     fields: Vec<Ty>,
     tyname: String,
+    /// `Some(names)` iff a record constructor — used to desugar `Expr::Record`/
+    /// `Field`/`Update` and `Pattern::Record` to positional form.
+    field_names: Option<Vec<String>>,
 }
 
 #[derive(Clone)]
@@ -113,6 +116,7 @@ impl<'a> Mono<'a> {
                                 type_params: t.params.clone(),
                                 fields: v.fields.clone(),
                                 tyname: t.name.clone(),
+                                field_names: v.field_names.clone(),
                             },
                         );
                     }
@@ -264,6 +268,15 @@ impl<'a> Mono<'a> {
                 None => Err(format!("monomorphize: unbound type variable `{}`", n)),
             },
             Ty::Named(n, args) if args.is_empty() => Ok(Ty::Named(n.clone(), Vec::new())),
+            // `Array` is a builtin generic, not a user ADT: keep it as
+            // `Array[concrete-elem]` (the backends recognize it and the
+            // element-kind call suffix carries the element type). Do NOT mangle
+            // its name or enqueue it as a type to specialize.
+            Ty::Named(n, args) if n == "Array" => {
+                let cargs: Vec<Ty> =
+                    args.iter().map(|a| self.subst_ty(a, map)).collect::<Result<_, _>>()?;
+                Ok(Ty::Named("Array".to_string(), cargs))
+            }
             Ty::Named(n, args) => {
                 let cargs: Vec<Ty> = args
                     .iter()
@@ -330,8 +343,18 @@ impl<'a> Mono<'a> {
                 fields.push(self.subst_ty(ft, &map)?);
             }
             variants.push(Variant {
-                name: Self::mangle_ctor_name(&v.name, &mangled),
+                // Match the constructor names emitted by the `Ctor` arm and
+                // `rewrite_pattern`: non-generic types keep their original ctor
+                // names; only generic instantiations are mangled. (Previously this
+                // always mangled, breaking any non-generic ADT — records included
+                // — referenced inside a program that also uses generics.)
+                name: if args.is_empty() {
+                    v.name.clone()
+                } else {
+                    Self::mangle_ctor_name(&v.name, &mangled)
+                },
                 fields,
+                field_names: v.field_names.clone(),
             });
         }
         let decl = TypeDecl {
@@ -419,6 +442,15 @@ impl<'a> Mono<'a> {
                 _ => None,
             },
             Ty::Named(n, args) if args.is_empty() => Some(Ty::Named(n.clone(), Vec::new())),
+            // `Array` is a builtin generic: keep it as `Array[concrete-elem]`,
+            // never ADT-mangle (see `subst_ty`).
+            Ty::Named(n, args) if n == "Array" => {
+                let cargs: Vec<Ty> = args
+                    .iter()
+                    .map(|a| self.subst_ty_partial(a, sub))
+                    .collect::<Option<_>>()?;
+                Some(Ty::Named("Array".to_string(), cargs))
+            }
             Ty::Named(n, args) => {
                 let cargs: Vec<Ty> = args
                     .iter()
@@ -472,6 +504,9 @@ impl<'a> Mono<'a> {
                 let lt = self.synth_ty(l, env)?;
                 Some(binary_ret(*op, &lt))
             }
+            // Records are interpreter-only so far; the compiled pipeline does not
+            // type or lower them (cleanly rejected in `rewrite_expr`).
+            Expr::Record(..) | Expr::Field(..) | Expr::Update(..) => None,
             Expr::Ctor(name, args) => {
                 // Only synthesizable if every owning type parameter is pinned by
                 // the constructor's own field types (no expected-type context
@@ -493,12 +528,33 @@ impl<'a> Mono<'a> {
                 Some(Ty::Named(self.mangle_type_name(&sig.tyname, &targs), Vec::new()))
             }
             Expr::Call(name, args) => {
+                // `array_lit` (variadic array-literal desugaring): the element
+                // type is the first argument's synthesized type.
+                if name == "array_lit" {
+                    let elem = match args.first() {
+                        Some(a) => self.synth_ty(a, env)?,
+                        None => return None,
+                    };
+                    return Some(Ty::Named("Array".to_string(), vec![elem]));
+                }
                 if !self.fns.contains_key(name) {
                     let mut arg_tys = Vec::new();
                     for a in args {
                         arg_tys.push(self.synth_ty(a, env)?);
                     }
-                    return Some(builtin_ret(name, &arg_tys));
+                    let mut rt = builtin_ret(name, &arg_tys);
+                    // Generic builtin: substitute its type vars from the concrete
+                    // argument types so the seed type is var-free.
+                    if contains_var(&rt) {
+                        if let Some((sig_params, _)) = crate::builtins::lookup(name) {
+                            let mut sub: HashMap<String, Ty> = HashMap::new();
+                            for (pt, at) in sig_params.iter().zip(arg_tys.iter()) {
+                                let _ = self.unify_decl(pt, at, &mut sub);
+                            }
+                            rt = resolve(&rt, &sub);
+                        }
+                    }
+                    return Some(rt);
                 }
                 let info = self.fns.get(name).cloned()?;
                 let mut sub: HashMap<String, Ty> = HashMap::new();
@@ -556,6 +612,104 @@ impl<'a> Mono<'a> {
     /// surrounding context requires, if known — it lets under-constrained
     /// generic constructors (e.g. nullary `Nil`) and calls recover type args
     /// that their arguments alone cannot pin down.
+    /// Given a concrete (possibly mangled) record type, return its constructor
+    /// name (mangled to match the `Ctor` arm / `rewrite_pattern`), its declared
+    /// field names, and the concrete field types. Used to desugar field access
+    /// and functional update.
+    fn record_shape(&mut self, ty: &Ty) -> Result<(String, Vec<String>, Vec<Ty>), String> {
+        let tyname = match ty {
+            Ty::Named(n, _) => n.clone(),
+            _ => return Err("monomorphize: field access on a non-record value".to_string()),
+        };
+        // A generic record's type name is mangled (`Box$Box$Int`); recover its
+        // origin + concrete args. Non-generic records pass through unmangled.
+        let (orig, cargs) = self
+            .demangle
+            .get(&tyname)
+            .cloned()
+            .unwrap_or((tyname.clone(), Vec::new()));
+        let sig = self
+            .ctors
+            .get(&orig)
+            .cloned()
+            .ok_or_else(|| format!("monomorphize: `{}` is not a record type", orig))?;
+        let fnames = sig
+            .field_names
+            .clone()
+            .ok_or_else(|| format!("monomorphize: `{}` is not a record", orig))?;
+        let map: HashMap<String, Ty> =
+            sig.type_params.iter().cloned().zip(cargs.iter().cloned()).collect();
+        let ftys: Vec<Ty> =
+            sig.fields.iter().map(|f| self.subst_ty(f, &map)).collect::<Result<_, _>>()?;
+        let ctor = if cargs.is_empty() {
+            orig.clone()
+        } else {
+            Self::mangle_ctor_name(&orig, &tyname)
+        };
+        Ok((ctor, fnames, ftys))
+    }
+
+    /// Rewrite an array builtin call. Threads the concrete element type INTO the
+    /// array argument (so a nested `array_new()` resolves) and suffixes the
+    /// emitted name with the element-kind tag the backends dispatch on. Returns
+    /// `None` if `name` is not one of `array_new/get/set/push/len`.
+    fn rewrite_array_op(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Ty>,
+        tymap: &HashMap<String, Ty>,
+        expected: Option<&Ty>,
+    ) -> Result<Option<(Expr, Ty)>, String> {
+        let arr = |elem: Ty| Ty::Named("Array".to_string(), vec![elem]);
+        match name {
+            "array_new" => {
+                // The element type comes from context (an `Array[E]` expected
+                // type — a callee param, a `let` annotation, or a sibling arg).
+                let elem = expected.and_then(array_elem_of).unwrap_or(Ty::Unit);
+                let tag = array_elem_tag(&elem);
+                Ok(Some((Expr::Call(format!("array_new${}", tag), Vec::new()), arr(elem))))
+            }
+            "array_push" => {
+                // args = [array, value]: the value fixes `E`; push it down into
+                // the array argument so a nested `array_new()` resolves to `E`.
+                let (rval, elem) = self.rewrite_expr(&args[1], env, tymap, None)?;
+                let (rarr, _) = self.rewrite_expr(&args[0], env, tymap, Some(&arr(elem.clone())))?;
+                let tag = array_elem_tag(&elem);
+                Ok(Some((Expr::Call(format!("array_push${}", tag), vec![rarr, rval]), arr(elem))))
+            }
+            "array_set" => {
+                // args = [array, index, value].
+                let (rval, elem) = self.rewrite_expr(&args[2], env, tymap, None)?;
+                let (rarr, _) = self.rewrite_expr(&args[0], env, tymap, Some(&arr(elem.clone())))?;
+                let (ridx, _) = self.rewrite_expr(&args[1], env, tymap, None)?;
+                let tag = array_elem_tag(&elem);
+                Ok(Some((
+                    Expr::Call(format!("array_set${}", tag), vec![rarr, ridx, rval]),
+                    arr(elem),
+                )))
+            }
+            "array_get" => {
+                // args = [array, index]; result is the element. An `expected`
+                // element type means the array is `Array[expected]`.
+                let arr_exp = expected.map(|e| arr(e.clone()));
+                let (rarr, arr_ty) = self.rewrite_expr(&args[0], env, tymap, arr_exp.as_ref())?;
+                let elem =
+                    array_elem_of(&arr_ty).or_else(|| expected.cloned()).unwrap_or(Ty::Unit);
+                let (ridx, _) = self.rewrite_expr(&args[1], env, tymap, None)?;
+                let tag = array_elem_tag(&elem);
+                Ok(Some((Expr::Call(format!("array_get${}", tag), vec![rarr, ridx]), elem)))
+            }
+            "array_len" => {
+                let (rarr, arr_ty) = self.rewrite_expr(&args[0], env, tymap, None)?;
+                let elem = array_elem_of(&arr_ty).unwrap_or(Ty::Unit);
+                let tag = array_elem_tag(&elem);
+                Ok(Some((Expr::Call(format!("array_len${}", tag), vec![rarr]), Ty::Int)))
+            }
+            _ => Ok(None),
+        }
+    }
+
     fn rewrite_expr(
         &mut self,
         e: &Expr,
@@ -569,6 +723,68 @@ impl<'a> Mono<'a> {
             Expr::Bool(v) => Ok((Expr::Bool(*v), Ty::Bool)),
             Expr::Str(s) => Ok((Expr::Str(s.clone()), Ty::Str)),
             Expr::Unit => Ok((Expr::Unit, Ty::Unit)),
+
+            // Records desugar to positional ADT form HERE, where the receiver's
+            // concrete record type is known. After this, the IR + backends see
+            // only ordinary `Ctor`/`Match` (a record is a 1-variant ADT cell).
+            //
+            // A record literal is exactly a positional constructor application,
+            // so reorder its fields and recurse through the `Ctor` arm (which
+            // handles all the generic mangling / type-arg solving).
+            Expr::Record(name, fields) => {
+                let sig = self
+                    .ctors
+                    .get(name)
+                    .cloned()
+                    .ok_or_else(|| format!("monomorphize: unknown record `{}`", name))?;
+                let decl_names = sig
+                    .field_names
+                    .clone()
+                    .ok_or_else(|| format!("monomorphize: `{}` is not a record", name))?;
+                let ordered: Vec<Expr> = decl_names
+                    .iter()
+                    .map(|fname| fields.iter().find(|(n, _)| n == fname).unwrap().1.clone())
+                    .collect();
+                self.rewrite_expr(&Expr::Ctor(name.clone(), ordered), env, tymap, expected)
+            }
+            // `obj.field` -> `match obj { Ctor(b0,..,bn) => b_idx }`. `obj` is
+            // rewritten first to learn its concrete (mangled) record type.
+            Expr::Field(obj, field) => {
+                let (robj, obj_ty) = self.rewrite_expr(obj, env, tymap, None)?;
+                let (ctor, fnames, ftys) = self.record_shape(&obj_ty)?;
+                let idx = fnames
+                    .iter()
+                    .position(|n| n == field)
+                    .ok_or_else(|| format!("monomorphize: no field `{}` on `{}`", field, ctor))?;
+                let binders = fresh_field_binders(fnames.len());
+                let pat =
+                    Pattern::Ctor(ctor, binders.iter().cloned().map(Pattern::Var).collect());
+                let arm = Arm { pat, body: Expr::Var(binders[idx].clone()) };
+                Ok((Expr::Match(Box::new(robj), vec![arm]), ftys[idx].clone()))
+            }
+            // `{ base | f = v }` -> `match base { Ctor(b0,..,bn) => Ctor(g0,..,gn) }`
+            // where g_i is the new value for updated fields, else Var(b_i).
+            Expr::Update(base, updates) => {
+                let (rbase, base_ty) = self.rewrite_expr(base, env, tymap, None)?;
+                let (ctor, fnames, _ftys) = self.record_shape(&base_ty)?;
+                let binders = fresh_field_binders(fnames.len());
+                let mut new_vals: HashMap<String, Expr> = HashMap::new();
+                for (fname, val) in updates {
+                    let (rv, _) = self.rewrite_expr(val, env, tymap, None)?;
+                    new_vals.insert(fname.clone(), rv);
+                }
+                let rebuilt: Vec<Expr> = fnames
+                    .iter()
+                    .zip(binders.iter())
+                    .map(|(fname, b)| new_vals.remove(fname).unwrap_or_else(|| Expr::Var(b.clone())))
+                    .collect();
+                let pat = Pattern::Ctor(
+                    ctor.clone(),
+                    binders.iter().cloned().map(Pattern::Var).collect(),
+                );
+                let arm = Arm { pat, body: Expr::Ctor(ctor, rebuilt) };
+                Ok((Expr::Match(Box::new(rbase), vec![arm]), base_ty))
+            }
 
             Expr::Var(name) => {
                 if let Some(ty) = env.get(name).cloned() {
@@ -666,9 +882,53 @@ impl<'a> Mono<'a> {
                         (*ret).clone(),
                     ));
                 }
-                // Builtin?  (Identified by NOT being a user function.) Builtins
-                // are non-generic, so just rewrite args with no expectations.
+                // `array_lit` is the variadic desugaring of an array literal. It
+                // is not in the signature table, so type it directly: the result
+                // is `Array[elem]` where `elem` is the (concrete) type of the
+                // first rewritten argument. An empty literal has no element type
+                // to recover here; fall back to an expected `Array[..]` if the
+                // context supplies one, else leave the element unresolved.
+                if name == "array_lit" {
+                    let mut rargs = Vec::new();
+                    let mut elem: Option<Ty> = None;
+                    for a in args {
+                        let (ra, at) = self.rewrite_expr(a, env, tymap, None)?;
+                        if elem.is_none() {
+                            elem = Some(at);
+                        }
+                        rargs.push(ra);
+                    }
+                    let elem = elem
+                        .or_else(|| match expected {
+                            Some(Ty::Named(n, eargs)) if n == "Array" && eargs.len() == 1 => {
+                                Some(eargs[0].clone())
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or(Ty::Unit);
+                    // Suffix the emitted name with the element-kind tag so the
+                    // native/wasm backends learn the concrete element type from
+                    // the (post-monomorphization) call name. The IR interpreter
+                    // never runs monomorphize, so it keeps using `array_lit`.
+                    let suffixed = format!("array_lit${}", array_elem_tag(&elem));
+                    let rt = Ty::Named("Array".to_string(), vec![elem]);
+                    return Ok((Expr::Call(suffixed, rargs), rt));
+                }
+                // Builtin?  (Identified by NOT being a user function.) Rewrite the
+                // arguments, then compute the result type. For a GENERIC builtin
+                // (one whose signature mentions type variables, e.g.
+                // `array_get: (Array[T], Int) -> T`), unify the signature's
+                // parameter types against the concrete argument types to build a
+                // substitution and apply it to the return type — exactly like the
+                // user-fn path. This keeps `Ty::Var` from leaking into the
+                // post-monomorphization IR.
                 if !self.fns.contains_key(name) {
+                    // Array builtins need their concrete element type threaded to
+                    // the backends (as a name suffix) AND propagated INTO the array
+                    // argument so a nested `array_new()` resolves its element type.
+                    if let Some(r) = self.rewrite_array_op(name, args, env, tymap, expected)? {
+                        return Ok(r);
+                    }
                     let mut rargs = Vec::new();
                     let mut arg_tys = Vec::new();
                     for a in args {
@@ -676,7 +936,19 @@ impl<'a> Mono<'a> {
                         rargs.push(ra);
                         arg_tys.push(at);
                     }
-                    let rt = builtin_ret(name, &arg_tys);
+                    let mut rt = builtin_ret(name, &arg_tys);
+                    if contains_var(&rt) {
+                        if let Some((sig_params, sig_ret)) = crate::builtins::lookup(name) {
+                            let mut sub: HashMap<String, Ty> = HashMap::new();
+                            if let Some(exp) = expected {
+                                let _ = self.unify_decl(&sig_ret, exp, &mut sub);
+                            }
+                            for (pt, at) in sig_params.iter().zip(arg_tys.iter()) {
+                                let _ = self.unify_decl(pt, at, &mut sub);
+                            }
+                            rt = resolve(&rt, &sub);
+                        }
+                    }
                     return Ok((Expr::Call(name.clone(), rargs), rt));
                 }
                 let info = self.fns.get(name).cloned().unwrap();
@@ -907,6 +1179,34 @@ impl<'a> Mono<'a> {
             }
             Pattern::Int(i) => Ok(Pattern::Int(*i)),
             Pattern::Bool(b) => Ok(Pattern::Bool(*b)),
+            // Record patterns are interpreter-only so far; cleanly rejected in the
+            // compiled pipeline (records never reach here in practice, since a
+            // record scrutinee comes from a record expression already gated).
+            // `Ctor { f: p, .. }` -> positional `Ctor(p0, .., pn)` (unmentioned
+            // fields become `_`), then recurse so the ctor name is mangled from
+            // the scrutinee type and sub-patterns are bound.
+            Pattern::Record(name, sub_fields) => {
+                let sig = self
+                    .ctors
+                    .get(name)
+                    .cloned()
+                    .ok_or_else(|| format!("monomorphize: unknown record `{}`", name))?;
+                let fnames = sig
+                    .field_names
+                    .clone()
+                    .ok_or_else(|| format!("monomorphize: `{}` is not a record", name))?;
+                let ordered: Vec<Pattern> = fnames
+                    .iter()
+                    .map(|fname| {
+                        sub_fields
+                            .iter()
+                            .find(|(n, _)| n == fname)
+                            .map(|(_, p)| p.clone())
+                            .unwrap_or(Pattern::Wild)
+                    })
+                    .collect();
+                self.rewrite_pattern(&Pattern::Ctor(name.clone(), ordered), scrut_ty, binds)
+            }
             Pattern::Ctor(name, subs) => {
                 let sig = self
                     .ctors
@@ -993,7 +1293,16 @@ impl<'a> Mono<'a> {
                 if let Some(existing) = sub.get(v).cloned() {
                     self.unify_decl(&existing, concrete, sub)
                 } else {
-                    sub.insert(v.clone(), concrete.clone());
+                    // Resolve the target first, then refuse an identity or cyclic
+                    // binding (`v -> v`, or `v -> ...v...`). Such a binding makes
+                    // `resolve` loop forever; it arises when an unresolved generic
+                    // builtin result (e.g. `array_new`'s `Array[T]`) is unified
+                    // against a signature reusing the same param name `T`. Skipping
+                    // it lets a later, concrete binding (`T -> Int`) win.
+                    let c = resolve(concrete, sub);
+                    if !ty_mentions(&c, v) {
+                        sub.insert(v.clone(), c);
+                    }
                     Ok(())
                 }
             }
@@ -1065,6 +1374,35 @@ impl<'a> Mono<'a> {
     }
 }
 
+/// Map a concrete array-element `Ty` to the one-char element-kind tag that the
+/// native/wasm backends dispatch on. `Int`/`Bool` are unboxed integers (`"i"`),
+/// `Float` an unboxed double (`"f"`), `Str` a heap string (`"s"`), and every
+/// other element — ADTs, nested `Array`/`Tensor`, etc. — a boxed heap ref
+/// (`"r"`). Used to suffix the six array-builtin call names (`array_get$i`, …).
+fn array_elem_tag(elem: &Ty) -> &'static str {
+    match elem {
+        Ty::Int | Ty::Bool => "i",
+        Ty::Float => "f",
+        Ty::Str => "s",
+        _ => "r",
+    }
+}
+
+/// Fresh, collision-proof binder names for a desugared record destructuring.
+static FIELD_BINDER_CTR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+fn fresh_field_binders(n: usize) -> Vec<String> {
+    let base = FIELD_BINDER_CTR.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    (0..n).map(|i| format!("$rf{}", base + i)).collect()
+}
+
+/// The element type `E` of an `Array[E]`, if `ty` is one.
+fn array_elem_of(ty: &Ty) -> Option<Ty> {
+    match ty {
+        Ty::Named(n, args) if n == "Array" && args.len() == 1 => Some(args[0].clone()),
+        _ => None,
+    }
+}
+
 fn resolve(ty: &Ty, sub: &HashMap<String, Ty>) -> Ty {
     match ty {
         Ty::Var(v) => match sub.get(v) {
@@ -1085,6 +1423,18 @@ fn contains_var(ty: &Ty) -> bool {
         Ty::Var(_) => true,
         Ty::Named(_, args) => args.iter().any(contains_var),
         Ty::Fn(ps, r) => ps.iter().any(contains_var) || contains_var(r),
+        _ => false,
+    }
+}
+
+/// Does `ty` mention the type variable named `v`? Used as an occurs check before
+/// inserting a substitution, so `unify_decl` never creates a cyclic binding that
+/// would make `resolve` loop.
+fn ty_mentions(ty: &Ty, v: &str) -> bool {
+    match ty {
+        Ty::Var(n) => n == v,
+        Ty::Named(_, args) => args.iter().any(|a| ty_mentions(a, v)),
+        Ty::Fn(ps, r) => ps.iter().any(|p| ty_mentions(p, v)) || ty_mentions(r, v),
         _ => false,
     }
 }

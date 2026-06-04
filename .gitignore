@@ -2,3 +2,6 @@
 **/*.rs.bk
 Cargo.lock
 .DS_Store
+
+# benchmark native binaries (rebuilt by benchmarks/run.py)
+benchmarks/*.bin

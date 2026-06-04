@@ -34,7 +34,10 @@ pub fn grammar() -> String {
 
         // type-decl: `type Name[params] = | Ctor(..) | ...` with REQUIRED
         // leading pipe before the first variant.
-        "type-decl ::= \"type\" ws upper-ident ws type-params? ws \"=\" ws \"|\" ws variant ( ws \"|\" ws variant )*",
+        "type-decl ::= \"type\" ws upper-ident ws type-params? ws \"=\" ws ( record-body | sum-body )",
+        "sum-body ::= \"|\" ws variant ( ws \"|\" ws variant )*",
+        "record-body ::= \"{\" ws ( field-decl ( ws \",\" ws field-decl )* ws )? \"}\"",
+        "field-decl ::= lower-ident ws \":\" ws type",
         "variant ::= upper-ident ( ws \"(\" ws type ( ws \",\" ws type )* ws \")\" )?",
 
         // type-params: `[T, U, ...]` (identifiers).
@@ -71,12 +74,24 @@ pub fn grammar() -> String {
         "lambda ::= \"\\\\\" ws lambda-params ws \"->\" ws expr",
         "lambda-params ::= \"(\" ws ( param ( ws \",\" ws param )* ws )? \")\" | lower-ident",
 
-        // Application: an atom followed by any number of `(args)` calls.
-        "app-expr ::= atom ( ws \"(\" ws args? ws \")\" )*",
+        // Application: an atom followed by any number of `(args)` calls,
+        // `[index]` array subscripts, or `.field` record accesses.
+        "app-expr ::= atom ( ws \"(\" ws args? ws \")\" | ws \"[\" ws expr ws \"]\" | ws \".\" ws lower-ident )*",
         "args ::= expr ( ws \",\" ws expr )*",
 
         // ---- atoms ------------------------------------------------------
-        "atom ::= if-expr | match-expr | block | paren-expr | literal | ctor-expr | call-or-var",
+        "atom ::= if-expr | match-expr | update-expr | block | paren-expr | array-lit | record-lit | literal | ctor-expr | call-or-var",
+
+        // Array literal `[e, e, ...]` (possibly empty).
+        "array-lit ::= \"[\" ws ( expr ( ws \",\" ws expr )* ws )? \"]\"",
+
+        // Record literal `Name { field: expr, ... }`.
+        "record-lit ::= upper-ident ws \"{\" ws ( field-init ( ws \",\" ws field-init )* ws )? \"}\"",
+        "field-init ::= lower-ident ws \":\" ws expr",
+
+        // Functional record update `{ base | field = expr, ... }` (a block form).
+        "update-expr ::= \"{\" ws expr ws \"|\" ws field-set ( ws \",\" ws field-set )* ws \"}\"",
+        "field-set ::= lower-ident ws \"=\" ws expr",
 
         "paren-expr ::= \"(\" ws expr ws \")\"",
 
@@ -100,8 +115,10 @@ pub fn grammar() -> String {
 
         // ---- patterns ---------------------------------------------------
         // `_`, int literal, bool literal, variable, or `Ctor(subpats)`.
-        "pattern ::= \"_\" | int | bool | ctor-pattern | lower-ident",
+        "pattern ::= \"_\" | int | bool | record-pattern | ctor-pattern | lower-ident",
         "ctor-pattern ::= upper-ident ( ws \"(\" ws pattern ( ws \",\" ws pattern )* ws \")\" )?",
+        "record-pattern ::= upper-ident ws \"{\" ws ( field-pat ( ws \",\" ws field-pat )* ws )? \"}\"",
+        "field-pat ::= lower-ident ( ws \":\" ws pattern )?",
 
         // ---- literals ---------------------------------------------------
         "literal ::= float | int | string | bool",
@@ -584,7 +601,7 @@ mod tests {
     #[test]
     fn accepts_real_examples() {
         let gram = g();
-        for name in ["intro", "list", "generic", "hof", "pure", "mem_bench"] {
+        for name in ["intro", "list", "generic", "hof", "pure", "mem_bench", "array", "record"] {
             let path = format!(
                 "{}/examples/{}.aria",
                 env!("CARGO_MANIFEST_DIR"),
