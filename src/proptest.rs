@@ -1321,6 +1321,31 @@ fn map_set_diff_programs() -> Vec<(String, &'static str)> {
             // 100 + 2 (deduped) = 102
             "102",
         ),
+        // A Map captured in a closure must be dup'd on load (it is dropped by the
+        // closure's drop-children helper). Regression for a native use-after-free
+        // where the captured map was freed while still live in the caller.
+        (
+            "fn apply(f: (Int) -> Int, x: Int) -> Int = f(x)\n\
+             fn main() -> Int = {\n\
+               let m = map_insert(map_insert(map_new(), 1, 10), 2, 20);\n\
+               let g = \\x -> map_len(m);\n\
+               apply(g, 0) + map_len(m)\n\
+             }\n"
+                .to_string(),
+            // closure reads len 2, then the original map is still live -> 2 + 2
+            "4",
+        ),
+        // Likewise for a captured Set.
+        (
+            "fn apply(f: (Int) -> Int, x: Int) -> Int = f(x)\n\
+             fn main() -> Int = {\n\
+               let s = set_add(set_add(set_new(), 1), 2);\n\
+               let g = \\x -> set_len(s);\n\
+               apply(g, 0) + set_len(s)\n\
+             }\n"
+                .to_string(),
+            "4",
+        ),
     ]
 }
 
@@ -1372,4 +1397,40 @@ fn maps_sets_interp_matches_compiled() {
         progs.len(),
         native_checked
     );
+}
+
+/// A Map whose VALUE type is non-flat (Array, nested Map, tuple/ADT) is not
+/// faithfully representable in the native backend (coarse value slots), so the
+/// compiled path must REJECT it cleanly — but the interpreter still supports it.
+/// This prevents silent interp-vs-native divergence (pointer display / identity
+/// equality / lost element layout on retrieval).
+#[test]
+fn native_rejects_non_flat_map_values() {
+    let cases = [
+        // Array value: retrieving + indexing would decode the element wrong.
+        "fn main() -> Int = {\n\
+           let a = array_push(array_new(), 7);\n\
+           let m = map_insert(map_new(), 1, a);\n\
+           array_get(map_get_or(m, 1, array_new()), 0)\n\
+         }\n",
+        // Nested-map value.
+        "fn main() -> Int = {\n\
+           let inner = map_insert(map_new(), 1, 2);\n\
+           map_len(map_insert(map_new(), 1, inner))\n\
+         }\n",
+    ];
+    for src in cases {
+        let prog = parser::parse(lexer::lex(src).expect("lex")).expect("parse");
+        // Type-checks (the interpreter supports these value types)...
+        assert!(typeck::check(&prog).is_ok(), "should type-check\n{}", src);
+        assert!(ast_run(src).is_ok(), "interpreter should run it\n{}", src);
+        // ...but the native (C) backend rejects it cleanly, no panic.
+        let err = crate::c_backend::compile(&prog).unwrap_err();
+        assert!(
+            err.contains("Map value of type") && err.contains("not yet supported"),
+            "expected a clean native rejection, got: {}\n{}",
+            err,
+            src
+        );
+    }
 }

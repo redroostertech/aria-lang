@@ -218,8 +218,26 @@ impl CType {
             Ty::Named(n, _) if n == "Bytes" => Ok(CType::Bytes),
             Ty::Named(n, args) if n == "Map" && args.len() == 2 => {
                 let k = SlotKind::from_ctype(CType::from_ty(&args[0])?);
-                let v = SlotKind::from_ctype(CType::from_ty(&args[1])?);
-                Ok(CType::Map(k, v))
+                let v_ct = CType::from_ty(&args[1])?;
+                // The native AriaMap stores each value under a COARSE slot-kind
+                // tag with no nested type info, so its runtime get/show/== can
+                // only faithfully handle FLAT value kinds. A non-flat value
+                // (Array, tuple/ADT (Ref), nested Map/Set) would lose its element
+                // layout on retrieval and render/compare by raw pointer —
+                // diverging from the interpreter. Reject cleanly (the
+                // interpreter supports these; this is a native limitation).
+                if !matches!(
+                    v_ct,
+                    CType::Int | CType::Bool | CType::Float | CType::Str | CType::Bytes
+                ) {
+                    return Err(format!(
+                        "c backend: a Map value of type `{}` is not yet supported \
+                         (native maps support value types Int, Float, Bool, Str, Bytes); \
+                         use the interpreter `aria run` for richer value types",
+                        crate::typeck::show(&args[1])
+                    ));
+                }
+                Ok(CType::Map(k, SlotKind::from_ctype(v_ct)))
             }
             Ty::Named(n, args) if n == "Set" && args.len() == 1 => {
                 let e = SlotKind::from_ctype(CType::from_ty(&args[0])?);
@@ -3238,6 +3256,16 @@ fn emit_lambda(
             }
             CType::Bytes => {
                 let _ = writeln!(out, "    aria_bytes_dup({});", cvar(cn));
+            }
+            // A captured Map/Set is dropped by the closure's drop-children
+            // helper, so its load MUST dup too — otherwise the refcount is one
+            // short and the container is freed while still live in the enclosing
+            // scope (use-after-free). Mirrors the Str/Array/Bytes arms above.
+            CType::Map(..) => {
+                let _ = writeln!(out, "    aria_map_dup({});", cvar(cn));
+            }
+            CType::Set(_) => {
+                let _ = writeln!(out, "    aria_set_dup({});", cvar(cn));
             }
             _ => {}
         }

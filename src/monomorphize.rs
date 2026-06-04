@@ -750,6 +750,9 @@ impl<'a> Mono<'a> {
                 let (k, v) = expected
                     .and_then(map_kv_of)
                     .unwrap_or((Ty::Unit, Ty::Unit));
+                if !native_map_value_ok(&v) {
+                    return Err(unsupported_map_value(&v));
+                }
                 let suffix = map_suffix(&k, &v);
                 Ok(Some((
                     Expr::Call(format!("map_new${}", suffix), Vec::new()),
@@ -761,6 +764,9 @@ impl<'a> Mono<'a> {
                 // the map argument so a nested `map_new()` resolves.
                 let (rkey, k) = self.rewrite_expr(&args[1], env, tymap, None)?;
                 let (rval, v) = self.rewrite_expr(&args[2], env, tymap, None)?;
+                if !native_map_value_ok(&v) {
+                    return Err(unsupported_map_value(&v));
+                }
                 let (rmap, _) =
                     self.rewrite_expr(&args[0], env, tymap, Some(&mapty(k.clone(), v.clone())))?;
                 let suffix = map_suffix(&k, &v);
@@ -773,6 +779,9 @@ impl<'a> Mono<'a> {
                 // args = [map, key, default]; result is V. The default fixes V.
                 let (rkey, k) = self.rewrite_expr(&args[1], env, tymap, None)?;
                 let (rdef, v) = self.rewrite_expr(&args[2], env, tymap, expected)?;
+                if !native_map_value_ok(&v) {
+                    return Err(unsupported_map_value(&v));
+                }
                 let (rmap, _) =
                     self.rewrite_expr(&args[0], env, tymap, Some(&mapty(k.clone(), v.clone())))?;
                 let suffix = map_suffix(&k, &v);
@@ -808,6 +817,9 @@ impl<'a> Mono<'a> {
                     .map(|(_, v)| v)
                     .or_else(|| expected.and_then(map_kv_of).map(|(_, v)| v))
                     .unwrap_or(Ty::Unit);
+                if !native_map_value_ok(&v) {
+                    return Err(unsupported_map_value(&v));
+                }
                 let suffix = map_suffix(&k, &v);
                 Ok(Some((
                     Expr::Call(format!("map_remove${}", suffix), vec![rmap, rkey]),
@@ -1673,6 +1685,28 @@ fn set_elem_of(ty: &Ty) -> Option<Ty> {
 /// (the checker restricts keys to Int/Str); the value tag is unrestricted.
 fn map_suffix(k: &Ty, v: &Ty) -> String {
     format!("{}_{}", array_elem_tag(k), array_elem_tag(v))
+}
+
+/// Whether a concrete Map value type round-trips faithfully through the COMPILED
+/// backends. Native maps store values under a coarse slot tag with no nested
+/// type info, so only flat value kinds (Int/Float/Bool/Str/Bytes) survive
+/// get/show/== without losing layout or comparing by raw pointer. The
+/// interpreter supports any value type; this guards the compiled path only.
+/// `Unit` is the not-yet-pinned placeholder (an unused `map_new()`), left to
+/// fail later if the map is actually given a concrete bad value.
+fn native_map_value_ok(v: &Ty) -> bool {
+    matches!(v, Ty::Int | Ty::Float | Ty::Bool | Ty::Str | Ty::Unit)
+        || matches!(v, Ty::Named(n, _) if n == "Bytes")
+}
+
+/// Clean error for an unsupported compiled-backend Map value type.
+fn unsupported_map_value(v: &Ty) -> String {
+    format!(
+        "a Map value of type `{}` is not yet supported in the compiled backends \
+         (supported value types: Int, Float, Bool, Str, Bytes); \
+         use the interpreter `aria run` for richer value types",
+        crate::typeck::show(v)
+    )
 }
 
 fn resolve(ty: &Ty, sub: &HashMap<String, Ty>) -> Ty {
