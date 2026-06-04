@@ -1874,6 +1874,16 @@ mod tests {
     }
 
     #[test]
+    fn closure_bidirectional_context_typed() {
+        // A curried lambda with no internal type hint, fully typed by the callee
+        // signature (bidirectional checking pushes the expected type inward).
+        differential(
+            "fn apply2(f: (Int) -> (Int) -> Int, a: Int, b: Int) -> Int = f(a)(b)\n\
+             fn main() -> Int = apply2(\\x -> \\y -> x + y, 30, 12)",
+        );
+    }
+
+    #[test]
     fn closure_applied_twice_and_composed() {
         // A closure stored, then applied twice (rc dup), and a closure that
         // captures two other closures (Ref captures released on the cell's drop).

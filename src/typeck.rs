@@ -751,12 +751,26 @@ impl Checker {
                 }
                 // Instantiate the function's generic parameters with fresh vars.
                 let map = self.instantiate_map(&type_params);
+                // Non-lambda arguments first (to pin type parameters), then lambda
+                // arguments bidirectionally — so a lambda's parameter types, fixed
+                // by the function signature or a sibling argument, are in scope
+                // before its body is checked.
                 for (i, (arg, pt)) in args.iter().zip(params.iter()).enumerate() {
-                    let at = self.synth(arg, scope)?;
-                    let expected = Self::apply_map(pt, &map);
-                    self.unify(&expected, &at).map_err(|e| {
-                        format!("function `{}` argument {}: {}", name, i, e)
-                    })?;
+                    if !matches!(arg, Expr::Lambda(..)) {
+                        let at = self.synth(arg, scope)?;
+                        let expected = Self::apply_map(pt, &map);
+                        self.unify(&expected, &at).map_err(|e| {
+                            format!("function `{}` argument {}: {}", name, i, e)
+                        })?;
+                    }
+                }
+                for (i, (arg, pt)) in args.iter().zip(params.iter()).enumerate() {
+                    if matches!(arg, Expr::Lambda(..)) {
+                        let expected = Self::apply_map(pt, &map);
+                        self.check(arg, &expected, scope).map_err(|e| {
+                            format!("function `{}` argument {}: {}", name, i, e)
+                        })?;
+                    }
                 }
                 Ok(Self::apply_map(&ret, &map))
             }
@@ -872,6 +886,42 @@ impl Checker {
     // unify with a function type of matching arity; each argument is checked
     // against the corresponding parameter type, and the application's type is the
     // function's return type.
+    /// Bidirectional check: verify `e` has the EXPECTED type, pushing that type
+    /// inward. For a lambda checked against a function type this binds the
+    /// parameters to the expected parameter types BEFORE checking the body, so a
+    /// lambda whose parameter types are fixed only by the surrounding context
+    /// (`apply2(\x -> \y -> x + y, ..)`) type-checks. Every other expression
+    /// falls back to synthesis + unification.
+    fn check(&self, e: &Expr, expected: &Ty, scope: &mut Scope) -> Result<(), String> {
+        let exp = self.prune(expected);
+        if let (Expr::Lambda(params, body, _), Ty::Fn(ep, er)) = (e, &exp) {
+            if params.len() == ep.len() {
+                let mut frame = HashMap::new();
+                for ((n, t), pexp) in params.iter().zip(ep.iter()) {
+                    // An unannotated parameter takes the expected type (recording
+                    // the placeholder for AST back-annotation); an annotated one
+                    // must unify with it.
+                    let pt = match t {
+                        Ty::Var(v) if v.starts_with("$lam") => {
+                            let fresh = self.fresh();
+                            self.lam_vars.borrow_mut().push((v.clone(), fresh.clone()));
+                            fresh
+                        }
+                        other => other.clone(),
+                    };
+                    self.unify(&pt, pexp)?;
+                    frame.insert(n.clone(), pt);
+                }
+                scope.push(frame);
+                let r = self.check(body, er, scope);
+                scope.pop();
+                return r;
+            }
+        }
+        let t = self.synth(e, scope)?;
+        self.unify(&t, &exp)
+    }
+
     fn synth_apply(
         &self,
         callee: &Ty,
@@ -904,10 +954,23 @@ impl Checker {
                 show(&self.resolve(&pruned))
             )
         })?;
+        // Check non-lambda arguments first (they pin down any type parameters),
+        // then lambda arguments bidirectionally against their now-resolved
+        // expected types — so a lambda whose parameter types come from the
+        // function's signature (or a sibling argument) is checked with those
+        // types already in scope.
         for (i, (arg, pv)) in args.iter().zip(arg_vars.iter()).enumerate() {
-            let at = self.synth(arg, scope)?;
-            self.unify(pv, &at)
-                .map_err(|e| format!("applying {} argument {}: {}", what, i, e))?;
+            if !matches!(arg, Expr::Lambda(..)) {
+                let at = self.synth(arg, scope)?;
+                self.unify(pv, &at)
+                    .map_err(|e| format!("applying {} argument {}: {}", what, i, e))?;
+            }
+        }
+        for (i, (arg, pv)) in args.iter().zip(arg_vars.iter()).enumerate() {
+            if matches!(arg, Expr::Lambda(..)) {
+                self.check(arg, pv, scope)
+                    .map_err(|e| format!("applying {} argument {}: {}", what, i, e))?;
+            }
         }
         Ok(self.resolve(&ret_var))
     }
@@ -1124,6 +1187,26 @@ mod tests {
             fn main() -> Int = { print_float(area(Circle(2.0))); 0 }
         "#;
         assert!(check_src(src).is_ok());
+    }
+
+    #[test]
+    fn bidirectional_lambda_argument_checking() {
+        // A nested lambda with NO internal type hint, whose parameter types are
+        // fixed only by the callee's signature, type-checks because the expected
+        // function type is pushed into the lambda before its body is checked.
+        assert!(check_src(
+            "fn apply2(f: (Int) -> (Int) -> Int, a: Int, b: Int) -> Int = f(a)(b)\n\
+             fn main() -> Int = apply2(\\x -> \\y -> x + y, 30, 12)"
+        )
+        .is_ok());
+        // A higher-order lambda whose Int-ness comes from a SIBLING argument
+        // (the list element type): non-lambda args are checked first.
+        assert!(check_src(
+            "type List = | Nil | Cons(Int, List)\n\
+             fn map(f: (Int) -> Int, xs: List) -> List = match xs { Nil => Nil, Cons(h, t) => Cons(f(h), map(f, t)), }\n\
+             fn main() -> List = map(\\x -> x + x, Cons(1, Nil))"
+        )
+        .is_ok());
     }
 
     #[test]
