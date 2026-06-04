@@ -1874,6 +1874,29 @@ mod tests {
     }
 
     #[test]
+    fn local_binding_shadows_global_function() {
+        // A lambda parameter, a `let`, and a match binder may each shadow a
+        // top-level function of the same name — the backend must resolve the
+        // local (scope-before-globals), not emit a function value / by-name call.
+        differential(
+            "fn helper(n: Int) -> Int = n * 1000\n\
+             fn ap(f: (Int) -> Int, x: Int) -> Int = f(x)\n\
+             fn main() -> Int = ap(\\helper -> helper + 1, 41)",
+        );
+        differential(
+            "fn helper(n: Int) -> Int = n * 1000\n\
+             fn main() -> Int = { let helper = 5; helper + 1 }",
+        );
+        // A block-scoped `let` shadowing a function must not leak to a sibling
+        // branch that calls the real function.
+        differential(
+            "fn helper(n: Int) -> Int = n * 1000\n\
+             fn pick(c: Bool) -> Int = if c { let helper = 1; helper + 1 } else { helper(2) }\n\
+             fn main() -> Int = pick(true) + pick(false)",
+        );
+    }
+
+    #[test]
     fn closure_bidirectional_context_typed() {
         // A curried lambda with no internal type hint, fully typed by the callee
         // signature (bidirectional checking pushes the expected type inward).

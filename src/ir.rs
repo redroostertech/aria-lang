@@ -186,6 +186,14 @@ struct Lowerer {
     /// Wrapper names already emitted for top-level functions used as values
     /// (so each global function gets exactly one `$fnval$` wrapper).
     wrappers: std::collections::HashSet<String>,
+    /// Local names currently in scope (function parameters, `let` bindings, match
+    /// binders, lambda parameters + captures). A name in this set is a *local*
+    /// that shadows any same-named top-level function or builtin — exactly the
+    /// tree-walker's scope-before-globals rule — so `Var`/`Call` resolve it as a
+    /// local rather than a function value or by-name call. Managed with
+    /// snapshot/restore around each scope; on a lowering error the whole pass is
+    /// discarded, so an un-restored snapshot is harmless.
+    bound: std::collections::HashSet<String>,
 }
 
 /// Variable names a pattern binds (used by the closure free-variable walk).
@@ -338,8 +346,9 @@ impl Lowerer {
             Expr::Var(n) => {
                 // A bare top-level function name in value position (it would be an
                 // `Expr::Call` if it were applied) becomes a closure over a
-                // zero-capture wrapper that forwards to the direct call.
-                if self.fn_arities.contains_key(n) {
+                // zero-capture wrapper that forwards to the direct call — UNLESS a
+                // local of the same name shadows it (then it is an ordinary local).
+                if !self.bound.contains(n) && self.fn_arities.contains_key(n) {
                     let w = self.fn_value_wrapper(n);
                     let t = self.fresh();
                     stmts.push((t.clone(), Bind::MakeClosure(w, vec![])));
@@ -383,11 +392,14 @@ impl Lowerer {
                 Ok(Atom::Var(t))
             }
             Expr::Call(name, args) => {
-                // A name that is neither a top-level function nor a builtin must be
-                // a local `Fn`-typed binding (parameter / let) being applied — a
-                // closure call, exactly as the tree-walker treats a shadowing local
-                // (it looks up the scope before the global function table).
-                if !self.fn_arities.contains_key(name) && crate::builtins::lookup(name).is_none() {
+                // A local binding (parameter / let / lambda capture) applied by
+                // name is a closure application — the tree-walker resolves the
+                // scope before the global function table, so a local shadows any
+                // same-named top-level function. A non-local name that is neither a
+                // top-level function nor a builtin is likewise a local `Fn` value.
+                if self.bound.contains(name)
+                    || (!self.fn_arities.contains_key(name) && crate::builtins::lookup(name).is_none())
+                {
                     let atoms = self.lower_all(args, stmts)?;
                     let t = self.fresh();
                     stmts.push((t.clone(), Bind::ApplyClosure(Atom::Var(name.clone()), atoms, None)));
@@ -463,7 +475,13 @@ impl Lowerer {
                 let lam_name = format!("$lam{}", self.lam);
                 self.lam += 1;
                 let lam_params: Vec<String> = params.iter().map(|(n, _)| n.clone()).collect();
+                // The lambda body is a fresh scope: its only locals are its
+                // parameters and the captured variables (everything else it
+                // references is a top-level function or builtin).
+                let saved = std::mem::take(&mut self.bound);
+                self.bound = lam_params.iter().cloned().chain(capture_names.iter().cloned()).collect();
                 let lam_body = self.lower_block(body)?;
+                self.bound = saved;
                 self.lifted.push((
                     lam_name.clone(),
                     IFn {
@@ -487,11 +505,16 @@ impl Lowerer {
                 Ok(Atom::Var(t))
             }
             Expr::Block(block_stmts, last) => {
+                // A block opens a scope: its `let` bindings are local for the rest
+                // of the block but must not leak to siblings. (`let` is
+                // non-recursive — the value is lowered before the name is bound.)
+                let block_saved = self.bound.clone();
                 for s in block_stmts {
                     match s {
                         Stmt::Let(name, _ty, value) => {
                             let va = self.lower(value, stmts)?;
                             stmts.push((name.clone(), Bind::Atom(va)));
+                            self.bound.insert(name.clone());
                         }
                         Stmt::Expr(ex) => {
                             // Evaluate for effect; bind to a discarded temp.
@@ -501,7 +524,9 @@ impl Lowerer {
                         }
                     }
                 }
-                self.lower(last, stmts)
+                let r = self.lower(last, stmts);
+                self.bound = block_saved;
+                r
             }
         }
     }
@@ -517,8 +542,10 @@ impl Lowerer {
         if has_ctor {
             let mut iarms = Vec::new();
             for arm in arms {
-                let body = self.lower_block(&arm.body)?;
-                match &arm.pat {
+                // Determine what the arm binds BEFORE lowering its body, so those
+                // binders are in scope (they shadow same-named globals) while the
+                // body is lowered.
+                let (ctor, binders): (Option<String>, Vec<String>) = match &arm.pat {
                     Pattern::Ctor(name, subs) => {
                         let mut binders = Vec::new();
                         for sp in subs {
@@ -532,20 +559,23 @@ impl Lowerer {
                                 }
                             }
                         }
-                        iarms.push(IArm { ctor: Some(name.clone()), binders, body });
+                        (Some(name.clone()), binders)
                     }
-                    Pattern::Var(n) => {
-                        iarms.push(IArm { ctor: None, binders: vec![n.clone()], body })
-                    }
-                    Pattern::Wild => {
-                        iarms.push(IArm { ctor: None, binders: vec![self.fresh()], body })
-                    }
+                    Pattern::Var(n) => (None, vec![n.clone()]),
+                    Pattern::Wild => (None, vec![self.fresh()]),
                     _ => {
                         return Err(LowerError(
                             "mixed literal/constructor patterns not supported in IR yet".into(),
                         ))
                     }
+                };
+                let saved = self.bound.clone();
+                for b in &binders {
+                    self.bound.insert(b.clone());
                 }
+                let body = self.lower_block(&arm.body)?;
+                self.bound = saved;
+                iarms.push(IArm { ctor, binders, body });
             }
             Ok(Bind::Match(scrut, iarms))
         } else {
@@ -586,11 +616,18 @@ impl Lowerer {
     }
 
     fn lower_catchall(&mut self, scrut: &Atom, arm: &crate::ast::Arm) -> Result<IExpr, LowerError> {
-        // Bind the catch-all variable (if any) to the scrutinee, then the body.
-        let body = self.lower_block(&arm.body)?;
+        // Bind the catch-all variable (if any) to the scrutinee, then the body —
+        // with that variable in scope (it shadows a same-named global) while the
+        // body is lowered.
         match &arm.pat {
-            Pattern::Var(n) => Ok(IExpr::Let(n.clone(), Bind::Atom(scrut.clone()), Box::new(body))),
-            _ => Ok(body),
+            Pattern::Var(n) => {
+                let saved = self.bound.clone();
+                self.bound.insert(n.clone());
+                let body = self.lower_block(&arm.body)?;
+                self.bound = saved;
+                Ok(IExpr::Let(n.clone(), Bind::Atom(scrut.clone()), Box::new(body)))
+            }
+            _ => self.lower_block(&arm.body),
         }
     }
 
@@ -626,9 +663,12 @@ pub fn lower_program(program: &Program) -> Result<HashMap<String, IFn>, String> 
         fn_sigs,
         lifted: Vec::new(),
         wrappers: std::collections::HashSet::new(),
+        bound: std::collections::HashSet::new(),
     };
     for item in &program.items {
         if let Item::Fn(f) = item {
+            // Parameters are the function's initial in-scope locals.
+            lw.bound = f.params.iter().map(|p| p.name.clone()).collect();
             let body = lw.lower_block(&f.body).map_err(|e| format!("fn `{}`: {}", f.name, e.0))?;
             let params = f.params.iter().map(|p| p.name.clone()).collect();
             fns.insert(
