@@ -240,10 +240,21 @@ impl CtorInfo {
             .filter_map(|(i, t)| if *t == WType::Str { Some(i) } else { None })
             .collect()
     }
-    /// True if this constructor has any reference-managed field (Ref or Str),
-    /// i.e. dropping a dead cell of this tag must release children.
+    /// Indices of the fields that are heap Arrays (dropped via `__array_drop`,
+    /// which is kind-aware from the array's own header).
+    fn array_fields(&self) -> Vec<usize> {
+        self.field_types
+            .iter()
+            .enumerate()
+            .filter_map(|(i, t)| if matches!(t, WType::Array(_)) { Some(i) } else { None })
+            .collect()
+    }
+    /// True if this constructor has any reference-managed field (Ref, Str, or
+    /// Array), i.e. dropping a dead cell of this tag must release children.
     fn has_managed_fields(&self) -> bool {
-        !self.ref_fields().is_empty() || !self.str_fields().is_empty()
+        !self.ref_fields().is_empty()
+            || !self.str_fields().is_empty()
+            || !self.array_fields().is_empty()
     }
 }
 
@@ -286,15 +297,11 @@ impl CtorTable {
                             t.name, v.name
                         ));
                     }
-                    // An Array field inside an ADT cell is outside the subset:
-                    // __drop has no per-tag knowledge to release Array children
-                    // kind-aware, so reject cleanly (never a panic / leak).
-                    if field_types.iter().any(|t| matches!(t, WType::Array(_))) {
-                        return Err(format!(
-                            "wasm backend: type `{}` ctor `{}` has an Array field (outside the subset)",
-                            t.name, v.name
-                        ));
-                    }
+                    // An Array field inside an ADT cell is fully supported: the
+                    // per-tag `__drop`/`__drop_reuse` release each Array field via
+                    // `__array_drop` (which is kind-aware from the array's own
+                    // header), and field dup/store/load route the Array pointer the
+                    // same way Str/Ref fields do. No rejection needed.
                     max_arity = max_arity.max(field_types.len());
                     by_name.insert(v.name.clone(), CtorInfo { tag, field_types });
                     tag += 1;
@@ -308,6 +315,17 @@ impl CtorTable {
         self.by_name
             .get(name)
             .ok_or_else(|| format!("wasm backend: unknown constructor `{}`", name))
+    }
+
+    /// True if any constructor in the program has an Array field. Structural ADT
+    /// `==` (`__eq`) recurses across every tag via Ref fields, but cannot compare
+    /// Array contents (it would need an elementwise compare). Rather than return a
+    /// silently-wrong answer, the backend rejects ADT `==`/`!=` when such a ctor
+    /// exists. (Array-in-ADT for storage/projection/drop is fully supported.)
+    fn any_array_field(&self) -> bool {
+        self.by_name
+            .values()
+            .any(|info| !info.array_fields().is_empty())
     }
 }
 
@@ -1929,6 +1947,15 @@ fn emit_adt_eq(
     env: &mut LocalEnv,
     code: &mut Vec<u8>,
 ) -> Result<WType, String> {
+    // `__eq` cannot compare Array-typed ADT fields (it would need an elementwise
+    // compare). If any ctor in the program has an Array field, reject ADT
+    // `==`/`!=` cleanly rather than risk a wrong answer — storing/projecting/
+    // dropping Array-in-ADT is still fully supported.
+    if env.ctors.any_array_field() {
+        return Err(
+            "wasm backend: `==`/`!=` on ADTs with Array fields is outside the wasm subset".into(),
+        );
+    }
     let lt = env.fresh_i32();
     let rt = env.fresh_i32();
     let eq = env.heap_index(HeapHelper::Eq);
@@ -2991,6 +3018,18 @@ fn emit_heap_helper(
                     leb_u(drop_str_idx as u64, &mut body);
                     body.push(DROP); // dummy result
                 }
+                // drop each Array field via __array_drop (the array dropper is
+                // kind-aware from the array's own header, so the ADT layer just
+                // hands it the i32 pointer — no element-kind knowledge needed).
+                for fi in info.array_fields() {
+                    body.push(LOCAL_GET);
+                    leb_u(0, &mut body); // ptr
+                    i64_load(CELL_HEADER + SLOT * fi as u64, &mut body);
+                    body.push(I32_WRAP_I64); // Array field address
+                    body.push(CALL);
+                    leb_u(drop_array_idx as u64, &mut body);
+                    body.push(DROP); // dummy result
+                }
                 // free(ptr, arity)
                 body.push(LOCAL_GET);
                 leb_u(0, &mut body); // ptr
@@ -3100,6 +3139,17 @@ fn emit_heap_helper(
                     body.push(I32_WRAP_I64); // String child address
                     body.push(CALL);
                     leb_u(drop_str_idx as u64, &mut body);
+                    body.push(DROP); // dummy result
+                }
+                // Array children: release via __array_drop (kind-aware), same as
+                // the full __drop path. The reused slot keeps the cell itself.
+                for fi in info.array_fields() {
+                    body.push(LOCAL_GET);
+                    leb_u(0, &mut body); // ptr
+                    i64_load(CELL_HEADER + SLOT * fi as u64, &mut body);
+                    body.push(I32_WRAP_I64); // Array child address
+                    body.push(CALL);
+                    leb_u(drop_array_idx as u64, &mut body);
                     body.push(DROP); // dummy result
                 }
                 body.push(END); // end if tag==T
@@ -3710,8 +3760,10 @@ fn emit_heap_helper(
                             body.push(CALL);
                             leb_u(eq_idx as u64, &mut body);
                         }
-                        // Tensor and Array fields are rejected from ADTs
-                        // (CtorTable::build), so these arms are unreachable; emit a
+                        // A Tensor field is rejected from ADTs (CtorTable::build),
+                        // and ADT `==` is rejected entirely when any ctor has an
+                        // Array field (emit_adt_eq guards on any_array_field), so
+                        // these arms are never reached at runtime; emit a
                         // constant-true to keep the match exhaustive.
                         WType::Tensor | WType::Array(_) => {
                             body.push(I32_CONST);
@@ -7747,6 +7799,47 @@ mod tests {
              type L = | Nil | Cons(P, L)\n\
              fn cnt(xs: L) -> Int = match xs { Nil => 0, Cons(_, r) => 1 + cnt(r), }\n\
              fn main() -> Int = cnt(Cons(P(1.0, 2.0), Cons(P(3.0, 4.0), Nil)))",
+        );
+    }
+
+    #[test]
+    fn array_field_in_adt_matches_and_is_garbage_free() {
+        // A record/ADT cell holding an Array[Int] field: project the array out of
+        // the cell and use it. The cell __drop must release the Array child via
+        // __array_drop (kind-aware), so the heap ends garbage-free (__live == 0).
+        differential_heap(
+            "type Buf = { data: Array[Int], n: Int }\n\
+             fn main() -> Int = { let b = Buf { data: [1,2,3], n: 3 }; \
+               match b { Buf(d, n) => array_len(d) + n, } }",
+        );
+        // A 2-tuple of arrays (a tuple is an ADT cell with Array fields): both
+        // array fields are projected, used, then dropped with the cell.
+        differential_heap(
+            "fn lensum(p: (Array[Int], Array[Int])) -> Int = \
+               match p { (a, b) => array_len(a) + array_len(b), }\n\
+             fn main() -> Int = lensum(([1,2,3], [4,5]))",
+        );
+        // The array field is NEVER read out of the cell (only the Int field is):
+        // the cell __drop must STILL release the unused Array child (no leak).
+        differential_heap(
+            "type Box = { data: Array[Int], n: Int }\n\
+             fn main() -> Int = { let b = Box { data: [1,2,3,4,5], n: 99 }; \
+               match b { Box(d, n) => n, } }",
+        );
+        // An Array[String] field (each element is a heap String): dropping the
+        // cell recursively drops the array, which recursively drops its Strings.
+        differential_heap(
+            "type Names = { items: Array[String], k: Int }\n\
+             fn main() -> Int = { let n = Names { items: [\"ab\",\"cde\"], k: 7 }; \
+               match n { Names(xs, k) => array_len(xs) + k, } }",
+        );
+        // An Array[ADT] field (each element is an ADT cell): the cell drop frees
+        // the array, which frees each element cell. Garbage-free.
+        differential_heap(
+            "type P = | P(Int, Int)\n\
+             type Bag = { ps: Array[P], m: Int }\n\
+             fn main() -> Int = { let g = Bag { ps: [P(1,2), P(3,4)], m: 10 }; \
+               match g { Bag(ps, m) => array_len(ps) + m, } }",
         );
     }
 

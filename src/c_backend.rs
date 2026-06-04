@@ -33,9 +33,10 @@
 //! calls `aria_trap` (writes "TRAP" then aborts), matching the interpreter's
 //! `Err` and the wasm trap.
 //!
-//! Float formatting note: Rust's `{}` and C's `printf` format floats
-//! differently, so the differential tests route Float results through Int/Bool
-//! (the same choice the wasm backend documented). `print_float` uses `%g`.
+//! Float formatting: `aria_print_float` (see `aria_fmt_float` in the runtime)
+//! renders the SHORTEST decimal that round-trips to the same f64, in plain
+//! notation — matching the interpreter's Rust `format!("{}", f)` and the wasm
+//! backend, so all backends print identical float output.
 //!
 //! Out-of-subset features (tensors/RAG/compression builtins, Unit results) yield
 //! a clean `Err` from `compile` — never a panic.
@@ -1656,7 +1657,51 @@ static void* aria_int_to_str(int64_t n) {
 /* ---- print helpers (match the interpreter's formatting) ---- */
 static void aria_print_int(int64_t n) { printf("%lld\n", (long long)n); }
 static void aria_print_bool(int64_t b) { fputs(b ? "true\n" : "false\n", stdout); }
-static void aria_print_float(double d) { printf("%g\n", d); }
+/* Format `d` as the SHORTEST decimal that round-trips back to the same f64, in
+   plain (non-scientific) notation -- matching the interpreter's Rust
+   `format!("{}", f)` and the wasm backend's JS rendering. C's `%g` would pick a
+   shortest significant-digit count but may switch to scientific notation
+   (`100` -> `1e+02`), which Rust never does. So: find the shortest sig-digit
+   count whose `%.*e` round-trips, then lay the digits out as a plain decimal. */
+static void aria_fmt_float(double d, char* buf, size_t cap) {
+    if (d != d) { snprintf(buf, cap, "NaN"); return; }
+    if (d == 1.0/0.0) { snprintf(buf, cap, "inf"); return; }
+    if (d == -1.0/0.0) { snprintf(buf, cap, "-inf"); return; }
+    char sci[40];
+    int p = 17;
+    for (int q = 1; q <= 17; q++) {
+        snprintf(sci, sizeof sci, "%.*e", q - 1, d);
+        if (strtod(sci, NULL) == d) { p = q; break; }
+    }
+    (void)p;
+    const char* s = sci;
+    char* out = buf;
+    if (*s == '-') { *out++ = '-'; s++; }
+    char digits[20];
+    int nd = 0;
+    digits[nd++] = *s++;
+    if (*s == '.') { s++; while (*s >= '0' && *s <= '9') digits[nd++] = *s++; }
+    int exp10 = 0;
+    if (*s == 'e' || *s == 'E') exp10 = (int)strtol(s + 1, NULL, 10);
+    while (nd > 1 && digits[nd - 1] == '0') nd--;
+    int point = exp10 + 1;
+    if (point <= 0) {
+        *out++ = '0'; *out++ = '.';
+        for (int i = 0; i < -point; i++) *out++ = '0';
+        for (int i = 0; i < nd; i++) *out++ = digits[i];
+    } else if (point >= nd) {
+        for (int i = 0; i < nd; i++) *out++ = digits[i];
+        for (int i = nd; i < point; i++) *out++ = '0';
+    } else {
+        for (int i = 0; i < nd; i++) { if (i == point) *out++ = '.'; *out++ = digits[i]; }
+    }
+    *out = '\0';
+}
+static void aria_print_float(double d) {
+    char buf[320];
+    aria_fmt_float(d, buf, sizeof buf);
+    printf("%s\n", buf);
+}
 static void aria_print_str(void* p) {
     AriaStr* s = (AriaStr*)p;
     fwrite(s->bytes, 1, (size_t)s->len, stdout);
@@ -1884,7 +1929,7 @@ pub fn compile(program: &Program) -> Result<String, String> {
         }
         CType::Float => {
             let _ = writeln!(src, "    double r = {}();", cfn("main"));
-            let _ = writeln!(src, "    printf(\"%g\\n\", r);");
+            let _ = writeln!(src, "    aria_print_float(r);");
         }
         CType::Str => {
             let _ = writeln!(src, "    void* r = {}();", cfn("main"));
@@ -2411,6 +2456,32 @@ mod tests {
         }
         let (stdout, _) = build_and_run(&c_src).expect("build+run native array");
         assert_eq!(stdout.lines().next().unwrap_or(""), "139");
+    }
+
+    #[test]
+    fn native_float_printing_matches_interpreter() {
+        // Native floats must print the shortest round-tripping decimal, identical
+        // to the interpreter's Rust `{}` formatting (no lossy `%g`).
+        if !cc_available() {
+            return;
+        }
+        let src = "fn main() -> Int = { print_float(3.14); print_float(12.566360); \
+                   print_float(0.670820415019989); print_float(3.141592653589793); \
+                   print_float(100.0); print_float(0.00001); 0 }";
+        let expected = [
+            format!("{}", 3.14_f64),
+            format!("{}", 12.566360_f64),
+            format!("{}", 0.670820415019989_f64),
+            format!("{}", 3.141592653589793_f64),
+            format!("{}", 100.0_f64),
+            format!("{}", 0.00001_f64),
+        ];
+        let c_src = compile_src(src).expect("float program should compile");
+        let (stdout, _) = build_and_run(&c_src).expect("build+run native float");
+        let lines: Vec<&str> = stdout.lines().collect();
+        for (i, e) in expected.iter().enumerate() {
+            assert_eq!(lines.get(i).copied().unwrap_or(""), e, "float line {}", i);
+        }
     }
 
     #[test]
