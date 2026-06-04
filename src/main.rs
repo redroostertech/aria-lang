@@ -496,8 +496,17 @@ fn run_source(args: &[String]) -> ExitCode {
         .join()
         .unwrap_or_else(|_| Err("interpreter thread panicked".into()));
     match result {
-        Ok(interp::Value::Int(n)) => ExitCode::from((n & 0xff) as u8),
-        Ok(_) => ExitCode::SUCCESS,
+        Ok(v) => {
+            // Print `main`'s result value, matching the native backend
+            // (`aria native-run`) so a program's full output is identical across
+            // backends. An `Int` result additionally maps to the process exit
+            // code (low 8 bits), preserving the historical convention.
+            println!("{}", v.display());
+            match v {
+                interp::Value::Int(n) => ExitCode::from((n & 0xff) as u8),
+                _ => ExitCode::SUCCESS,
+            }
+        }
         Err(e) => {
             eprintln!("runtime error: {}", e);
             ExitCode::FAILURE

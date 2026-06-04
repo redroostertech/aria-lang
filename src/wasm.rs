@@ -195,6 +195,14 @@ impl WType {
             // heap object, so it reuses the array runtime; distinguished here so it
             // gets its own ==/display and the bytes builtins.
             Ty::Named(n, _) if n == "Bytes" => Ok(WType::Bytes),
+            // Maps and Sets are supported by the interpreter and the native (C)
+            // backend, but NOT the wasm backend — gate with a clean error.
+            Ty::Named(n, _) if n == "Map" || n == "Set" => Err(format!(
+                "maps/sets are not yet supported in the wasm backend \
+                 (use the interpreter `aria run` or the native backend \
+                 `aria native-run`): type `{}`",
+                n
+            )),
             // A named ADT becomes a heap reference. (Generics — args present —
             // are out of the 2b subset and rejected below.)
             Ty::Named(_, args) if args.is_empty() => Ok(WType::Ref),
@@ -1000,6 +1008,14 @@ fn bind_type(bind: &Bind, env: &LocalEnv) -> Result<WType, String> {
             if let Some(ret) = bytes_builtin_ret(name) {
                 return Ok(ret);
             }
+            if is_map_set_builtin(name) {
+                return Err(format!(
+                    "maps/sets are not yet supported in the wasm backend \
+                     (use the interpreter `aria run` or the native backend \
+                     `aria native-run`): builtin `{}`",
+                    name
+                ));
+            }
             let sig = env
                 .sigs
                 .get(name)
@@ -1393,6 +1409,14 @@ fn emit_bind(bind: &Bind, env: &mut LocalEnv, code: &mut Vec<u8>) -> Result<WTyp
             if is_bytes_builtin(name) {
                 return emit_bytes_builtin(name, args, env, code);
             }
+            if is_map_set_builtin(name) {
+                return Err(format!(
+                    "maps/sets are not yet supported in the wasm backend \
+                     (use the interpreter `aria run` or the native backend \
+                     `aria native-run`): builtin `{}`",
+                    name
+                ));
+            }
             let sig_ret;
             let sig_params;
             {
@@ -1660,6 +1684,14 @@ fn is_bytes_builtin(name: &str) -> bool {
             | "bytes_from_str"
             | "bytes_to_str"
     )
+}
+
+/// True for any map/set builtin (suffixed by monomorphization, e.g.
+/// `map_insert$i_i`, or the bare interpreter name). The wasm backend does not
+/// support maps/sets; recognizing them lets it emit a clean, specific error.
+fn is_map_set_builtin(name: &str) -> bool {
+    let base = name.rsplit_once('$').map(|(b, _)| b).unwrap_or(name);
+    base.starts_with("map_") || base.starts_with("set_")
 }
 
 /// The wasm result type of a Bytes builtin, or `None` if not a bytes builtin.

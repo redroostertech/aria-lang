@@ -193,9 +193,14 @@ pub fn check(program: &Program) -> Result<(), Vec<String>> {
     ) {
         match t {
             Ty::Named(n, args) if BUILTIN_TYPES.contains(&n.as_str()) => {
-                // Built-in types have a fixed arity: `Array[T]` takes one type
-                // argument; the others (e.g. `Tensor`) are nullary handles.
-                let expected = if n == "Array" { 1 } else { 0 };
+                // Built-in types have a fixed arity: `Array[T]` and `Set[T]`
+                // take one type argument; `Map[K, V]` takes two; the others
+                // (e.g. `Tensor`, `Bytes`) are nullary handles.
+                let expected = match n.as_str() {
+                    "Array" | "Set" => 1,
+                    "Map" => 2,
+                    _ => 0,
+                };
                 if args.len() != expected {
                     errs.push(format!(
                         "{}: built-in type `{}` takes {} type argument(s), got {}",
@@ -717,6 +722,19 @@ fn builtin_type_params(params: &[Ty], ret: &Ty) -> Vec<String> {
     acc
 }
 
+/// For a Map/Set builtin, the name of the signature type variable that carries
+/// the (order-restricted) key / set-element type — `"K"` for `map_*`, `"T"` for
+/// `set_*`. Returns `None` for any other builtin. The checker resolves this var
+/// after argument unification and requires it to be Int or Str.
+fn map_set_key_var(name: &str) -> Option<&'static str> {
+    match name {
+        "map_new" | "map_insert" | "map_get_or" | "map_has" | "map_len" | "map_remove"
+        | "map_show" => Some("K"),
+        "set_new" | "set_add" | "set_has" | "set_len" | "set_remove" | "set_show" => Some("T"),
+        _ => None,
+    }
+}
+
 impl Checker {
     fn lookup_var(scope: &Scope, name: &str) -> Option<Ty> {
         for frame in scope.iter().rev() {
@@ -1094,6 +1112,36 @@ impl Checker {
                         self.check(arg, &expected, scope).map_err(|e| {
                             format!("function `{}` argument {}: {}", name, i, e)
                         })?;
+                    }
+                }
+                // Map/Set key & element types are restricted to the two
+                // primitive totally-ordered types (Int, Str) so the ordered
+                // representation has a deterministic, backend-agnostic order.
+                // Resolve the relevant type variable now that the arguments have
+                // pinned it; reject anything else (Float, Bool, ADT, Array, …)
+                // with a clean error.
+                if let Some(var) = map_set_key_var(name) {
+                    if let Some(tv) = map.get(var) {
+                        let kt = self.resolve(tv);
+                        // A still-unresolved fresh variable (e.g. `map_new()`
+                        // whose key type is pinned only by a later `insert`) is
+                        // left to that later use to constrain; only reject a
+                        // CONCRETE non-Int/Str key here.
+                        let unresolved = matches!(&kt, Ty::Var(v) if is_fresh(v));
+                        if !unresolved && !matches!(kt, Ty::Int | Ty::Str) {
+                            let what = if name.starts_with("set_") {
+                                "set element"
+                            } else {
+                                "map key"
+                            };
+                            return Err(format!(
+                                "`{}`: {} type must be Int or Str (the totally-ordered \
+                                 primitives), got {}",
+                                name,
+                                what,
+                                show(&kt)
+                            ));
+                        }
                     }
                 }
                 // A `[T: Trait]`-bounded function may only be instantiated at a
@@ -1854,6 +1902,100 @@ mod tests {
             "expected a `cannot compare` error, got: {:?}",
             errs
         );
+    }
+
+    // ---- Map / Set builtin types, signatures & key restriction ----------
+
+    #[test]
+    fn map_set_are_builtin_types_with_correct_signatures() {
+        use crate::ast::Ty::*;
+        use crate::builtins;
+        assert!(builtins::BUILTIN_TYPES.contains(&"Map"));
+        assert!(builtins::BUILTIN_TYPES.contains(&"Set"));
+        let map = Named("Map".to_string(), vec![Var("K".into()), Var("V".into())]);
+        let set = Named("Set".to_string(), vec![Var("T".into())]);
+        let cases: &[(&str, Vec<Ty>, Ty)] = &[
+            ("map_new", vec![], map.clone()),
+            ("map_insert", vec![map.clone(), Var("K".into()), Var("V".into())], map.clone()),
+            ("map_get_or", vec![map.clone(), Var("K".into()), Var("V".into())], Var("V".into())),
+            ("map_has", vec![map.clone(), Var("K".into())], Bool),
+            ("map_len", vec![map.clone()], Int),
+            ("map_remove", vec![map.clone(), Var("K".into())], map.clone()),
+            ("set_new", vec![], set.clone()),
+            ("set_add", vec![set.clone(), Var("T".into())], set.clone()),
+            ("set_has", vec![set.clone(), Var("T".into())], Bool),
+            ("set_len", vec![set.clone()], Int),
+            ("set_remove", vec![set.clone(), Var("T".into())], set.clone()),
+        ];
+        for (name, params, ret) in cases {
+            let (p, r) = builtins::lookup(name)
+                .unwrap_or_else(|| panic!("builtin `{}` missing from signature table", name));
+            assert_eq!(&p, params, "param mismatch for `{}`", name);
+            assert_eq!(&r, ret, "return mismatch for `{}`", name);
+        }
+    }
+
+    #[test]
+    fn map_set_programs_type_check_with_int_and_str_keys() {
+        // Int-keyed map, including `map_get_or`'s default matching V.
+        let ok_int = r#"
+            fn main() -> Int = {
+                let m = map_insert(map_insert(map_new(), 1, 10), 2, 20);
+                map_get_or(m, 1, 0) + map_len(m)
+            }
+        "#;
+        assert!(check_src(ok_int).is_ok(), "got: {:?}", check_src(ok_int));
+        // Str-keyed map.
+        let ok_str = r#"
+            fn main() -> Int = map_get_or(map_insert(map_new(), "a", 7), "a", 0)
+        "#;
+        assert!(check_src(ok_str).is_ok(), "got: {:?}", check_src(ok_str));
+        // Set of Str.
+        let ok_set = r#"
+            fn main() -> Bool = set_has(set_add(set_new(), "x"), "x")
+        "#;
+        assert!(check_src(ok_set).is_ok(), "got: {:?}", check_src(ok_set));
+    }
+
+    #[test]
+    fn non_int_str_key_is_rejected() {
+        // A Bool key (a `Map[Bool, Int]`) is rejected: keys must be Int or Str.
+        let bad_bool = r#"fn main() -> Bool = map_has(map_insert(map_new(), true, 1), true)"#;
+        let errs = check_src(bad_bool).unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains("must be Int or Str")),
+            "expected a key-restriction error, got: {:?}",
+            errs
+        );
+        // A Float set element is likewise rejected.
+        let bad_float = r#"fn main() -> Bool = set_has(set_add(set_new(), 1.5), 1.5)"#;
+        let errs = check_src(bad_float).unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains("must be Int or Str")),
+            "expected a set-element-restriction error, got: {:?}",
+            errs
+        );
+        // An ADT-keyed map is rejected.
+        let bad_adt = r#"
+            type K = | A | B
+            fn main() -> Bool = map_has(map_insert(map_new(), A, 1), A)
+        "#;
+        let errs = check_src(bad_adt).unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains("must be Int or Str")),
+            "expected an ADT-key-restriction error, got: {:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn map_get_or_default_must_match_value_type() {
+        // The default (3rd arg) must have the map's value type V. A Str default
+        // for an `Int`-valued map is a type error.
+        let bad = r#"
+            fn main() -> Int = map_get_or(map_insert(map_new(), 1, 10), 1, "oops")
+        "#;
+        assert!(check_src(bad).is_err(), "expected a value-type mismatch error");
     }
 
     // ---- effect system (purity) -----------------------------------------

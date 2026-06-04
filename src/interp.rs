@@ -24,6 +24,12 @@ pub enum Value {
     /// from `Str` (own type tag) so `==`/display never conflate the two even when
     /// they hold identical bytes.
     Bytes(Vec<u8>),
+    /// An ordered map (`Map[K, V]`), kept SORTED BY KEY ascending so iteration,
+    /// display, and equality are deterministic and identical across all
+    /// backends. Keys are restricted (by the checker) to Int or Str.
+    Map(Vec<(Value, Value)>),
+    /// An ordered set (`Set[T]`), kept SORTED ascending. Elements are Int or Str.
+    Set(Vec<Value>),
     /// An opaque AI-runtime tensor handle, built and queried via builtins.
     Tensor(crate::tensor::Tensor),
     /// A first-class function value. A lambda captures the environment in which
@@ -62,6 +68,17 @@ impl Value {
                 format!("[{}]", inner.join(", "))
             }
             Value::Bytes(bs) => render_bytes(bs),
+            Value::Map(entries) => {
+                let inner: Vec<String> = entries
+                    .iter()
+                    .map(|(k, v)| format!("{}: {}", k.display(), v.display()))
+                    .collect();
+                format!("Map[{}]", inner.join(", "))
+            }
+            Value::Set(elems) => {
+                let inner: Vec<String> = elems.iter().map(|v| v.display()).collect();
+                format!("Set[{}]", inner.join(", "))
+            }
             Value::Closure(c) => {
                 format!("<closure/{}>", c.params.len())
             }
@@ -84,6 +101,22 @@ impl Value {
 pub fn render_bytes(bs: &[u8]) -> String {
     let inner: Vec<String> = bs.iter().map(|b| format!("{:02x}", b)).collect();
     format!("Bytes[{}]", inner.join(" "))
+}
+
+/// Total ordering on map keys / set elements. Keys are restricted to Int and Str
+/// by the type checker; Ints order numerically, Strs lexicographically by bytes.
+/// A mixed comparison cannot arise (a Map/Set is homogeneous), but is given a
+/// stable fallback so the function is total.
+fn key_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a, b) {
+        (Value::Int(x), Value::Int(y)) => x.cmp(y),
+        (Value::Str(x), Value::Str(y)) => x.as_bytes().cmp(y.as_bytes()),
+        // Unreachable for well-typed programs; keep a deterministic fallback.
+        (Value::Int(_), _) => Ordering::Less,
+        (_, Value::Int(_)) => Ordering::Greater,
+        _ => Ordering::Equal,
+    }
 }
 
 type Scope = Vec<HashMap<String, Value>>;
@@ -687,6 +720,17 @@ fn values_equal(a: &Value, b: &Value) -> bool {
         // through to `false` below: a Bytes never equals a Str (distinct tags),
         // and the type checker rejects such a comparison up front anyway.
         (Value::Bytes(x), Value::Bytes(y)) => x == y,
+        // Maps/Sets are kept sorted, so structural element-wise comparison of the
+        // ordered contents is exact equality of the abstract map/set.
+        (Value::Map(x), Value::Map(y)) => {
+            x.len() == y.len()
+                && x.iter()
+                    .zip(y)
+                    .all(|((k1, v1), (k2, v2))| values_equal(k1, k2) && values_equal(v1, v2))
+        }
+        (Value::Set(x), Value::Set(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(a, b)| values_equal(a, b))
+        }
         // Tensors compare structurally (shape + contents). Without this arm,
         // `t == t` fell through to `false`, silently disagreeing with the type
         // checker which accepts `==` on Tensor.
@@ -1023,6 +1067,101 @@ fn builtin(name: &str, args: &[Value]) -> Result<Option<Value>, String> {
             },
             _ => Err("bytes_to_str expects (Bytes)".into()),
         },
+
+        // ---- Ordered Map ---------------------------------------------------
+        // A Map is a Vec of (key, value) kept sorted by key. The interpreter is
+        // the oracle, so it copies (the compiled backends reuse in place when
+        // unique). `insert` replaces an existing key; the read API is total
+        // (`get_or` returns its default when the key is absent).
+        "map_new" => match args {
+            [] => Ok(Some(Value::Map(Vec::new()))),
+            _ => Err("map_new expects no arguments".into()),
+        },
+        "map_insert" => match args {
+            [Value::Map(entries), k, v] => {
+                let mut out = entries.clone();
+                match out.binary_search_by(|(ek, _)| key_cmp(ek, k)) {
+                    Ok(i) => out[i].1 = v.clone(),          // replace existing value
+                    Err(i) => out.insert(i, (k.clone(), v.clone())),
+                }
+                Ok(Some(Value::Map(out)))
+            }
+            _ => Err("map_insert expects (Map, K, V)".into()),
+        },
+        "map_get_or" => match args {
+            [Value::Map(entries), k, default] => {
+                let r = match entries.binary_search_by(|(ek, _)| key_cmp(ek, k)) {
+                    Ok(i) => entries[i].1.clone(),
+                    Err(_) => default.clone(),
+                };
+                Ok(Some(r))
+            }
+            _ => Err("map_get_or expects (Map, K, V)".into()),
+        },
+        "map_has" => match args {
+            [Value::Map(entries), k] => Ok(Some(Value::Bool(
+                entries.binary_search_by(|(ek, _)| key_cmp(ek, k)).is_ok(),
+            ))),
+            _ => Err("map_has expects (Map, K)".into()),
+        },
+        "map_len" => match args {
+            [Value::Map(entries)] => Ok(Some(Value::Int(entries.len() as i64))),
+            _ => Err("map_len expects (Map)".into()),
+        },
+        "map_remove" => match args {
+            [Value::Map(entries), k] => {
+                let mut out = entries.clone();
+                if let Ok(i) = out.binary_search_by(|(ek, _)| key_cmp(ek, k)) {
+                    out.remove(i);
+                }
+                Ok(Some(Value::Map(out)))
+            }
+            _ => Err("map_remove expects (Map, K)".into()),
+        },
+        "map_show" => match args {
+            [m @ Value::Map(_)] => Ok(Some(Value::Str(m.display()))),
+            _ => Err("map_show expects (Map)".into()),
+        },
+
+        // ---- Ordered Set ---------------------------------------------------
+        "set_new" => match args {
+            [] => Ok(Some(Value::Set(Vec::new()))),
+            _ => Err("set_new expects no arguments".into()),
+        },
+        "set_add" => match args {
+            [Value::Set(elems), x] => {
+                let mut out = elems.clone();
+                if let Err(i) = out.binary_search_by(|e| key_cmp(e, x)) {
+                    out.insert(i, x.clone()); // adding an existing element is a no-op
+                }
+                Ok(Some(Value::Set(out)))
+            }
+            _ => Err("set_add expects (Set, T)".into()),
+        },
+        "set_has" => match args {
+            [Value::Set(elems), x] => Ok(Some(Value::Bool(
+                elems.binary_search_by(|e| key_cmp(e, x)).is_ok(),
+            ))),
+            _ => Err("set_has expects (Set, T)".into()),
+        },
+        "set_len" => match args {
+            [Value::Set(elems)] => Ok(Some(Value::Int(elems.len() as i64))),
+            _ => Err("set_len expects (Set)".into()),
+        },
+        "set_remove" => match args {
+            [Value::Set(elems), x] => {
+                let mut out = elems.clone();
+                if let Ok(i) = out.binary_search_by(|e| key_cmp(e, x)) {
+                    out.remove(i);
+                }
+                Ok(Some(Value::Set(out)))
+            }
+            _ => Err("set_remove expects (Set, T)".into()),
+        },
+        "set_show" => match args {
+            [s @ Value::Set(_)] => Ok(Some(Value::Str(s.display()))),
+            _ => Err("set_show expects (Set)".into()),
+        },
         _ => Ok(None),
     }
 }
@@ -1121,9 +1260,32 @@ mod tests {
                 // array builtins have something to index/return.
                 Value::Array(vec![dummy(&args[0])])
             }
+            // A one-entry map / set, so the generic builtins have something to
+            // read. The drift test drives map/set builtins at Int key/element;
+            // the contained key/element is deliberately DISTINCT from the
+            // dummy(K) lookup key (which is `Int(0)`/empty `Str`) so a `remove`
+            // is a no-op and the container keeps its element type (an emptied
+            // container would lose its element types and fail the exact-type
+            // drift check).
+            Named(n, args) if n == "Map" => {
+                Value::Map(vec![(distinct_dummy_key(&args[0]), dummy(&args[1]))])
+            }
+            Named(n, args) if n == "Set" => Value::Set(vec![distinct_dummy_key(&args[0])]),
             // A generic element position: any concrete value will do.
             Var(_) => Value::Int(0),
             other => panic!("drift test has no dummy for {}", crate::typeck::show(other)),
+        }
+    }
+
+    // A dummy key/element value DISTINCT from `dummy(ty)`, so a `remove`/lookup
+    // driven with `dummy(ty)` misses and leaves a one-element container intact.
+    fn distinct_dummy_key(ty: &crate::ast::Ty) -> Value {
+        use crate::ast::Ty::*;
+        match ty {
+            Str => Value::Str("x".to_string()),
+            // Int keys, and a generic key var (drift drives these at Int): use 1
+            // (dummy(Int)/dummy(Var) is 0).
+            _ => Value::Int(1),
         }
     }
 
@@ -1141,6 +1303,17 @@ mod tests {
             Value::Array(xs) => Named(
                 "Array".into(),
                 vec![xs.first().map(value_ty).unwrap_or(Var("T".into()))],
+            ),
+            Value::Map(entries) => Named(
+                "Map".into(),
+                match entries.first() {
+                    Some((k, v)) => vec![value_ty(k), value_ty(v)],
+                    None => vec![Var("K".into()), Var("V".into())],
+                },
+            ),
+            Value::Set(elems) => Named(
+                "Set".into(),
+                vec![elems.first().map(value_ty).unwrap_or(Var("T".into()))],
             ),
             Value::Data { ctor, .. } => Named(ctor.clone(), vec![]),
             Value::Closure(c) => {
@@ -1405,6 +1578,112 @@ mod tests {
             run_err("fn main() -> String = bytes_to_str(bytes_push(bytes_new(), 255))")
                 .contains("invalid UTF-8")
         );
+    }
+
+    // ---- Map / Set (interpreter oracle behavior) ------------------------
+
+    #[test]
+    fn map_ordered_display_and_replacement() {
+        // Out-of-order inserts render in ASCENDING key order; an insert of an
+        // existing key REPLACES its value (does not duplicate it).
+        let v = run(r#"
+            fn main() -> Map[Int, Int] = {
+                let m = map_insert(map_insert(map_insert(map_new(), 30, 3), 10, 1), 20, 2);
+                map_insert(m, 10, 111)
+            }
+        "#);
+        assert_eq!(v.display(), "Map[10: 111, 20: 2, 30: 3]");
+        assert_eq!(run("fn main() -> Map[Int, Int] = map_new()").display(), "Map[]");
+    }
+
+    #[test]
+    fn map_get_or_total_read_and_default() {
+        // Present key returns its value; absent key returns the default (no
+        // Option type exists, so the read is total).
+        let present = run(r#"fn main() -> Int = map_get_or(map_insert(map_new(), 7, 42), 7, -1)"#);
+        assert!(matches!(present, Value::Int(42)));
+        let absent = run(r#"fn main() -> Int = map_get_or(map_insert(map_new(), 7, 42), 9, -1)"#);
+        assert!(matches!(absent, Value::Int(-1)));
+    }
+
+    #[test]
+    fn map_has_len_remove() {
+        let has = run(r#"fn main() -> Bool = map_has(map_insert(map_new(), 5, 1), 5)"#);
+        assert!(matches!(has, Value::Bool(true)));
+        let missing = run(r#"fn main() -> Bool = map_has(map_insert(map_new(), 5, 1), 6)"#);
+        assert!(matches!(missing, Value::Bool(false)));
+        let len = run(r#"
+            fn main() -> Int = {
+                let m = map_insert(map_insert(map_insert(map_new(), 1, 1), 2, 2), 1, 9);
+                map_len(m)
+            }
+        "#);
+        assert!(matches!(len, Value::Int(2)), "got {}", len.display()); // key 1 replaced, not added
+        let removed = run(r#"
+            fn main() -> Map[Int, Int] =
+                map_remove(map_insert(map_insert(map_new(), 1, 10), 2, 20), 1)
+        "#);
+        assert_eq!(removed.display(), "Map[2: 20]");
+        // Removing an absent key is a no-op.
+        let noop = run(r#"fn main() -> Int = map_len(map_remove(map_insert(map_new(), 1, 1), 99))"#);
+        assert!(matches!(noop, Value::Int(1)));
+    }
+
+    #[test]
+    fn map_str_keys_sorted_and_equality() {
+        let v = run(r#"
+            fn main() -> Map[String, Int] =
+                map_insert(map_insert(map_insert(map_new(), "pear", 3), "apple", 1), "fig", 2)
+        "#);
+        assert_eq!(v.display(), "Map[apple: 1, fig: 2, pear: 3]");
+        // Two maps built in different insertion orders are equal (sorted contents).
+        let eq = run(r#"
+            fn main() -> Bool = {
+                let a = map_insert(map_insert(map_new(), 1, 10), 2, 20);
+                let b = map_insert(map_insert(map_new(), 2, 20), 1, 10);
+                a == b
+            }
+        "#);
+        assert!(matches!(eq, Value::Bool(true)));
+        let ne = run(r#"
+            fn main() -> Bool = {
+                let a = map_insert(map_new(), 1, 10);
+                let b = map_insert(map_new(), 1, 99);
+                a == b
+            }
+        "#);
+        assert!(matches!(ne, Value::Bool(false)));
+    }
+
+    #[test]
+    fn set_ordered_dedup_display_and_ops() {
+        // Out-of-order, duplicate adds render sorted & deduped; add of an
+        // existing element is a no-op.
+        let v = run(r#"
+            fn main() -> Set[Int] =
+                set_add(set_add(set_add(set_add(set_new(), 30), 10), 20), 10)
+        "#);
+        assert_eq!(v.display(), "Set[10, 20, 30]");
+        assert_eq!(run("fn main() -> Set[Int] = set_new()").display(), "Set[]");
+        let len = run(r#"fn main() -> Int = set_len(set_add(set_add(set_new(), 1), 1))"#);
+        assert!(matches!(len, Value::Int(1))); // dedup
+        let has = run(r#"fn main() -> Bool = set_has(set_add(set_new(), 5), 5)"#);
+        assert!(matches!(has, Value::Bool(true)));
+        let removed = run(r#"fn main() -> Set[Int] = set_remove(set_add(set_add(set_new(), 1), 2), 1)"#);
+        assert_eq!(removed.display(), "Set[2]");
+        // Str set, sorted; equality independent of insertion order.
+        let strs = run(r#"
+            fn main() -> Set[String] = set_add(set_add(set_add(set_new(), "b"), "a"), "c")
+        "#);
+        assert_eq!(strs.display(), "Set[a, b, c]");
+        let eq = run(r#"
+            fn main() -> Bool = {
+                let a = set_add(set_add(set_new(), 1), 2);
+                let b = set_add(set_add(set_new(), 2), 1);
+                a == b
+            }
+        "#);
+        assert!(matches!(eq, Value::Bool(true)));
     }
 
     #[test]

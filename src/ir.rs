@@ -464,6 +464,8 @@ impl Lowerer {
                 // interpreter's `array_builtin` (unsuffixed) and the native/wasm
                 // backends (suffixed) handle them.
                 if !name.starts_with("array_")
+                    && !name.starts_with("map_")
+                    && !name.starts_with("set_")
                     && (self.bound.contains(name)
                         || (!self.fn_arities.contains_key(name)
                             && crate::builtins::lookup(name).is_none()))
@@ -472,6 +474,23 @@ impl Lowerer {
                     let t = self.fresh();
                     stmts.push((t.clone(), Bind::ApplyClosure(Atom::Var(name.clone()), atoms, None)));
                     return Ok(Atom::Var(t));
+                }
+                // Maps and Sets are FULLY supported by the interpreter and the
+                // native (C) backend, but NOT by the IR memory path (`aria mem`)
+                // or the wasm backend. The native path renames these to suffixed
+                // names (`map_insert$i_i`) during monomorphization, which have no
+                // `builtins::lookup` signature and so fall through to `Bind::Call`
+                // below. An UNSUFFIXED map/set builtin reaching lowering means we
+                // are on the IR-interpreter path: gate it with a clean error.
+                if crate::builtins::lookup(name).is_some()
+                    && (name.starts_with("map_") || name.starts_with("set_"))
+                {
+                    return Err(LowerError(format!(
+                        "maps/sets are not yet supported in the IR memory path \
+                         (`aria mem`) — use the interpreter `aria run` or the \
+                         native backend `aria native-run`: builtin `{}`",
+                        name
+                    )));
                 }
                 // Builtins the IR doesn't implement (tensors/RAG/compression) are
                 // outside the IR subset — reject at lowering with a clear message

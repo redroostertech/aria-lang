@@ -97,9 +97,79 @@ impl ElemKind {
             CType::Int | CType::Bool => ElemKind::Int,
             CType::Float => ElemKind::Float,
             CType::Str => ElemKind::Str,
-            // A Bytes buffer is a heap pointer, so an array element of Bytes is a
-            // boxed heap ref (recursive drop), like a nested Array/ADT.
-            CType::Ref | CType::Bytes | CType::Array(_) => ElemKind::Ref,
+            // A Bytes/Map/Set buffer is a heap pointer, so an array element of one
+            // is a boxed heap ref (recursive drop), like a nested Array/ADT.
+            CType::Ref | CType::Bytes | CType::Array(_) | CType::Map(..) | CType::Set(_) => {
+                ElemKind::Ref
+            }
+        }
+    }
+}
+
+/// A richer per-slot kind for the Map/Set runtime: a map key/value or set
+/// element may be ANY supported Aria type, and each needs the CORRECT recursive
+/// drop (a Str, a Bytes buffer, an Array, an ADT cell, or a nested Map/Set use
+/// different drop functions). The integer `code()` is stored in the AriaMap /
+/// AriaSet header and drives the kind-aware runtime dup/drop. Map keys are only
+/// ever `Int` or `Str` (the checker's restriction).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlotKind {
+    Int,   // Int — stored directly, no drop
+    Float, // Float — f64 bit-reinterpreted, no drop
+    Str,   // AriaStr* — aria_str_drop
+    Ref,   // ADT cell / closure — aria_drop
+    Bytes, // AriaBytes* — aria_bytes_drop
+    Array, // AriaArray* — aria_array_drop
+    Map,   // AriaMap* — aria_map_drop
+    Set,   // AriaSet* — aria_set_drop
+    Bool,  // Bool — stored directly (0/1); distinct from Int so DISPLAY renders
+           // `true`/`false` (matching the interpreter) rather than `1`/`0`.
+}
+
+impl SlotKind {
+    fn code(self) -> i64 {
+        match self {
+            SlotKind::Int => 0,
+            SlotKind::Float => 1,
+            SlotKind::Str => 2,
+            SlotKind::Ref => 3,
+            SlotKind::Bytes => 4,
+            SlotKind::Array => 5,
+            SlotKind::Map => 6,
+            SlotKind::Set => 7,
+            SlotKind::Bool => 8,
+        }
+    }
+    fn from_ctype(ct: CType) -> SlotKind {
+        match ct {
+            CType::Int => SlotKind::Int,
+            CType::Bool => SlotKind::Bool,
+            CType::Float => SlotKind::Float,
+            CType::Str => SlotKind::Str,
+            CType::Ref => SlotKind::Ref,
+            CType::Bytes => SlotKind::Bytes,
+            CType::Array(_) => SlotKind::Array,
+            CType::Map(..) => SlotKind::Map,
+            CType::Set(_) => SlotKind::Set,
+        }
+    }
+    /// Encode an evaluated C expression of value type `t` into an int64 slot.
+    fn encode(self, t: CType, ex: &str) -> String {
+        match self {
+            SlotKind::Int | SlotKind::Bool => format!("(int64_t)({})", ex),
+            SlotKind::Float => format!("aria_f2i({})", ex),
+            _ => {
+                let _ = t;
+                format!("(int64_t)(uintptr_t)({})", ex)
+            }
+        }
+    }
+    /// Decode an int64 slot back to a C value expression of the slot's ctype.
+    fn decode(self, slot: &str) -> String {
+        match self {
+            SlotKind::Int | SlotKind::Bool => slot.to_string(),
+            SlotKind::Float => format!("aria_i2f({})", slot),
+            _ => format!("(void*)(uintptr_t)({})", slot),
         }
     }
 }
@@ -107,13 +177,15 @@ impl ElemKind {
 /// A C-level value type for an Aria value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CType {
-    Int,             // int64_t
-    Bool,            // int64_t (0/1)
-    Float,           // double
-    Ref,             // void* — heap ADT cell
-    Str,             // void* — heap String object
-    Bytes,           // void* — heap AriaBytes buffer (flat byte buffer)
-    Array(ElemKind), // void* — heap AriaArray of the given element kind
+    Int,                 // int64_t
+    Bool,                // int64_t (0/1)
+    Float,               // double
+    Ref,                 // void* — heap ADT cell
+    Str,                 // void* — heap String object
+    Bytes,               // void* — heap AriaBytes buffer (flat byte buffer)
+    Array(ElemKind),     // void* — heap AriaArray of the given element kind
+    Map(SlotKind, SlotKind), // void* — heap AriaMap (key kind, value kind)
+    Set(SlotKind),       // void* — heap AriaSet (element kind)
 }
 
 impl CType {
@@ -122,7 +194,12 @@ impl CType {
         match self {
             CType::Int | CType::Bool => "int64_t",
             CType::Float => "double",
-            CType::Ref | CType::Str | CType::Bytes | CType::Array(_) => "void*",
+            CType::Ref
+            | CType::Str
+            | CType::Bytes
+            | CType::Array(_)
+            | CType::Map(..)
+            | CType::Set(_) => "void*",
         }
     }
 
@@ -139,6 +216,15 @@ impl CType {
                 Ok(CType::Array(ElemKind::from_ctype(elem)))
             }
             Ty::Named(n, _) if n == "Bytes" => Ok(CType::Bytes),
+            Ty::Named(n, args) if n == "Map" && args.len() == 2 => {
+                let k = SlotKind::from_ctype(CType::from_ty(&args[0])?);
+                let v = SlotKind::from_ctype(CType::from_ty(&args[1])?);
+                Ok(CType::Map(k, v))
+            }
+            Ty::Named(n, args) if n == "Set" && args.len() == 1 => {
+                let e = SlotKind::from_ctype(CType::from_ty(&args[0])?);
+                Ok(CType::Set(e))
+            }
             Ty::Named(_, args) if args.is_empty() => Ok(CType::Ref),
             // A closure value is a heap cell (tag = lambda id, fields = captures).
             Ty::Fn(_, _) => Ok(CType::Ref),
@@ -166,6 +252,30 @@ fn parse_array_builtin(name: &str) -> Option<(&'static str, ElemKind)> {
         _ => return None,
     };
     Some((base, kind))
+}
+
+/// Parse a suffixed map/set builtin name (`map_insert$i_r`, `set_add$s`, …) into
+/// its base operation. The element kinds are recovered from the operands' static
+/// C types at emit time (which carry the PRECISE kind, unlike the coarse `$r`
+/// name suffix). Returns `None` if not a map/set builtin.
+fn parse_map_set_builtin(name: &str) -> Option<&'static str> {
+    let (base, _suffix) = name.rsplit_once('$')?;
+    match base {
+        "map_new" => Some("map_new"),
+        "map_insert" => Some("map_insert"),
+        "map_get_or" => Some("map_get_or"),
+        "map_has" => Some("map_has"),
+        "map_len" => Some("map_len"),
+        "map_remove" => Some("map_remove"),
+        "map_show" => Some("map_show"),
+        "set_new" => Some("set_new"),
+        "set_add" => Some("set_add"),
+        "set_has" => Some("set_has"),
+        "set_len" => Some("set_len"),
+        "set_remove" => Some("set_remove"),
+        "set_show" => Some("set_show"),
+        _ => None,
+    }
 }
 
 /// A function's C-level signature, derived from the typed AST.
@@ -392,9 +502,12 @@ fn bind_type(bind: &Bind, env: &Env) -> Result<CType, String> {
             UnOp::Neg => atom_type(a, env),
             UnOp::Not => Ok(CType::Bool),
         },
-        Bind::Call(name, _) => {
+        Bind::Call(name, args) => {
             if let Some((base, kind)) = parse_array_builtin(name) {
                 return Ok(array_builtin_ret(base, kind));
+            }
+            if let Some(base) = parse_map_set_builtin(name) {
+                return map_set_builtin_ret(base, name, args, env);
             }
             if let Some(t) = builtin_ret(name) {
                 return Ok(t);
@@ -557,7 +670,116 @@ fn builtin_ret(name: &str) -> Option<CType> {
 }
 
 fn is_builtin(name: &str) -> bool {
-    builtin_ret(name).is_some() || parse_array_builtin(name).is_some()
+    builtin_ret(name).is_some()
+        || parse_array_builtin(name).is_some()
+        || parse_map_set_builtin(name).is_some()
+}
+
+/// A COARSE `SlotKind` from a single element-kind tag char (`i`/`f`/`s`/`r`).
+/// The monomorphizer collapses all heap-ref types to `r`, so this returns
+/// `SlotKind::Ref` for any non-scalar — the PRECISE kind is recovered from the
+/// operand's static `CType` at emit time. Used only where no operand is
+/// available (`map_new`/`set_new`'s header kinds, harmless as they hold no
+/// elements until reconciled on first insert).
+fn slot_kind_from_tag(c: char) -> SlotKind {
+    match c {
+        'i' => SlotKind::Int,
+        'f' => SlotKind::Float,
+        's' => SlotKind::Str,
+        _ => SlotKind::Ref,
+    }
+}
+
+/// Parse the `$<keytag>_<valtag>` (map) or `$<elemtag>` (set) name suffix into
+/// coarse (key, value) / (element) slot kinds.
+fn map_set_suffix_kinds(name: &str) -> (SlotKind, SlotKind) {
+    let suffix = name.rsplit_once('$').map(|(_, s)| s).unwrap_or("");
+    match suffix.split_once('_') {
+        Some((k, v)) => (
+            slot_kind_from_tag(k.chars().next().unwrap_or('i')),
+            slot_kind_from_tag(v.chars().next().unwrap_or('i')),
+        ),
+        None => {
+            let e = slot_kind_from_tag(suffix.chars().next().unwrap_or('i'));
+            (e, e)
+        }
+    }
+}
+
+/// The C result type of a map/set builtin. Container-producing ops recover the
+/// precise key/value (element) kinds from their operand's static `CType` when
+/// available (a `map_*`/`set_*` op takes the container as arg 0), falling back to
+/// the coarse name-suffix kinds for the empty constructors. `map_get_or` yields
+/// the value type; the predicates/`*_len` yield Bool/Int.
+fn map_set_builtin_ret(base: &str, name: &str, args: &[Atom], env: &Env) -> Result<CType, String> {
+    let (sk, sv) = map_set_suffix_kinds(name);
+    // Recover precise container kinds from the first argument when present.
+    let container_kinds = |env: &Env| -> Option<(SlotKind, SlotKind)> {
+        match args.first().map(|a| atom_type(a, env)) {
+            Some(Ok(CType::Map(k, v))) => Some((k, v)),
+            Some(Ok(CType::Set(e))) => Some((e, e)),
+            _ => None,
+        }
+    };
+    match base {
+        "map_new" => Ok(CType::Map(sk, sv)),
+        "map_insert" => {
+            // Precise value kind from the inserted value (arg 2); precise key
+            // kind from arg 1.
+            let k = match args.get(1).map(|a| atom_type(a, env)) {
+                Some(Ok(t)) => SlotKind::from_ctype(t),
+                _ => sk,
+            };
+            let v = match args.get(2).map(|a| atom_type(a, env)) {
+                Some(Ok(t)) => SlotKind::from_ctype(t),
+                _ => sv,
+            };
+            Ok(CType::Map(k, v))
+        }
+        "map_remove" => {
+            let (k, v) = container_kinds(env).unwrap_or((sk, sv));
+            Ok(CType::Map(k, v))
+        }
+        "map_get_or" => {
+            // The value type: prefer the default (arg 2)'s precise type.
+            match args.get(2).map(|a| atom_type(a, env)) {
+                Some(Ok(t)) => Ok(t),
+                _ => Ok(slot_kind_ctype(sv)),
+            }
+        }
+        "map_has" | "set_has" => Ok(CType::Bool),
+        "map_len" | "set_len" => Ok(CType::Int),
+        "map_show" | "set_show" => Ok(CType::Str),
+        "set_new" => Ok(CType::Set(sk)),
+        "set_add" => {
+            let e = match args.get(1).map(|a| atom_type(a, env)) {
+                Some(Ok(t)) => SlotKind::from_ctype(t),
+                _ => sk,
+            };
+            Ok(CType::Set(e))
+        }
+        "set_remove" => {
+            let (e, _) = container_kinds(env).unwrap_or((sk, sv));
+            Ok(CType::Set(e))
+        }
+        _ => Err(format!("c backend: unknown map/set builtin `{}`", base)),
+    }
+}
+
+/// A representative `CType` for a `SlotKind` (used when no operand pins the
+/// precise type — only the scalar/Str/Ref distinction matters there).
+fn slot_kind_ctype(k: SlotKind) -> CType {
+    match k {
+        SlotKind::Int => CType::Int,
+        SlotKind::Bool => CType::Bool,
+        SlotKind::Float => CType::Float,
+        SlotKind::Str => CType::Str,
+        SlotKind::Bytes => CType::Bytes,
+        SlotKind::Array => CType::Array(ElemKind::Ref),
+        SlotKind::Map => CType::Map(SlotKind::Ref, SlotKind::Ref),
+        SlotKind::Set => CType::Set(SlotKind::Ref),
+        SlotKind::Ref => CType::Ref,
+    }
 }
 
 /// The C result type of an array builtin: builders yield an `Array(kind)`,
@@ -613,6 +835,12 @@ fn emit_iexpr(
                 CType::Bytes => {
                     let _ = writeln!(out, "{}aria_bytes_dup({});", ind, cvar(v));
                 }
+                CType::Map(..) => {
+                    let _ = writeln!(out, "{}aria_map_dup({});", ind, cvar(v));
+                }
+                CType::Set(_) => {
+                    let _ = writeln!(out, "{}aria_set_dup({});", ind, cvar(v));
+                }
                 _ => {}
             }
             emit_iexpr(body, result, result_ty, env, ind, out)
@@ -630,6 +858,12 @@ fn emit_iexpr(
                 }
                 CType::Bytes => {
                     let _ = writeln!(out, "{}aria_bytes_drop({});", ind, cvar(v));
+                }
+                CType::Map(..) => {
+                    let _ = writeln!(out, "{}aria_map_drop({});", ind, cvar(v));
+                }
+                CType::Set(_) => {
+                    let _ = writeln!(out, "{}aria_set_drop({});", ind, cvar(v));
                 }
                 _ => {}
             }
@@ -748,7 +982,7 @@ fn emit_make_closure(
             CType::Float => {
                 let _ = writeln!(out, "{}aria_field({}, {}) = aria_f2i({});", ind, dst, i, ex);
             }
-            CType::Ref | CType::Str | CType::Bytes | CType::Array(_) => {
+            CType::Ref | CType::Str | CType::Bytes | CType::Array(_) | CType::Map(..) | CType::Set(_) => {
                 let _ = writeln!(out, "{}aria_field({}, {}) = (int64_t)(uintptr_t)({});", ind, dst, i, ex);
             }
         }
@@ -892,6 +1126,16 @@ fn emit_prim(
                 );
                 return Ok(());
             }
+            if matches!(lt, CType::Map(..)) && matches!(rt, CType::Map(..)) {
+                let cmp = if op == BinOp::Eq { "" } else { "!" };
+                let _ = writeln!(out, "{}{} = {}aria_map_eq_consume({}, {});", ind, dst, cmp, lx, rx);
+                return Ok(());
+            }
+            if matches!(lt, CType::Set(_)) && matches!(rt, CType::Set(_)) {
+                let cmp = if op == BinOp::Eq { "" } else { "!" };
+                let _ = writeln!(out, "{}{} = {}aria_set_eq_consume({}, {});", ind, dst, cmp, lx, rx);
+                return Ok(());
+            }
             // Scalar ==/!= (Int/Bool/Float) — direct C comparison.
             let cop = if op == BinOp::Eq { "==" } else { "!=" };
             let _ = writeln!(out, "{}{} = ({} {} {});", ind, dst, lx, cop, rx);
@@ -998,6 +1242,9 @@ fn emit_builtin(
 ) -> Result<(), String> {
     if let Some((base, kind)) = parse_array_builtin(name) {
         return emit_array_builtin(base, kind, args, dst, env, ind, out);
+    }
+    if let Some(base) = parse_map_set_builtin(name) {
+        return emit_map_set_builtin(base, name, args, dst, env, ind, out);
     }
     match name {
         "concat" => {
@@ -1141,7 +1388,7 @@ fn encode_elem_slot(kind: ElemKind, t: CType, ex: &str) -> Result<String, String
         ElemKind::Int => matches!(t, CType::Int | CType::Bool),
         ElemKind::Float => t == CType::Float,
         ElemKind::Str => t == CType::Str,
-        ElemKind::Ref => matches!(t, CType::Ref | CType::Str | CType::Bytes | CType::Array(_)),
+        ElemKind::Ref => matches!(t, CType::Ref | CType::Str | CType::Bytes | CType::Array(_) | CType::Map(..) | CType::Set(_)),
     };
     if !ok {
         return Err(format!(
@@ -1255,6 +1502,225 @@ fn emit_array_builtin(
     }
 }
 
+/// Emit a native map/set builtin. The precise key/value/element kinds are read
+/// from the operands' static `CType`s and passed to the `aria_map_*`/`aria_set_*`
+/// runtime, which keeps the container sorted by key/element and does the
+/// kind-aware dup/drop. Each helper CONSUMES its container argument (rc-balanced:
+/// the rc pass dup'd it if reused), mirroring the array runtime.
+fn emit_map_set_builtin(
+    base: &str,
+    name: &str,
+    args: &[Atom],
+    dst: &str,
+    env: &mut Env,
+    ind: &str,
+    out: &mut String,
+) -> Result<(), String> {
+    // The coarse header kinds for the empty constructors; precise kinds come
+    // from operands for every op that has one.
+    let (sk, sv) = map_set_suffix_kinds(name);
+    match base {
+        "map_new" => {
+            if !args.is_empty() {
+                return Err("c backend: map_new expects no arguments".into());
+            }
+            let _ = writeln!(
+                out,
+                "{}{} = aria_map_new(INT64_C({}), INT64_C({}));",
+                ind, dst, sk.code(), sv.code()
+            );
+            Ok(())
+        }
+        "map_insert" => {
+            if args.len() != 3 {
+                return Err("c backend: map_insert expects (map, key, value)".into());
+            }
+            let (mt, m) = emit_atom(&args[0], env, out)?;
+            let (kk, vk) = map_kinds_of(mt)?;
+            let (kt, kex) = emit_atom(&args[1], env, out)?;
+            let (vt, vex) = emit_atom(&args[2], env, out)?;
+            // Use the precise kinds of the actual key/value operands.
+            let kk = unify_slot(kk, SlotKind::from_ctype(kt));
+            let vk = unify_slot(vk, SlotKind::from_ctype(vt));
+            let kslot = kk.encode(kt, &kex);
+            let vslot = vk.encode(vt, &vex);
+            let _ = writeln!(
+                out,
+                "{}{} = aria_map_insert({}, {}, {}, INT64_C({}), INT64_C({}));",
+                ind, dst, m, kslot, vslot, kk.code(), vk.code()
+            );
+            Ok(())
+        }
+        "map_get_or" => {
+            if args.len() != 3 {
+                return Err("c backend: map_get_or expects (map, key, default)".into());
+            }
+            let (mt, m) = emit_atom(&args[0], env, out)?;
+            let (kk, vk) = map_kinds_of(mt)?;
+            let (kt, kex) = emit_atom(&args[1], env, out)?;
+            let (vt, vex) = emit_atom(&args[2], env, out)?;
+            let kk = unify_slot(kk, SlotKind::from_ctype(kt));
+            let vk = unify_slot(vk, SlotKind::from_ctype(vt));
+            let kslot = kk.encode(kt, &kex);
+            let vslot = vk.encode(vt, &vex);
+            // Returns the value slot (the stored value dup'd, or the default).
+            let call = format!(
+                "aria_map_get_or({}, {}, {}, INT64_C({}), INT64_C({}))",
+                m, kslot, vslot, kk.code(), vk.code()
+            );
+            let _ = writeln!(out, "{}{} = {};", ind, dst, vk.decode(&call));
+            Ok(())
+        }
+        "map_has" => {
+            if args.len() != 2 {
+                return Err("c backend: map_has expects (map, key)".into());
+            }
+            let (mt, m) = emit_atom(&args[0], env, out)?;
+            let (kk, _) = map_kinds_of(mt)?;
+            let (kt, kex) = emit_atom(&args[1], env, out)?;
+            let kk = unify_slot(kk, SlotKind::from_ctype(kt));
+            let kslot = kk.encode(kt, &kex);
+            let _ = writeln!(
+                out,
+                "{}{} = aria_map_has({}, {}, INT64_C({}));",
+                ind, dst, m, kslot, kk.code()
+            );
+            Ok(())
+        }
+        "map_len" => {
+            if args.len() != 1 {
+                return Err("c backend: map_len expects (map)".into());
+            }
+            let (_, m) = emit_atom(&args[0], env, out)?;
+            let _ = writeln!(out, "{}{} = aria_map_len({});", ind, dst, m);
+            Ok(())
+        }
+        "map_show" => {
+            if args.len() != 1 {
+                return Err("c backend: map_show expects (map)".into());
+            }
+            let (_, m) = emit_atom(&args[0], env, out)?;
+            let _ = writeln!(out, "{}{} = aria_map_show({});", ind, dst, m);
+            Ok(())
+        }
+        "map_remove" => {
+            if args.len() != 2 {
+                return Err("c backend: map_remove expects (map, key)".into());
+            }
+            let (mt, m) = emit_atom(&args[0], env, out)?;
+            let (kk, _) = map_kinds_of(mt)?;
+            let (kt, kex) = emit_atom(&args[1], env, out)?;
+            let kk = unify_slot(kk, SlotKind::from_ctype(kt));
+            let kslot = kk.encode(kt, &kex);
+            let _ = writeln!(
+                out,
+                "{}{} = aria_map_remove({}, {}, INT64_C({}));",
+                ind, dst, m, kslot, kk.code()
+            );
+            Ok(())
+        }
+        "set_new" => {
+            if !args.is_empty() {
+                return Err("c backend: set_new expects no arguments".into());
+            }
+            let _ = writeln!(out, "{}{} = aria_set_new(INT64_C({}));", ind, dst, sk.code());
+            Ok(())
+        }
+        "set_add" => {
+            if args.len() != 2 {
+                return Err("c backend: set_add expects (set, elem)".into());
+            }
+            let (st, s) = emit_atom(&args[0], env, out)?;
+            let ek = set_kind_of(st)?;
+            let (et, eex) = emit_atom(&args[1], env, out)?;
+            let ek = unify_slot(ek, SlotKind::from_ctype(et));
+            let eslot = ek.encode(et, &eex);
+            let _ = writeln!(
+                out,
+                "{}{} = aria_set_add({}, {}, INT64_C({}));",
+                ind, dst, s, eslot, ek.code()
+            );
+            Ok(())
+        }
+        "set_has" => {
+            if args.len() != 2 {
+                return Err("c backend: set_has expects (set, elem)".into());
+            }
+            let (st, s) = emit_atom(&args[0], env, out)?;
+            let ek = set_kind_of(st)?;
+            let (et, eex) = emit_atom(&args[1], env, out)?;
+            let ek = unify_slot(ek, SlotKind::from_ctype(et));
+            let eslot = ek.encode(et, &eex);
+            let _ = writeln!(
+                out,
+                "{}{} = aria_set_has({}, {}, INT64_C({}));",
+                ind, dst, s, eslot, ek.code()
+            );
+            Ok(())
+        }
+        "set_len" => {
+            if args.len() != 1 {
+                return Err("c backend: set_len expects (set)".into());
+            }
+            let (_, s) = emit_atom(&args[0], env, out)?;
+            let _ = writeln!(out, "{}{} = aria_set_len({});", ind, dst, s);
+            Ok(())
+        }
+        "set_show" => {
+            if args.len() != 1 {
+                return Err("c backend: set_show expects (set)".into());
+            }
+            let (_, s) = emit_atom(&args[0], env, out)?;
+            let _ = writeln!(out, "{}{} = aria_set_show({});", ind, dst, s);
+            Ok(())
+        }
+        "set_remove" => {
+            if args.len() != 2 {
+                return Err("c backend: set_remove expects (set, elem)".into());
+            }
+            let (st, s) = emit_atom(&args[0], env, out)?;
+            let ek = set_kind_of(st)?;
+            let (et, eex) = emit_atom(&args[1], env, out)?;
+            let ek = unify_slot(ek, SlotKind::from_ctype(et));
+            let eslot = ek.encode(et, &eex);
+            let _ = writeln!(
+                out,
+                "{}{} = aria_set_remove({}, {}, INT64_C({}));",
+                ind, dst, s, eslot, ek.code()
+            );
+            Ok(())
+        }
+        _ => Err(format!("c backend: unsupported map/set builtin `{}`", base)),
+    }
+}
+
+/// The (key, value) slot kinds of a `CType::Map`.
+fn map_kinds_of(t: CType) -> Result<(SlotKind, SlotKind), String> {
+    match t {
+        CType::Map(k, v) => Ok((k, v)),
+        other => Err(format!("c backend: expected a Map, got {:?}", other)),
+    }
+}
+
+/// The element slot kind of a `CType::Set`.
+fn set_kind_of(t: CType) -> Result<SlotKind, String> {
+    match t {
+        CType::Set(e) => Ok(e),
+        other => Err(format!("c backend: expected a Set, got {:?}", other)),
+    }
+}
+
+/// Prefer the PRECISE operand kind over a coarse `Ref` recovered from a stale
+/// header/suffix: when the container's recorded kind is the catch-all `Ref` but
+/// the operand carries a more specific heap kind (Bytes/Array/Map/Set), use the
+/// operand's. (For scalar kinds the two always agree for a well-typed program.)
+fn unify_slot(container: SlotKind, operand: SlotKind) -> SlotKind {
+    match (container, operand) {
+        (SlotKind::Ref, k) => k,
+        (k, _) => k,
+    }
+}
+
 fn check_ctor<'a>(
     name: &str,
     fields: &[Atom],
@@ -1299,7 +1765,7 @@ fn emit_store_fields(
             CType::Float => {
                 let _ = writeln!(out, "{}aria_field({}, {}) = aria_f2i({});", ind, cellptr, i, ex);
             }
-            CType::Ref | CType::Str | CType::Bytes | CType::Array(_) => {
+            CType::Ref | CType::Str | CType::Bytes | CType::Array(_) | CType::Map(..) | CType::Set(_) => {
                 let _ = writeln!(out, "{}aria_field({}, {}) = (int64_t)(uintptr_t)({});", ind, cellptr, i, ex);
             }
         }
@@ -1408,7 +1874,7 @@ fn emit_arm_body(
                         format!("aria_field({}, {})", sv, idx)
                     }
                     CType::Float => format!("aria_i2f(aria_field({}, {}))", sv, idx),
-                    CType::Ref | CType::Str | CType::Bytes | CType::Array(_) => {
+                    CType::Ref | CType::Str | CType::Bytes | CType::Array(_) | CType::Map(..) | CType::Set(_) => {
                         format!("(void*)(uintptr_t)aria_field({}, {})", sv, idx)
                     }
                 };
@@ -1850,8 +2316,460 @@ static void aria_print_bytes_value(void* p) {
     fputs("]\n", stdout);
 }
 
-/* ---- structural equality (per-tag, emitted below) ---- */
+/* ---- Ordered Map and Set -------------------------------------------------
+   An AriaMap is kept SORTED BY KEY ascending; an AriaSet sorted by element.
+   This makes iteration / display / equality deterministic and identical to the
+   interpreter (the differential oracle). Storage is an insertion-sorted array of
+   int64 slots: a Map stores interleaved [k0,v0,k1,v1,...], a Set stores
+   [e0,e1,...]. Each slot is encoded like the array runtime (Int directly, Float
+   via aria_f2i, heap pointer via uintptr_t). `kkind`/`vkind` (the SlotKind codes
+   0=Int,1=Float,2=Str,3=Ref,4=Bytes,5=Array,6=Map,7=Set) drive the kind-aware
+   dup/drop. Keys are only ever Int(0) or Str(2). FBIP: insert/add/remove mutate
+   in place when rc==1, else copy-on-write — always garbage-free. */
 static int64_t aria_eq(void* a, void* b);
+static int64_t aria_byteseq(void* a, void* b);
+static int64_t aria_streq(void* a, void* b);
+static void aria_print_int_inline(int64_t n);
+static void aria_print_float_inline(double d);
+static void aria_map_dup(void* p);
+static void aria_map_drop(void* p);
+static void aria_set_dup(void* p);
+static void aria_set_drop(void* p);
+static int64_t aria_map_eq(void* a, void* b);
+static int64_t aria_set_eq(void* a, void* b);
+static void aria_print_map_value(void* p);
+static void aria_print_set_value(void* p);
+
+/* Dup / drop a single slot by its SlotKind code. */
+static void aria_slot_dup(int64_t kind, int64_t slot) {
+    switch (kind) {
+        case 2: aria_str_dup((void*)(uintptr_t)slot); break;
+        case 3: aria_dup((void*)(uintptr_t)slot); break;
+        case 4: aria_bytes_dup((void*)(uintptr_t)slot); break;
+        case 5: aria_array_dup((void*)(uintptr_t)slot); break;
+        case 6: aria_map_dup((void*)(uintptr_t)slot); break;
+        case 7: aria_set_dup((void*)(uintptr_t)slot); break;
+        default: break;  /* Int/Float: nothing to dup */
+    }
+}
+static void aria_slot_drop(int64_t kind, int64_t slot) {
+    switch (kind) {
+        case 2: aria_str_drop((void*)(uintptr_t)slot); break;
+        case 3: aria_drop((void*)(uintptr_t)slot); break;
+        case 4: aria_bytes_drop((void*)(uintptr_t)slot); break;
+        case 5: aria_array_drop((void*)(uintptr_t)slot); break;
+        case 6: aria_map_drop((void*)(uintptr_t)slot); break;
+        case 7: aria_set_drop((void*)(uintptr_t)slot); break;
+        default: break;
+    }
+}
+/* Total ordering on keys/elements. kind is 0 (Int) or 2 (Str). Returns <0/0/>0. */
+static int aria_key_cmp(int64_t kind, int64_t a, int64_t b) {
+    if (kind == 2) {
+        AriaStr* x = (AriaStr*)(uintptr_t)a; AriaStr* y = (AriaStr*)(uintptr_t)b;
+        int64_t n = x->len < y->len ? x->len : y->len;
+        int c = memcmp(x->bytes, y->bytes, (size_t)n);
+        if (c != 0) return c;
+        if (x->len < y->len) return -1;
+        if (x->len > y->len) return 1;
+        return 0;
+    }
+    /* Int (kind 0): signed numeric order. */
+    if (a < b) return -1;
+    if (a > b) return 1;
+    return 0;
+}
+/* Compare two value slots for equality, kind-aware. */
+static int64_t aria_slot_eq(int64_t kind, int64_t a, int64_t b) {
+    switch (kind) {
+        case 1: return aria_i2f(a) == aria_i2f(b);                  /* Float */
+        case 2: return aria_streq((void*)(uintptr_t)a, (void*)(uintptr_t)b);
+        case 3: return aria_eq((void*)(uintptr_t)a, (void*)(uintptr_t)b);
+        case 4: return aria_byteseq((void*)(uintptr_t)a, (void*)(uintptr_t)b);
+        case 6: return aria_map_eq((void*)(uintptr_t)a, (void*)(uintptr_t)b);
+        case 7: return aria_set_eq((void*)(uintptr_t)a, (void*)(uintptr_t)b);
+        default: return a == b;                                      /* Int */
+    }
+}
+/* Print a single value slot inline (no trailing newline), matching the
+   interpreter's display for that value type. */
+static void aria_print_slot(int64_t kind, int64_t slot) {
+    switch (kind) {
+        case 1: aria_print_float_inline(aria_i2f(slot)); break;
+        case 2: { AriaStr* s = (AriaStr*)(uintptr_t)slot; fwrite(s->bytes, 1, (size_t)s->len, stdout); break; }
+        case 4: aria_print_bytes_value((void*)(uintptr_t)slot); break;  /* Bytes already has its own form */
+        case 6: aria_print_map_value((void*)(uintptr_t)slot); break;
+        case 7: aria_print_set_value((void*)(uintptr_t)slot); break;
+        case 8: fputs(slot ? "true" : "false", stdout); break;  /* Bool */
+        default: aria_print_int_inline(slot); break;  /* Int */
+    }
+}
+
+typedef struct { int64_t rc; int64_t kkind; int64_t vkind; int64_t len; int64_t cap; int64_t slots[]; } AriaMap;
+
+static void* aria_map_alloc(int64_t kkind, int64_t vkind, int64_t cap) {
+    AriaMap* m = (AriaMap*)malloc(sizeof(AriaMap) + (size_t)cap * 2 * sizeof(int64_t));
+    if (!m) aria_trap();
+    m->rc = 1; m->kkind = kkind; m->vkind = vkind; m->len = 0; m->cap = cap;
+    aria_live++;
+    return (void*)m;
+}
+static void* aria_map_new(int64_t kkind, int64_t vkind) { return aria_map_alloc(kkind, vkind, 0); }
+static void aria_map_dup(void* p) { ((AriaMap*)p)->rc++; }
+static void aria_map_drop(void* p) {
+    AriaMap* m = (AriaMap*)p;
+    if (--m->rc == 0) {
+        for (int64_t i = 0; i < m->len; i++) {
+            aria_slot_drop(m->kkind, m->slots[2*i]);
+            aria_slot_drop(m->vkind, m->slots[2*i+1]);
+        }
+        aria_live--;
+        free(m);
+    }
+}
+static int64_t aria_map_len(void* p) {
+    int64_t n = ((AriaMap*)p)->len;
+    aria_map_drop(p);  /* map_len consumes its argument */
+    return n;
+}
+/* Binary search for `key` (kind kkind); returns the index if present (sets
+   *found=1) or the insertion point (*found=0). */
+static int64_t aria_map_find(AriaMap* m, int64_t key, int* found) {
+    int64_t lo = 0, hi = m->len;
+    while (lo < hi) {
+        int64_t mid = lo + (hi - lo) / 2;
+        int c = aria_key_cmp(m->kkind, m->slots[2*mid], key);
+        if (c == 0) { *found = 1; return mid; }
+        if (c < 0) lo = mid + 1; else hi = mid;
+    }
+    *found = 0;
+    return lo;
+}
+static AriaMap* aria_map_clone(AriaMap* m) {
+    int64_t cap = m->len > 0 ? m->len : 1;
+    AriaMap* n = (AriaMap*)aria_map_alloc(m->kkind, m->vkind, cap);
+    n->len = m->len;
+    for (int64_t i = 0; i < m->len; i++) {
+        n->slots[2*i]   = m->slots[2*i];   aria_slot_dup(m->kkind, m->slots[2*i]);
+        n->slots[2*i+1] = m->slots[2*i+1]; aria_slot_dup(m->vkind, m->slots[2*i+1]);
+    }
+    return n;
+}
+static AriaMap* aria_map_grow(AriaMap* m) {
+    if (m->len < m->cap) return m;
+    int64_t ncap = m->cap > 0 ? m->cap * 2 : 4;
+    AriaMap* g = (AriaMap*)realloc(m, sizeof(AriaMap) + (size_t)ncap * 2 * sizeof(int64_t));
+    if (!g) aria_trap();
+    g->cap = ncap;
+    return g;
+}
+/* Insert (or replace) key->val. Ownership of `key` and `val` transfers in. A
+   replaced key's old value is dropped; the duplicate key (on replace) is dropped.
+   FBIP in place when rc==1, else copy-on-write. The argument map is consumed. */
+static void* aria_map_insert(void* p, int64_t key, int64_t val, int64_t kkind, int64_t vkind) {
+    AriaMap* m = (AriaMap*)p;
+    if (m->len == 0) { m->kkind = kkind; m->vkind = vkind; }
+    if (m->rc != 1) {
+        AriaMap* n = aria_map_clone(m);
+        aria_map_drop(p);
+        m = n;
+    } else {
+        aria_reuses++;  /* FBIP: mutate the uniquely-owned buffer in place */
+    }
+    int found = 0;
+    int64_t idx = aria_map_find(m, key, &found);
+    if (found) {
+        aria_slot_drop(m->vkind, m->slots[2*idx+1]);  /* drop displaced value */
+        m->slots[2*idx+1] = val;
+        aria_slot_drop(m->kkind, key);                /* duplicate key not stored */
+        return (void*)m;
+    }
+    m = aria_map_grow(m);
+    /* Shift entries [idx..len) right by one to open a slot at idx. */
+    for (int64_t i = m->len; i > idx; i--) {
+        m->slots[2*i]   = m->slots[2*(i-1)];
+        m->slots[2*i+1] = m->slots[2*(i-1)+1];
+    }
+    m->slots[2*idx] = key;
+    m->slots[2*idx+1] = val;
+    m->len++;
+    return (void*)m;
+}
+/* Total read: returns the stored value (dup'd) if present, else `dflt`. The
+   not-taken branch's slot is dropped so exactly one value reference is returned.
+   The map argument is consumed. */
+static int64_t aria_map_get_or(void* p, int64_t key, int64_t dflt, int64_t kkind, int64_t vkind) {
+    AriaMap* m = (AriaMap*)p;
+    (void)kkind;
+    int found = 0;
+    int64_t idx = aria_map_find(m, key, &found);
+    int64_t result;
+    if (found) {
+        result = m->slots[2*idx+1];
+        aria_slot_dup(vkind, result);     /* hand caller its own reference */
+        aria_slot_drop(vkind, dflt);      /* default not used */
+    } else {
+        result = dflt;                    /* ownership of dflt passes to caller */
+    }
+    aria_slot_drop(kkind, key);           /* the lookup key is consumed */
+    aria_map_drop(p);
+    return result;
+}
+static int64_t aria_map_has(void* p, int64_t key, int64_t kkind) {
+    AriaMap* m = (AriaMap*)p;
+    int found = 0;
+    (void)aria_map_find(m, key, &found);
+    aria_slot_drop(kkind, key);
+    aria_map_drop(p);
+    return found ? 1 : 0;
+}
+/* Remove key if present. FBIP in place when rc==1, else copy-on-write. */
+static void* aria_map_remove(void* p, int64_t key, int64_t kkind) {
+    AriaMap* m = (AriaMap*)p;
+    if (m->rc != 1) {
+        AriaMap* n = aria_map_clone(m);
+        aria_map_drop(p);
+        m = n;
+    } else {
+        aria_reuses++;
+    }
+    int found = 0;
+    int64_t idx = aria_map_find(m, key, &found);
+    if (found) {
+        aria_slot_drop(m->kkind, m->slots[2*idx]);
+        aria_slot_drop(m->vkind, m->slots[2*idx+1]);
+        for (int64_t i = idx; i + 1 < m->len; i++) {
+            m->slots[2*i]   = m->slots[2*(i+1)];
+            m->slots[2*i+1] = m->slots[2*(i+1)+1];
+        }
+        m->len--;
+    }
+    aria_slot_drop(kkind, key);  /* the lookup key is consumed */
+    return (void*)m;
+}
+static int64_t aria_map_eq(void* a, void* b) {
+    AriaMap* x = (AriaMap*)a; AriaMap* y = (AriaMap*)b;
+    if (x->len != y->len) return 0;
+    for (int64_t i = 0; i < x->len; i++) {
+        if (aria_key_cmp(x->kkind, x->slots[2*i], y->slots[2*i]) != 0) return 0;
+        if (!aria_slot_eq(x->vkind, x->slots[2*i+1], y->slots[2*i+1])) return 0;
+    }
+    return 1;
+}
+static int64_t aria_map_eq_consume(void* a, void* b) {
+    int64_t r = aria_map_eq(a, b);
+    aria_map_drop(a); aria_map_drop(b);
+    return r;
+}
+static void aria_print_map_value(void* p) {
+    AriaMap* m = (AriaMap*)p;
+    fputs("Map[", stdout);
+    for (int64_t i = 0; i < m->len; i++) {
+        if (i > 0) fputs(", ", stdout);
+        aria_print_slot(m->kkind, m->slots[2*i]);
+        fputs(": ", stdout);
+        aria_print_slot(m->vkind, m->slots[2*i+1]);
+    }
+    fputs("]", stdout);
+}
+
+typedef struct { int64_t rc; int64_t ekind; int64_t len; int64_t cap; int64_t slots[]; } AriaSet;
+
+static void* aria_set_alloc(int64_t ekind, int64_t cap) {
+    AriaSet* s = (AriaSet*)malloc(sizeof(AriaSet) + (size_t)cap * sizeof(int64_t));
+    if (!s) aria_trap();
+    s->rc = 1; s->ekind = ekind; s->len = 0; s->cap = cap;
+    aria_live++;
+    return (void*)s;
+}
+static void* aria_set_new(int64_t ekind) { return aria_set_alloc(ekind, 0); }
+static void aria_set_dup(void* p) { ((AriaSet*)p)->rc++; }
+static void aria_set_drop(void* p) {
+    AriaSet* s = (AriaSet*)p;
+    if (--s->rc == 0) {
+        for (int64_t i = 0; i < s->len; i++) aria_slot_drop(s->ekind, s->slots[i]);
+        aria_live--;
+        free(s);
+    }
+}
+static int64_t aria_set_len(void* p) {
+    int64_t n = ((AriaSet*)p)->len;
+    aria_set_drop(p);
+    return n;
+}
+static int64_t aria_set_find(AriaSet* s, int64_t e, int* found) {
+    int64_t lo = 0, hi = s->len;
+    while (lo < hi) {
+        int64_t mid = lo + (hi - lo) / 2;
+        int c = aria_key_cmp(s->ekind, s->slots[mid], e);
+        if (c == 0) { *found = 1; return mid; }
+        if (c < 0) lo = mid + 1; else hi = mid;
+    }
+    *found = 0;
+    return lo;
+}
+static AriaSet* aria_set_clone(AriaSet* s) {
+    int64_t cap = s->len > 0 ? s->len : 1;
+    AriaSet* n = (AriaSet*)aria_set_alloc(s->ekind, cap);
+    n->len = s->len;
+    for (int64_t i = 0; i < s->len; i++) { n->slots[i] = s->slots[i]; aria_slot_dup(s->ekind, s->slots[i]); }
+    return n;
+}
+static AriaSet* aria_set_grow(AriaSet* s) {
+    if (s->len < s->cap) return s;
+    int64_t ncap = s->cap > 0 ? s->cap * 2 : 4;
+    AriaSet* g = (AriaSet*)realloc(s, sizeof(AriaSet) + (size_t)ncap * sizeof(int64_t));
+    if (!g) aria_trap();
+    g->cap = ncap;
+    return g;
+}
+/* Add an element (ownership transfers in). An already-present element is a
+   no-op (its incoming reference is dropped). FBIP in place when rc==1. */
+static void* aria_set_add(void* p, int64_t e, int64_t ekind) {
+    AriaSet* s = (AriaSet*)p;
+    if (s->len == 0) s->ekind = ekind;
+    if (s->rc != 1) {
+        AriaSet* n = aria_set_clone(s);
+        aria_set_drop(p);
+        s = n;
+    } else {
+        aria_reuses++;
+    }
+    int found = 0;
+    int64_t idx = aria_set_find(s, e, &found);
+    if (found) { aria_slot_drop(s->ekind, e); return (void*)s; }
+    s = aria_set_grow(s);
+    for (int64_t i = s->len; i > idx; i--) s->slots[i] = s->slots[i-1];
+    s->slots[idx] = e;
+    s->len++;
+    return (void*)s;
+}
+static int64_t aria_set_has(void* p, int64_t e, int64_t ekind) {
+    AriaSet* s = (AriaSet*)p;
+    int found = 0;
+    (void)aria_set_find(s, e, &found);
+    aria_slot_drop(ekind, e);
+    aria_set_drop(p);
+    return found ? 1 : 0;
+}
+static void* aria_set_remove(void* p, int64_t e, int64_t ekind) {
+    AriaSet* s = (AriaSet*)p;
+    if (s->rc != 1) {
+        AriaSet* n = aria_set_clone(s);
+        aria_set_drop(p);
+        s = n;
+    } else {
+        aria_reuses++;
+    }
+    int found = 0;
+    int64_t idx = aria_set_find(s, e, &found);
+    if (found) {
+        aria_slot_drop(s->ekind, s->slots[idx]);
+        for (int64_t i = idx; i + 1 < s->len; i++) s->slots[i] = s->slots[i+1];
+        s->len--;
+    }
+    aria_slot_drop(ekind, e);
+    return (void*)s;
+}
+static int64_t aria_set_eq(void* a, void* b) {
+    AriaSet* x = (AriaSet*)a; AriaSet* y = (AriaSet*)b;
+    if (x->len != y->len) return 0;
+    for (int64_t i = 0; i < x->len; i++)
+        if (aria_key_cmp(x->ekind, x->slots[i], y->slots[i]) != 0) return 0;
+    return 1;
+}
+static int64_t aria_set_eq_consume(void* a, void* b) {
+    int64_t r = aria_set_eq(a, b);
+    aria_set_drop(a); aria_set_drop(b);
+    return r;
+}
+static void aria_print_set_value(void* p) {
+    AriaSet* s = (AriaSet*)p;
+    fputs("Set[", stdout);
+    for (int64_t i = 0; i < s->len; i++) {
+        if (i > 0) fputs(", ", stdout);
+        aria_print_slot(s->ekind, s->slots[i]);
+    }
+    fputs("]", stdout);
+}
+
+/* ---- map_show / set_show: render the canonical string into an AriaStr ----
+   A growable byte buffer mirrors `aria_print_slot`, so the produced text is
+   byte-for-byte identical to the interpreter's `Value::display`. */
+static void aria_fmt_float(double d, char* buf, size_t cap);  /* fwd */
+typedef struct { char* p; size_t len; size_t cap; } AriaSB;
+static void aria_sb_reserve(AriaSB* b, size_t extra) {
+    if (b->len + extra + 1 > b->cap) {
+        size_t ncap = b->cap ? b->cap * 2 : 32;
+        while (b->len + extra + 1 > ncap) ncap *= 2;
+        char* np = (char*)realloc(b->p, ncap);
+        if (!np) aria_trap();
+        b->p = np; b->cap = ncap;
+    }
+}
+static void aria_sb_puts(AriaSB* b, const char* s, size_t n) {
+    aria_sb_reserve(b, n);
+    memcpy(b->p + b->len, s, n);
+    b->len += n;
+}
+static void aria_sb_cstr(AriaSB* b, const char* s) { aria_sb_puts(b, s, strlen(s)); }
+/* Append a single value slot's rendering (no separators). */
+static void aria_sb_slot(AriaSB* b, int64_t kind, int64_t slot) {
+    char tmp[330];
+    switch (kind) {
+        case 1: { aria_fmt_float(aria_i2f(slot), tmp, sizeof tmp); aria_sb_cstr(b, tmp); break; }
+        case 2: { AriaStr* s = (AriaStr*)(uintptr_t)slot; aria_sb_puts(b, s->bytes, (size_t)s->len); break; }
+        case 4: { /* Bytes: `Bytes[xx xx]` */
+            AriaBytes* by = (AriaBytes*)(uintptr_t)slot;
+            aria_sb_cstr(b, "Bytes[");
+            for (int64_t i = 0; i < by->len; i++) {
+                if (i > 0) aria_sb_cstr(b, " ");
+                snprintf(tmp, sizeof tmp, "%02x", (unsigned)by->bytes[i]);
+                aria_sb_cstr(b, tmp);
+            }
+            aria_sb_cstr(b, "]");
+            break;
+        }
+        case 8: aria_sb_cstr(b, slot ? "true" : "false"); break;  /* Bool */
+        default: { snprintf(tmp, sizeof tmp, "%lld", (long long)slot); aria_sb_cstr(b, tmp); break; }
+    }
+}
+static AriaStr* aria_sb_finish(AriaSB* b) {
+    AriaStr* s = (AriaStr*)aria_str_alloc((int64_t)b->len);
+    memcpy(s->bytes, b->p, b->len);
+    free(b->p);
+    return s;
+}
+static void* aria_map_show(void* p) {
+    AriaMap* m = (AriaMap*)p;
+    AriaSB b = {0,0,0};
+    aria_sb_cstr(&b, "Map[");
+    for (int64_t i = 0; i < m->len; i++) {
+        if (i > 0) aria_sb_cstr(&b, ", ");
+        aria_sb_slot(&b, m->kkind, m->slots[2*i]);
+        aria_sb_cstr(&b, ": ");
+        aria_sb_slot(&b, m->vkind, m->slots[2*i+1]);
+    }
+    aria_sb_cstr(&b, "]");
+    AriaStr* s = aria_sb_finish(&b);
+    aria_map_drop(p);  /* map_show consumes its argument */
+    return (void*)s;
+}
+static void* aria_set_show(void* p) {
+    AriaSet* st = (AriaSet*)p;
+    AriaSB b = {0,0,0};
+    aria_sb_cstr(&b, "Set[");
+    for (int64_t i = 0; i < st->len; i++) {
+        if (i > 0) aria_sb_cstr(&b, ", ");
+        aria_sb_slot(&b, st->ekind, st->slots[i]);
+    }
+    aria_sb_cstr(&b, "]");
+    AriaStr* s = aria_sb_finish(&b);
+    aria_set_drop(p);
+    return (void*)s;
+}
+
+/* ---- structural equality (per-tag, emitted below) ---- */
 
 static int64_t aria_streq(void* a, void* b) {
     AriaStr* x = (AriaStr*)a; AriaStr* y = (AriaStr*)b;
@@ -1936,6 +2854,13 @@ static void aria_print_float(double d) {
     char buf[320];
     aria_fmt_float(d, buf, sizeof buf);
     printf("%s\n", buf);
+}
+/* Inline (no-newline) scalar renderers used by the Map/Set value printer. */
+static void aria_print_int_inline(int64_t n) { printf("%lld", (long long)n); }
+static void aria_print_float_inline(double d) {
+    char buf[320];
+    aria_fmt_float(d, buf, sizeof buf);
+    fputs(buf, stdout);
 }
 static void aria_print_str(void* p) {
     AriaStr* s = (AriaStr*)p;
@@ -2180,7 +3105,26 @@ pub fn compile(program: &Program) -> Result<String, String> {
             let _ = writeln!(src, "    aria_print_bytes_value(r);");
             let _ = writeln!(src, "    aria_bytes_drop(r);");
         }
-        _ => unreachable!(),
+        CType::Map(..) => {
+            // Print the canonical `Map[k: v, ..]` rendering (sorted by key), then
+            // consume the map.
+            let _ = writeln!(src, "    void* r = {}();", cfn("main"));
+            let _ = writeln!(src, "    aria_print_map_value(r);");
+            let _ = writeln!(src, "    aria_map_drop(r);");
+        }
+        CType::Set(_) => {
+            let _ = writeln!(src, "    void* r = {}();", cfn("main"));
+            let _ = writeln!(src, "    aria_print_set_value(r);");
+            let _ = writeln!(src, "    aria_set_drop(r);");
+        }
+        CType::Ref | CType::Array(_) => {
+            // An ADT / Array result is outside the printed-result subset (it has
+            // no canonical printed form in this backend). Clean error, no panic.
+            return Err(
+                "c backend: `main` must return a printable value \
+                 (Int/Bool/Float/Str/Bytes/Map/Set)".into(),
+            );
+        }
     }
     let _ = writeln!(src, "    fprintf(stderr, \"aria_live=%lld aria_reuses=%lld\\n\", (long long)aria_live, (long long)aria_reuses);");
     let _ = writeln!(src, "    return 0;");
@@ -2219,6 +3163,14 @@ fn emit_eq_helper(ctors: &CtorTable, out: &mut String) {
                 CType::Bytes => {
                     // Bytes fields compare structurally (content), like Strings.
                     let _ = writeln!(out, "        eq = eq && aria_byteseq((void*)(uintptr_t)aria_field(a, {}), (void*)(uintptr_t)aria_field(b, {}));", i, i);
+                }
+                CType::Map(..) => {
+                    // Map fields compare structurally (ordered contents).
+                    let _ = writeln!(out, "        eq = eq && aria_map_eq((void*)(uintptr_t)aria_field(a, {}), (void*)(uintptr_t)aria_field(b, {}));", i, i);
+                }
+                CType::Set(_) => {
+                    // Set fields compare structurally (ordered contents).
+                    let _ = writeln!(out, "        eq = eq && aria_set_eq((void*)(uintptr_t)aria_field(a, {}), (void*)(uintptr_t)aria_field(b, {}));", i, i);
                 }
             }
         }
@@ -2271,7 +3223,7 @@ fn emit_lambda(
         let load = match ct {
             CType::Int | CType::Bool => format!("(int64_t)aria_field(__aria_clo, {})", i),
             CType::Float => format!("aria_i2f(aria_field(__aria_clo, {}))", i),
-            CType::Ref | CType::Str | CType::Bytes | CType::Array(_) => format!("(void*)(uintptr_t)aria_field(__aria_clo, {})", i),
+            CType::Ref | CType::Str | CType::Bytes | CType::Array(_) | CType::Map(..) | CType::Set(_) => format!("(void*)(uintptr_t)aria_field(__aria_clo, {})", i),
         };
         let _ = writeln!(out, "    {} {} = {};", ct.decl(), cvar(cn), load);
         match ct {
@@ -2325,7 +3277,7 @@ fn emit_drop_children_helper(
             .field_types
             .iter()
             .enumerate()
-            .filter(|(_, t)| matches!(t, CType::Ref | CType::Str | CType::Bytes | CType::Array(_)))
+            .filter(|(_, t)| matches!(t, CType::Ref | CType::Str | CType::Bytes | CType::Array(_) | CType::Map(..) | CType::Set(_)))
             .map(|(i, t)| (i, *t))
             .collect();
         if managed.is_empty() {
@@ -2347,7 +3299,7 @@ fn emit_drop_children_helper(
         let managed: Vec<(usize, CType)> = cap_cts
             .iter()
             .enumerate()
-            .filter(|(_, t)| matches!(t, CType::Ref | CType::Str | CType::Bytes | CType::Array(_)))
+            .filter(|(_, t)| matches!(t, CType::Ref | CType::Str | CType::Bytes | CType::Array(_) | CType::Map(..) | CType::Set(_)))
             .map(|(i, t)| (i, *t))
             .collect();
         if managed.is_empty() {
@@ -2380,6 +3332,12 @@ fn emit_drop_managed_field(t: CType, i: usize, out: &mut String) {
         }
         CType::Bytes => {
             let _ = writeln!(out, "        aria_bytes_drop((void*)(uintptr_t)aria_field(p, {}));", i);
+        }
+        CType::Map(..) => {
+            let _ = writeln!(out, "        aria_map_drop((void*)(uintptr_t)aria_field(p, {}));", i);
+        }
+        CType::Set(_) => {
+            let _ = writeln!(out, "        aria_set_drop((void*)(uintptr_t)aria_field(p, {}));", i);
         }
         _ => {}
     }

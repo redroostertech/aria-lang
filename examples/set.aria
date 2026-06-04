@@ -1,0 +1,32 @@
+-- Set[T]: a first-class, ORDERED set (kept sorted ascending). Elements are Int
+-- or Str. `add` of an existing element is a no-op. add/remove reuse the buffer
+-- in place when uniquely owned (FBIP). Identical output via `aria run` AND
+-- `aria native-run`; the whole set prints in ascending order regardless of
+-- insertion order.
+
+fn main() -> Int = {
+  -- Build an Int set with OUT-OF-ORDER, duplicate inserts.
+  let a0 = set_new();
+  let a1 = set_add(a0, 30);
+  let a2 = set_add(a1, 10);
+  let a3 = set_add(a2, 20);
+  let a4 = set_add(a3, 10);          -- duplicate -> no-op
+  print_str(set_show(a4));           -- Set[10, 20, 30]  (sorted, deduped)
+  print_int(set_len(a4));            -- 3
+  print_bool(set_has(a4, 20));       -- true
+  print_bool(set_has(a4, 99));       -- false
+  let a5 = set_remove(a4, 20);       -- drop 20
+  print_str(set_show(a5));           -- Set[10, 30]
+  print_int(set_len(a5));            -- 2
+
+  -- A Str set, also out of order.
+  let s0 = set_new();
+  let s1 = set_add(s0, "pear");
+  let s2 = set_add(s1, "apple");
+  let s3 = set_add(s2, "fig");
+  let s4 = set_add(s3, "apple");     -- duplicate -> no-op
+  print_str(set_show(s4));           -- Set[apple, fig, pear]
+  print_bool(set_has(s4, "fig"));    -- true
+  print_bool(set_new() == set_new());  -- true (two empty sets are equal)
+  0
+}

@@ -16,7 +16,7 @@ use std::sync::OnceLock;
 /// Built-in (opaque) type names that need no user `type` declaration.
 /// `Array` is generic (`Array[T]`); `Tensor` and `Bytes` are nullary opaque
 /// handles. `Bytes` is a flat, growable byte buffer (a byte = Int 0..255).
-pub const BUILTIN_TYPES: &[&str] = &["Tensor", "Array", "Bytes"];
+pub const BUILTIN_TYPES: &[&str] = &["Tensor", "Array", "Bytes", "Map", "Set"];
 
 /// Cached signature table, built once on first access. The table is on a hot
 /// path (`lookup`/`names` are called per call-expression during lowering and
@@ -49,6 +49,14 @@ fn build_signatures() -> Vec<(&'static str, Vec<Ty>, Ty)> {
     let array = || Named("Array".to_string(), vec![elem()]);
     // The nullary opaque byte-buffer handle, shared across the bytes builtins.
     let bytes = || Named("Bytes".to_string(), vec![]);
+    // Ordered Map[K, V] and Set[T]. `K`/`T` are restricted to Int/Str by the
+    // type checker (the two primitive totally-ordered types); `V` is fully
+    // generic. The generic vars instantiate fresh per call site, like Array.
+    let mkey = || Var("K".to_string());
+    let mval = || Var("V".to_string());
+    let map = || Named("Map".to_string(), vec![mkey(), mval()]);
+    let setelem = || Var("T".to_string());
+    let set = || Named("Set".to_string(), vec![setelem()]);
     vec![
         ("print_int", vec![Int], Unit),
         ("print_float", vec![Float], Unit),
@@ -85,6 +93,29 @@ fn build_signatures() -> Vec<(&'static str, Vec<Ty>, Ty)> {
         ("bytes_push", vec![bytes(), Int], bytes()),
         ("bytes_from_str", vec![Str], bytes()),
         ("bytes_to_str", vec![bytes()], Str),
+        // ---- Ordered Map[K, V] (sorted by key; K is Int or Str) -------------
+        // The read API is TOTAL (no Option type exists): `map_get_or` returns
+        // its 3rd argument when the key is absent. `map_insert` replaces an
+        // existing key's value. Entries are kept sorted by key for a
+        // deterministic display/equality/iteration order across all backends.
+        ("map_new", vec![], map()),
+        ("map_insert", vec![map(), mkey(), mval()], map()),
+        ("map_get_or", vec![map(), mkey(), mval()], mval()),
+        ("map_has", vec![map(), mkey()], Bool),
+        ("map_len", vec![map()], Int),
+        ("map_remove", vec![map(), mkey()], map()),
+        // Canonical textual rendering `Map[k1: v1, k2: v2]` (ascending key
+        // order, empty `Map[]`) — identical byte-for-byte in every backend, so a
+        // whole-map can be printed via `print_str(map_show(m))`.
+        ("map_show", vec![map()], Str),
+        // ---- Ordered Set[T] (sorted by element; T is Int or Str) ------------
+        ("set_new", vec![], set()),
+        ("set_add", vec![set(), setelem()], set()),
+        ("set_has", vec![set(), setelem()], Bool),
+        ("set_len", vec![set()], Int),
+        ("set_remove", vec![set(), setelem()], set()),
+        // Canonical textual rendering `Set[a, b, c]` (ascending order).
+        ("set_show", vec![set()], Str),
     ]
 }
 

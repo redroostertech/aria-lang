@@ -1225,3 +1225,151 @@ fn bytes_interp_matches_compiled() {
         wasm_checked
     );
 }
+
+// ---------------------------------------------------------------------------
+// 9) Maps & Sets differential: interp (oracle) vs native (cc-gated). Maps/Sets
+//    are NOT supported by the wasm backend, so wasm is intentionally excluded
+//    here. Each program exercises build / insert / lookup(get_or) / has / len /
+//    remove plus the ORDERED display (`map_show`/`set_show`), with Str keys, key
+//    replacement, removal, and out-of-order inserts. The interpreter and the
+//    native backend must produce IDENTICAL results AND the native heap must be
+//    garbage-free (live == 0). Programs return either an Int or a String (the
+//    canonical ordered rendering); `run_native_live` compares the final value.
+// ---------------------------------------------------------------------------
+
+/// Hand-written Map/Set programs and their expected results (Int or the
+/// canonical ordered-display String).
+fn map_set_diff_programs() -> Vec<(String, &'static str)> {
+    vec![
+        // Out-of-order inserts render in ascending key order; replacement keeps
+        // the latest value.
+        (
+            "fn main() -> String = {\n\
+               let m = map_insert(map_insert(map_insert(map_new(), 30, 3), 10, 1), 20, 2);\n\
+               map_show(map_insert(m, 10, 111))\n\
+             }\n"
+                .to_string(),
+            "Map[10: 111, 20: 2, 30: 3]",
+        ),
+        // Str-keyed map, out of order -> sorted display.
+        (
+            "fn main() -> String =\n\
+               map_show(map_insert(map_insert(map_insert(map_new(), \"pear\", 3), \"apple\", 1), \"fig\", 2))\n"
+                .to_string(),
+            "Map[apple: 1, fig: 2, pear: 3]",
+        ),
+        // Total read: present -> value, absent -> default; len after a replace.
+        (
+            "fn main() -> Int = {\n\
+               let m = map_insert(map_insert(map_insert(map_new(), 1, 10), 2, 20), 1, 99);\n\
+               map_get_or(m, 1, 0) + map_get_or(m, 7, 5) + map_len(m)\n\
+             }\n"
+                .to_string(),
+            // 99 (replaced) + 5 (absent default) + 2 (len) = 106
+            "106",
+        ),
+        // has + remove; removed key absent, survivor present.
+        (
+            "fn main() -> String = {\n\
+               let m = map_insert(map_insert(map_insert(map_new(), 1, 10), 2, 20), 3, 30);\n\
+               map_show(map_remove(m, 2))\n\
+             }\n"
+                .to_string(),
+            "Map[1: 10, 3: 30]",
+        ),
+        // map equality independent of insertion order (returned as Int).
+        (
+            "fn main() -> Int = {\n\
+               let a = map_insert(map_insert(map_new(), 1, 10), 2, 20);\n\
+               let b = map_insert(map_insert(map_new(), 2, 20), 1, 10);\n\
+               if a == b { 1 } else { 0 }\n\
+             }\n"
+                .to_string(),
+            "1",
+        ),
+        // A shared map forces copy-on-write on insert (still garbage-free).
+        (
+            "fn use2(m: Map[Int, Int]) -> Int =\n\
+               map_get_or(map_insert(m, 5, 50), 5, 0) + map_get_or(m, 1, -1)\n\
+             fn main() -> Int = use2(map_insert(map_new(), 1, 10))\n"
+                .to_string(),
+            // 50 (inserted copy) + 10 (original key 1 intact) = 60
+            "60",
+        ),
+        // Set: out-of-order, duplicate adds -> sorted, deduped display.
+        (
+            "fn main() -> String =\n\
+               set_show(set_add(set_add(set_add(set_add(set_new(), 30), 10), 20), 10))\n"
+                .to_string(),
+            "Set[10, 20, 30]",
+        ),
+        // Str set, sorted; remove drops an element.
+        (
+            "fn main() -> String =\n\
+               set_show(set_remove(set_add(set_add(set_add(set_new(), \"b\"), \"a\"), \"c\"), \"a\"))\n"
+                .to_string(),
+            "Set[b, c]",
+        ),
+        // Set has / len / dedup as an Int.
+        (
+            "fn main() -> Int = {\n\
+               let s = set_add(set_add(set_add(set_new(), 1), 1), 2);\n\
+               let h = if set_has(s, 2) { 100 } else { 0 };\n\
+               h + set_len(s)\n\
+             }\n"
+                .to_string(),
+            // 100 + 2 (deduped) = 102
+            "102",
+        ),
+    ]
+}
+
+#[test]
+fn maps_sets_interp_matches_compiled() {
+    let progs = map_set_diff_programs();
+    let cc = cc_available();
+    let mut native_checked = 0u64;
+
+    for (src, expected) in &progs {
+        // Oracle: tree-walking interpreter.
+        let interp = ast_run(src).unwrap_or_else(|e| panic!("interp failed: {}\n{}", e, src));
+        assert_eq!(
+            &interp, expected,
+            "interpreter result mismatch\n{}\n got={} want={}",
+            src, interp, expected
+        );
+
+        let prog = parser::parse(lexer::lex(src).expect("lex")).expect("parse");
+        assert!(typeck::check(&prog).is_ok(), "type error\n{}", src);
+
+        // Native (C) backend: identical result + garbage-free (live == 0).
+        if cc {
+            let c_src = crate::c_backend::compile(&prog)
+                .unwrap_or_else(|e| panic!("c_backend failed: {}\n{}", e, src));
+            let (nat, live) = run_native_live(&c_src)
+                .unwrap_or_else(|e| panic!("native runner failed: {}\n{}", e, src));
+            assert_eq!(nat, *expected, "native != expected\n{}\n native={}", src, nat);
+            assert_eq!(live, 0, "native leaked {} cell(s)\n{}", live, src);
+            native_checked += 1;
+        }
+
+        // The wasm backend must cleanly REJECT maps/sets (never compile/panic).
+        let bytes = wasm::compile(&prog);
+        assert!(
+            bytes.is_err(),
+            "wasm backend unexpectedly accepted a map/set program\n{}",
+            src
+        );
+        assert!(
+            bytes.unwrap_err().contains("maps/sets are not yet supported"),
+            "wasm rejection message should mention maps/sets\n{}",
+            src
+        );
+    }
+
+    eprintln!(
+        "maps_sets_interp_matches_compiled: {} programs ({} native)",
+        progs.len(),
+        native_checked
+    );
+}

@@ -274,14 +274,14 @@ impl<'a> Mono<'a> {
                 None => Err(format!("monomorphize: unbound type variable `{}`", n)),
             },
             Ty::Named(n, args) if args.is_empty() => Ok(Ty::Named(n.clone(), Vec::new())),
-            // `Array` is a builtin generic, not a user ADT: keep it as
-            // `Array[concrete-elem]` (the backends recognize it and the
-            // element-kind call suffix carries the element type). Do NOT mangle
-            // its name or enqueue it as a type to specialize.
-            Ty::Named(n, args) if n == "Array" => {
+            // `Array`/`Map`/`Set` are builtin generics, not user ADTs: keep them
+            // as `Array[E]`/`Map[K,V]`/`Set[T]` (the backends recognize them and
+            // the element-kind call suffix carries the element types). Do NOT
+            // mangle the name or enqueue it as a type to specialize.
+            Ty::Named(n, args) if n == "Array" || n == "Map" || n == "Set" => {
                 let cargs: Vec<Ty> =
                     args.iter().map(|a| self.subst_ty(a, map)).collect::<Result<_, _>>()?;
-                Ok(Ty::Named("Array".to_string(), cargs))
+                Ok(Ty::Named(n.clone(), cargs))
             }
             Ty::Named(n, args) => {
                 let cargs: Vec<Ty> = args
@@ -449,14 +449,14 @@ impl<'a> Mono<'a> {
                 _ => None,
             },
             Ty::Named(n, args) if args.is_empty() => Some(Ty::Named(n.clone(), Vec::new())),
-            // `Array` is a builtin generic: keep it as `Array[concrete-elem]`,
-            // never ADT-mangle (see `subst_ty`).
-            Ty::Named(n, args) if n == "Array" => {
+            // `Array`/`Map`/`Set` are builtin generics: keep them as
+            // `Array[E]`/`Map[K,V]`/`Set[T]`, never ADT-mangle (see `subst_ty`).
+            Ty::Named(n, args) if n == "Array" || n == "Map" || n == "Set" => {
                 let cargs: Vec<Ty> = args
                     .iter()
                     .map(|a| self.subst_ty_partial(a, sub))
                     .collect::<Option<_>>()?;
-                Some(Ty::Named("Array".to_string(), cargs))
+                Some(Ty::Named(n.clone(), cargs))
             }
             Ty::Named(n, args) => {
                 let cargs: Vec<Ty> = args
@@ -483,9 +483,13 @@ impl<'a> Mono<'a> {
             // `Array[elem]`); the element-kind call suffix carries the element
             // type. Mangling it to `Array$Int` would hide the element from the
             // array-builtin element inference (e.g. an empty `[]` in a tuple).
-            Ty::Named(n, args) if n == "Array" => {
+            Ty::Named(n, args) if n == "Array" || n == "Map" || n == "Set" => {
+                // Builtin generic collections — never ADT-mangle them (keep
+                // `Array[E]`/`Map[K,V]`/`Set[T]`); the element-kind call suffix
+                // carries the concrete element type to the backends. Mangling
+                // would hide the element type from element inference.
                 let cargs: Vec<Ty> = args.iter().map(|a| self.mangle_concrete(a)).collect();
-                Ty::Named("Array".to_string(), cargs)
+                Ty::Named(n.clone(), cargs)
             }
             Ty::Named(n, args) if !args.is_empty() => {
                 let cargs: Vec<Ty> = args.iter().map(|a| self.mangle_concrete(a)).collect();
@@ -720,6 +724,159 @@ impl<'a> Mono<'a> {
                 let elem = array_elem_of(&arr_ty).unwrap_or(Ty::Unit);
                 let tag = array_elem_tag(&elem);
                 Ok(Some((Expr::Call(format!("array_len${}", tag), vec![rarr]), Ty::Int)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Rewrite a Map/Set builtin call. Threads the concrete key/value (or
+    /// element) types INTO the map/set argument (so a nested `map_new()`
+    /// resolves) and suffixes the emitted name with `$<keytag>_<valtag>` (maps)
+    /// or `$<elemtag>` (sets) — the element-kind contract the native backend
+    /// dispatches on. Returns `None` if `name` is not a map/set builtin.
+    fn rewrite_map_set_op(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Ty>,
+        tymap: &HashMap<String, Ty>,
+        expected: Option<&Ty>,
+    ) -> Result<Option<(Expr, Ty)>, String> {
+        let mapty = |k: Ty, v: Ty| Ty::Named("Map".to_string(), vec![k, v]);
+        let setty = |t: Ty| Ty::Named("Set".to_string(), vec![t]);
+        match name {
+            // ---- Map ----
+            "map_new" => {
+                let (k, v) = expected
+                    .and_then(map_kv_of)
+                    .unwrap_or((Ty::Unit, Ty::Unit));
+                let suffix = map_suffix(&k, &v);
+                Ok(Some((
+                    Expr::Call(format!("map_new${}", suffix), Vec::new()),
+                    mapty(k, v),
+                )))
+            }
+            "map_insert" => {
+                // args = [map, key, value]: key & value fix K, V; push them into
+                // the map argument so a nested `map_new()` resolves.
+                let (rkey, k) = self.rewrite_expr(&args[1], env, tymap, None)?;
+                let (rval, v) = self.rewrite_expr(&args[2], env, tymap, None)?;
+                let (rmap, _) =
+                    self.rewrite_expr(&args[0], env, tymap, Some(&mapty(k.clone(), v.clone())))?;
+                let suffix = map_suffix(&k, &v);
+                Ok(Some((
+                    Expr::Call(format!("map_insert${}", suffix), vec![rmap, rkey, rval]),
+                    mapty(k, v),
+                )))
+            }
+            "map_get_or" => {
+                // args = [map, key, default]; result is V. The default fixes V.
+                let (rkey, k) = self.rewrite_expr(&args[1], env, tymap, None)?;
+                let (rdef, v) = self.rewrite_expr(&args[2], env, tymap, expected)?;
+                let (rmap, _) =
+                    self.rewrite_expr(&args[0], env, tymap, Some(&mapty(k.clone(), v.clone())))?;
+                let suffix = map_suffix(&k, &v);
+                Ok(Some((
+                    Expr::Call(format!("map_get_or${}", suffix), vec![rmap, rkey, rdef]),
+                    v,
+                )))
+            }
+            "map_has" => {
+                let (rkey, k) = self.rewrite_expr(&args[1], env, tymap, None)?;
+                let (rmap, map_ty) = self.rewrite_expr(&args[0], env, tymap, None)?;
+                let v = map_kv_of(&map_ty).map(|(_, v)| v).unwrap_or(Ty::Unit);
+                let suffix = map_suffix(&k, &v);
+                Ok(Some((
+                    Expr::Call(format!("map_has${}", suffix), vec![rmap, rkey]),
+                    Ty::Bool,
+                )))
+            }
+            "map_len" => {
+                let (rmap, map_ty) = self.rewrite_expr(&args[0], env, tymap, None)?;
+                let (k, v) = map_kv_of(&map_ty).unwrap_or((Ty::Unit, Ty::Unit));
+                let suffix = map_suffix(&k, &v);
+                Ok(Some((
+                    Expr::Call(format!("map_len${}", suffix), vec![rmap]),
+                    Ty::Int,
+                )))
+            }
+            "map_remove" => {
+                let (rkey, k) = self.rewrite_expr(&args[1], env, tymap, None)?;
+                let (rmap, map_ty) =
+                    self.rewrite_expr(&args[0], env, tymap, expected)?;
+                let v = map_kv_of(&map_ty)
+                    .map(|(_, v)| v)
+                    .or_else(|| expected.and_then(map_kv_of).map(|(_, v)| v))
+                    .unwrap_or(Ty::Unit);
+                let suffix = map_suffix(&k, &v);
+                Ok(Some((
+                    Expr::Call(format!("map_remove${}", suffix), vec![rmap, rkey]),
+                    mapty(k, v),
+                )))
+            }
+            "map_show" => {
+                let (rmap, map_ty) = self.rewrite_expr(&args[0], env, tymap, None)?;
+                let (k, v) = map_kv_of(&map_ty).unwrap_or((Ty::Unit, Ty::Unit));
+                let suffix = map_suffix(&k, &v);
+                Ok(Some((
+                    Expr::Call(format!("map_show${}", suffix), vec![rmap]),
+                    Ty::Str,
+                )))
+            }
+            // ---- Set ----
+            "set_new" => {
+                let t = expected.and_then(set_elem_of).unwrap_or(Ty::Unit);
+                let suffix = array_elem_tag(&t);
+                Ok(Some((
+                    Expr::Call(format!("set_new${}", suffix), Vec::new()),
+                    setty(t),
+                )))
+            }
+            "set_add" => {
+                let (relem, t) = self.rewrite_expr(&args[1], env, tymap, None)?;
+                let (rset, _) = self.rewrite_expr(&args[0], env, tymap, Some(&setty(t.clone())))?;
+                let suffix = array_elem_tag(&t);
+                Ok(Some((
+                    Expr::Call(format!("set_add${}", suffix), vec![rset, relem]),
+                    setty(t),
+                )))
+            }
+            "set_has" => {
+                let (relem, t) = self.rewrite_expr(&args[1], env, tymap, None)?;
+                let (rset, _) = self.rewrite_expr(&args[0], env, tymap, Some(&setty(t.clone())))?;
+                let suffix = array_elem_tag(&t);
+                Ok(Some((
+                    Expr::Call(format!("set_has${}", suffix), vec![rset, relem]),
+                    Ty::Bool,
+                )))
+            }
+            "set_len" => {
+                let (rset, set_ty) = self.rewrite_expr(&args[0], env, tymap, None)?;
+                let t = set_elem_of(&set_ty).unwrap_or(Ty::Unit);
+                let suffix = array_elem_tag(&t);
+                Ok(Some((
+                    Expr::Call(format!("set_len${}", suffix), vec![rset]),
+                    Ty::Int,
+                )))
+            }
+            "set_remove" => {
+                let (relem, t) = self.rewrite_expr(&args[1], env, tymap, None)?;
+                let (rset, _) =
+                    self.rewrite_expr(&args[0], env, tymap, Some(&setty(t.clone())))?;
+                let suffix = array_elem_tag(&t);
+                Ok(Some((
+                    Expr::Call(format!("set_remove${}", suffix), vec![rset, relem]),
+                    setty(t),
+                )))
+            }
+            "set_show" => {
+                let (rset, set_ty) = self.rewrite_expr(&args[0], env, tymap, None)?;
+                let t = set_elem_of(&set_ty).unwrap_or(Ty::Unit);
+                let suffix = array_elem_tag(&t);
+                Ok(Some((
+                    Expr::Call(format!("set_show${}", suffix), vec![rset]),
+                    Ty::Str,
+                )))
             }
             _ => Ok(None),
         }
@@ -1011,6 +1168,12 @@ impl<'a> Mono<'a> {
                     // the backends (as a name suffix) AND propagated INTO the array
                     // argument so a nested `array_new()` resolves its element type.
                     if let Some(r) = self.rewrite_array_op(name, args, env, tymap, expected)? {
+                        return Ok(r);
+                    }
+                    // Map/Set builtins are threaded the same way: concrete key/
+                    // value (element) types pushed into the collection argument
+                    // and encoded as the call-name suffix the backends dispatch on.
+                    if let Some(r) = self.rewrite_map_set_op(name, args, env, tymap, expected)? {
                         return Ok(r);
                     }
                     let mut rargs = Vec::new();
@@ -1485,6 +1648,31 @@ fn array_elem_of(ty: &Ty) -> Option<Ty> {
         Ty::Named(n, args) if n == "Array" && args.len() == 1 => Some(args[0].clone()),
         _ => None,
     }
+}
+
+/// The (key, value) types `(K, V)` of a `Map[K, V]`, if `ty` is one.
+fn map_kv_of(ty: &Ty) -> Option<(Ty, Ty)> {
+    match ty {
+        Ty::Named(n, args) if n == "Map" && args.len() == 2 => {
+            Some((args[0].clone(), args[1].clone()))
+        }
+        _ => None,
+    }
+}
+
+/// The element type `T` of a `Set[T]`, if `ty` is one.
+fn set_elem_of(ty: &Ty) -> Option<Ty> {
+    match ty {
+        Ty::Named(n, args) if n == "Set" && args.len() == 1 => Some(args[0].clone()),
+        _ => None,
+    }
+}
+
+/// The `$<keytag>_<valtag>` element-kind suffix for a map builtin, reusing the
+/// array element-kind tags (`i`/`f`/`s`/`r`). The key tag is always `i` or `s`
+/// (the checker restricts keys to Int/Str); the value tag is unrestricted.
+fn map_suffix(k: &Ty, v: &Ty) -> String {
+    format!("{}_{}", array_elem_tag(k), array_elem_tag(v))
 }
 
 fn resolve(ty: &Ty, sub: &HashMap<String, Ty>) -> Ty {

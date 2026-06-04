@@ -1,0 +1,36 @@
+-- Map[K, V]: a first-class, ORDERED map (kept sorted by key ascending) with a
+-- TOTAL read API (no Option type exists, so `map_get_or` returns its default
+-- when the key is absent). Keys are Int or Str; values are any type. `insert`
+-- replaces an existing key. Inserts/removes reuse the buffer in place when the
+-- map is uniquely owned (FBIP), like Array/Bytes — mutable speed, immutable
+-- semantics. Identical output via `aria run` AND `aria native-run`; the whole
+-- map prints in ascending key order regardless of insertion order.
+
+fn main() -> Int = {
+  -- Build an Int-keyed map with OUT-OF-ORDER inserts.
+  let m0 = map_new();
+  let m1 = map_insert(m0, 30, 300);
+  let m2 = map_insert(m1, 10, 100);
+  let m3 = map_insert(m2, 20, 200);
+  let m4 = map_insert(m3, 10, 111);   -- replace key 10's value (100 -> 111)
+  print_str(map_show(m4));            -- Map[10: 111, 20: 200, 30: 300]  (sorted)
+  print_int(map_len(m4));             -- 3
+  print_int(map_get_or(m4, 20, -1));  -- 200  (present)
+  print_int(map_get_or(m4, 99, -1));  -- -1   (absent -> default)
+  print_bool(map_has(m4, 10));        -- true
+  print_bool(map_has(m4, 99));        -- false
+  let m5 = map_remove(m4, 20);        -- drop key 20
+  print_str(map_show(m5));            -- Map[10: 111, 30: 300]
+  print_int(map_len(m5));             -- 2
+
+  -- A Str-keyed map, also inserted out of order.
+  let s0 = map_new();
+  let s1 = map_insert(s0, "pear", 3);
+  let s2 = map_insert(s1, "apple", 1);
+  let s3 = map_insert(s2, "fig", 2);
+  print_str(map_show(s3));            -- Map[apple: 1, fig: 2, pear: 3]  (sorted)
+  print_int(map_get_or(s3, "fig", 0));    -- 2
+  print_int(map_get_or(s3, "kiwi", 0));   -- 0  (absent)
+  print_bool(map_new() == map_new());     -- true  (two empty maps are equal)
+  0
+}
