@@ -13,6 +13,9 @@ pub struct Parser {
     /// type annotations inside its body (e.g. `let y: T = ...`) resolve `T` to a
     /// type variable rather than a bogus nullary named type.
     type_params: Vec<String>,
+    /// Counter for naming the inferred type variable of an unannotated lambda
+    /// parameter (`\x -> ...`). Kept unique per parse.
+    lambda_counter: usize,
 }
 
 fn is_upper(name: &str) -> bool {
@@ -21,7 +24,7 @@ fn is_upper(name: &str) -> bool {
 
 impl Parser {
     pub fn new(toks: Vec<Token>) -> Self {
-        Parser { toks, pos: 0, type_params: Vec::new() }
+        Parser { toks, pos: 0, type_params: Vec::new(), lambda_counter: 0 }
     }
 
     fn peek(&self) -> &Tok {
@@ -195,6 +198,27 @@ impl Parser {
     // a bare name found there becomes a `Ty::Var`, builtins map to their concrete
     // types, and anything else is a `Ty::Named` with optional `[..]` arguments.
     fn parse_type(&mut self, tparams: &[String]) -> Result<Ty, String> {
+        // Function type: `(T1, T2, ...) -> R`. The leading `(` unambiguously
+        // distinguishes it from a named/builtin type (which starts with an
+        // identifier).
+        if *self.peek() == Tok::LParen {
+            self.advance();
+            let mut params = Vec::new();
+            if *self.peek() != Tok::RParen {
+                loop {
+                    params.push(self.parse_type(tparams)?);
+                    if *self.peek() == Tok::Comma {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+            }
+            self.expect(&Tok::RParen)?;
+            self.expect(&Tok::Arrow)?;
+            let ret = self.parse_type(tparams)?;
+            return Ok(Ty::Fn(params, Box::new(ret)));
+        }
         let name = self.expect_ident()?;
         // A bare builtin name (no brackets) stays a concrete builtin type.
         let builtin = match name.as_str() {
@@ -280,8 +304,69 @@ impl Parser {
                 self.advance();
                 Ok(Expr::Unary(UnOp::Not, Box::new(self.parse_unary()?)))
             }
-            _ => self.parse_atom(),
+            Tok::Backslash => self.parse_lambda(),
+            _ => self.parse_postfix(),
         }
+    }
+
+    // A lambda: `\x -> body` or `\(x: Int, y: Int) -> body`. Canonical form uses
+    // a leading backslash. The single-parameter shorthand `\x -> ...` infers no
+    // type, so its parameter type is left as a fresh type variable for the
+    // checker to solve from use; the parenthesized form carries explicit
+    // annotations. The body extends as far right as possible.
+    fn parse_lambda(&mut self) -> Result<Expr, String> {
+        self.expect(&Tok::Backslash)?;
+        let mut params = Vec::new();
+        if *self.peek() == Tok::LParen {
+            self.advance();
+            if *self.peek() != Tok::RParen {
+                loop {
+                    let pname = self.expect_ident()?;
+                    self.expect(&Tok::Colon)?;
+                    let tps = self.type_params.clone();
+                    let ty = self.parse_type(&tps)?;
+                    params.push((pname, ty));
+                    if *self.peek() == Tok::Comma {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+            }
+            self.expect(&Tok::RParen)?;
+        } else {
+            // Single unannotated parameter shorthand: `\x -> body`.
+            let pname = self.expect_ident()?;
+            params.push((pname, Ty::Var(self.fresh_lambda_var())));
+        }
+        self.expect(&Tok::Arrow)?;
+        let body = self.parse_expr(0)?;
+        Ok(Expr::Lambda(params, Box::new(body)))
+    }
+
+    // Parse an atom, then any trailing `(args)` applications. A trailing call on
+    // a bare lowercase identifier stays `Expr::Call` (top-level call by name);
+    // any other callee (a lambda, a parenthesized expression, or a further
+    // application) becomes `Expr::Apply`.
+    fn parse_postfix(&mut self) -> Result<Expr, String> {
+        let mut e = self.parse_atom()?;
+        // `parse_atom` already consumes the first `(args)` for `name(args)`
+        // (yielding a by-name Call/Ctor). Any further `(args)` here — or an
+        // application of a non-name expression such as `(\x -> ...)(5)` — is a
+        // general application of the callee value.
+        while *self.peek() == Tok::LParen {
+            let args = self.parse_args()?;
+            e = Expr::Apply(Box::new(e), args);
+        }
+        Ok(e)
+    }
+
+    // A fresh, source-invisible type-variable name for an unannotated lambda
+    // parameter. Prefixed so it never collides with a user generic parameter.
+    fn fresh_lambda_var(&mut self) -> String {
+        let n = self.lambda_counter;
+        self.lambda_counter += 1;
+        format!("$lam{}", n)
     }
 
     fn parse_args(&mut self) -> Result<Vec<Expr>, String> {

@@ -34,6 +34,7 @@ pub enum Tok {
     Underscore,
     Arrow,    // ->
     FatArrow, // =>
+    Backslash, // \  (introduces a lambda)
     Eq,       // =
     // Operators
     Plus,
@@ -131,6 +132,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             '<' => Some(Tok::Lt),
             '>' => Some(Tok::Gt),
             '!' => Some(Tok::Bang),
+            '\\' => Some(Tok::Backslash),
             _ => None,
         };
         if let Some(t) = single {

@@ -217,6 +217,12 @@ impl Lowerer {
                 stmts.push((t.clone(), bind));
                 Ok(Atom::Var(t))
             }
+            Expr::Lambda(_, _) | Expr::Apply(_, _) => {
+                return Err(LowerError(
+                    "function values (lambdas / higher-order calls) are not supported by the compiled backends yet"
+                        .to_string(),
+                ));
+            }
             Expr::Block(block_stmts, last) => {
                 for s in block_stmts {
                     match s {
@@ -885,6 +891,25 @@ mod tests {
     #[test]
     fn factorial_matches_interpreter() {
         differential("fn fac(n: Int) -> Int = match n { 0 => 1, _ => n * fac(n - 1), }\nfn main() -> Int = fac(6)");
+    }
+
+    #[test]
+    fn function_values_rejected_by_compiled_backend() {
+        // A program using a lambda / higher-order call type-checks and runs in the
+        // interpreter, but the IR (and thus the wasm/native backends) must reject
+        // it with a clean Err — never a panic.
+        let src = r#"
+            fn apply1(f: (Int) -> Int, x: Int) -> Int = f(x)
+            fn main() -> Int = apply1(\y -> y + 1, 41)
+        "#;
+        let prog = parser::parse(lexer::lex(src).unwrap()).unwrap();
+        typeck::check(&prog).expect("must type-check");
+        let err = lower_program(&prog).unwrap_err();
+        assert!(
+            err.contains("not supported by the compiled backends"),
+            "got: {}",
+            err
+        );
     }
 
     #[test]

@@ -18,6 +18,10 @@ pub enum Ty {
     /// A type variable, either a declared generic parameter (`T`) or a fresh
     /// unification variable introduced by the checker.
     Var(String),
+    /// A first-class function type: parameter types and a return type, e.g.
+    /// `(Int, Bool) -> Int`. Only the interpreter executes these; the compiled
+    /// backends reject any program mentioning a `Ty::Fn`.
+    Fn(Vec<Ty>, Box<Ty>),
 }
 
 #[derive(Debug, Clone)]
@@ -32,6 +36,13 @@ pub enum Expr {
     Ctor(String, Vec<Expr>),
     /// Function or builtin call, e.g. `factorial(5)`.
     Call(String, Vec<Expr>),
+    /// A lambda with typed parameters and a body, e.g. `\(x: Int) -> x + 1`.
+    /// Evaluates to a closure capturing the defining environment.
+    Lambda(Vec<(String, Ty)>, Box<Expr>),
+    /// Application of an arbitrary expression (a lambda, a function-valued
+    /// variable, or a call result) to arguments, e.g. `f(3)` where `f` is a
+    /// local function value, or `(\x -> x)(5)`.
+    Apply(Box<Expr>, Vec<Expr>),
     Unary(UnOp, Box<Expr>),
     Binary(BinOp, Box<Expr>, Box<Expr>),
     If(Box<Expr>, Box<Expr>, Box<Expr>),

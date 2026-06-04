@@ -17,7 +17,20 @@ pub enum Value {
     Data { ctor: String, fields: Vec<Value> },
     /// An opaque AI-runtime tensor handle, built and queried via builtins.
     Tensor(crate::tensor::Tensor),
+    /// A first-class function value. A lambda captures the environment in which
+    /// it was created; a bare top-level function name becomes a closure with an
+    /// empty captured environment. Boxed (via `Arc`) so adding closures does not
+    /// enlarge `Value` and blow the recursive-interpreter stack.
+    Closure(std::sync::Arc<ClosureData>),
     Unit,
+}
+
+/// The payload of a `Value::Closure`, heap-allocated behind an `Arc`.
+#[derive(Debug)]
+pub struct ClosureData {
+    pub params: Vec<String>,
+    pub body: Expr,
+    pub env: HashMap<String, Value>,
 }
 
 impl Value {
@@ -35,6 +48,9 @@ impl Value {
                 }
             }
             Value::Unit => "()".to_string(),
+            Value::Closure(c) => {
+                format!("<closure/{}>", c.params.len())
+            }
             Value::Data { ctor, fields } => {
                 if fields.is_empty() {
                     ctor.clone()
@@ -118,6 +134,9 @@ impl Interp {
             Expr::Var(name) => {
                 if let Some(v) = Interp::lookup(scope, name) {
                     Ok(v.clone())
+                } else if let Some(c) = self.fn_as_closure(name) {
+                    // A bare top-level function name used as a value.
+                    Ok(c)
                 } else {
                     Err(format!("unbound variable `{}`", name))
                 }
@@ -150,6 +169,12 @@ impl Interp {
                 let mut vals = Vec::with_capacity(args.len());
                 for a in args {
                     vals.push(self.eval(a, scope)?);
+                }
+                // A local binding that shadows the name (e.g. a function-valued
+                // parameter) is applied as a closure value.
+                if let Some(v) = Interp::lookup(scope, name) {
+                    let callee = v.clone();
+                    return self.apply_value(callee, vals, name);
                 }
                 if let Some(v) = builtin(name, &vals)? {
                     return Ok(v);
@@ -218,6 +243,31 @@ impl Interp {
                 Err(format!("no match arm for value {}", v.display()))
             }
 
+            Expr::Lambda(params, body) => {
+                // Capture the current environment by flattening all in-scope
+                // frames (inner shadowing outer) into the closure's env.
+                let mut env = HashMap::new();
+                for frame in scope.iter() {
+                    for (k, v) in frame {
+                        env.insert(k.clone(), v.clone());
+                    }
+                }
+                Ok(Value::Closure(std::sync::Arc::new(ClosureData {
+                    params: params.iter().map(|(n, _)| n.clone()).collect(),
+                    body: (**body).clone(),
+                    env,
+                })))
+            }
+
+            Expr::Apply(callee, args) => {
+                let f = self.eval(callee, scope)?;
+                let mut vals = Vec::with_capacity(args.len());
+                for a in args {
+                    vals.push(self.eval(a, scope)?);
+                }
+                self.apply_value(f, vals, "value")
+            }
+
             Expr::Block(stmts, last) => {
                 scope.push(HashMap::new());
                 let mut run = || -> Result<Value, String> {
@@ -239,6 +289,57 @@ impl Interp {
                 result
             }
         }
+    }
+
+    /// Build a closure value for a top-level function used as a value. The
+    /// captured environment is empty: a top-level function closes over nothing
+    /// (it can still reference other top-level functions, resolved at call time).
+    fn fn_as_closure(&self, name: &str) -> Option<Value> {
+        let f = self.fns.get(name)?;
+        Some(Value::Closure(std::sync::Arc::new(ClosureData {
+            params: f.params.iter().map(|p| p.name.clone()).collect(),
+            body: f.body.clone(),
+            env: HashMap::new(),
+        })))
+    }
+
+    /// Apply a function VALUE (a closure) to already-evaluated arguments. Binds
+    /// the parameters in the closure's captured environment and evaluates the
+    /// body, honoring the recursion-depth guard.
+    fn apply_value(&self, callee: Value, args: Vec<Value>, what: &str) -> Result<Value, String> {
+        let data = match callee {
+            Value::Closure(c) => c,
+            other => {
+                return Err(format!(
+                    "cannot apply {} `{}`: it is not a function",
+                    what,
+                    other.display()
+                ))
+            }
+        };
+        if data.params.len() != args.len() {
+            return Err(format!(
+                "function value expects {} argument(s), got {}",
+                data.params.len(),
+                args.len()
+            ));
+        }
+        let mut frame = data.env.clone();
+        for (p, v) in data.params.iter().zip(args.into_iter()) {
+            frame.insert(p.clone(), v);
+        }
+        let mut call_scope: Scope = vec![frame];
+        let d = self.depth.get() + 1;
+        if d > MAX_CALL_DEPTH {
+            return Err(format!(
+                "maximum recursion depth ({}) exceeded applying {}",
+                MAX_CALL_DEPTH, what
+            ));
+        }
+        self.depth.set(d);
+        let result = self.eval(&data.body, &mut call_scope);
+        self.depth.set(d - 1);
+        result
     }
 
     fn eval_binary(
@@ -608,6 +709,9 @@ mod tests {
             Value::Unit => Unit,
             Value::Tensor(_) => Named("Tensor".into(), vec![]),
             Value::Data { ctor, .. } => Named(ctor.clone(), vec![]),
+            Value::Closure(c) => {
+                Fn(c.params.iter().map(|_| Unit).collect(), Box::new(Unit))
+            }
         }
     }
 
@@ -718,6 +822,82 @@ mod tests {
             }
         "#);
         assert!(matches!(same, Value::Bool(true)));
+    }
+
+    #[test]
+    fn closure_captures_a_variable() {
+        // The lambda `\x -> x + n` must capture `n` from the enclosing scope.
+        let v = run(r#"
+            fn apply1(f: (Int) -> Int, x: Int) -> Int = f(x)
+            fn main() -> Int = { let n = 100; apply1(\x -> x + n, 5) }
+        "#);
+        assert!(matches!(v, Value::Int(105)), "got {}", v.display());
+    }
+
+    #[test]
+    fn map_with_a_lambda_closure() {
+        // map with a closure capturing `n`, summed: (1+10)+(2+10) = 23.
+        let v = run(r#"
+            type L = | Nil | Cons(Int, L)
+            fn map(f: (Int) -> Int, xs: L) -> L =
+              match xs { Nil => Nil, Cons(h, r) => Cons(f(h), map(f, r)), }
+            fn sum(xs: L) -> Int = match xs { Nil => 0, Cons(h, r) => h + sum(r), }
+            fn main() -> Int = {
+                let n = 10;
+                sum(map(\x -> x + n, Cons(1, Cons(2, Nil))))
+            }
+        "#);
+        assert!(matches!(v, Value::Int(23)), "got {}", v.display());
+    }
+
+    #[test]
+    fn filter_with_a_lambda() {
+        // Keep odd numbers from [1,2,3,4], then sum: 1 + 3 = 4.
+        let v = run(r#"
+            type L = | Nil | Cons(Int, L)
+            fn filter(p: (Int) -> Bool, xs: L) -> L =
+              match xs {
+                Nil => Nil,
+                Cons(h, r) => if p(h) { Cons(h, filter(p, r)) } else { filter(p, r) },
+              }
+            fn sum(xs: L) -> Int = match xs { Nil => 0, Cons(h, r) => h + sum(r), }
+            fn main() -> Int =
+              sum(filter(\x -> x % 2 == 1, Cons(1, Cons(2, Cons(3, Cons(4, Nil))))))
+        "#);
+        assert!(matches!(v, Value::Int(4)), "got {}", v.display());
+    }
+
+    #[test]
+    fn fold_with_a_lambda() {
+        // Left fold (+) over [1,2,3,4] starting at 0 = 10.
+        let v = run(r#"
+            type L = | Nil | Cons(Int, L)
+            fn fold(f: (Int, Int) -> Int, acc: Int, xs: L) -> Int =
+              match xs { Nil => acc, Cons(h, r) => fold(f, f(acc, h), r), }
+            fn main() -> Int =
+              fold(\(a: Int, b: Int) -> a + b, 0, Cons(1, Cons(2, Cons(3, Cons(4, Nil)))))
+        "#);
+        assert!(matches!(v, Value::Int(10)), "got {}", v.display());
+    }
+
+    #[test]
+    fn function_passed_by_name_runs() {
+        // A top-level function name handed to a HOF as a value.
+        let v = run(r#"
+            type L = | Nil | Cons(Int, L)
+            fn dbl(x: Int) -> Int = x * 2
+            fn map(f: (Int) -> Int, xs: L) -> L =
+              match xs { Nil => Nil, Cons(h, r) => Cons(f(h), map(f, r)), }
+            fn sum(xs: L) -> Int = match xs { Nil => 0, Cons(h, r) => h + sum(r), }
+            fn main() -> Int = sum(map(dbl, Cons(1, Cons(2, Cons(3, Nil)))))
+        "#);
+        assert!(matches!(v, Value::Int(12)), "got {}", v.display());
+    }
+
+    #[test]
+    fn immediately_applied_lambda() {
+        let v = run("fn main() -> Int = (\\(x: Int) -> x * x)(7)");
+        assert!(matches!(v, Value::Int(49)), "got {}", v.display());
     }
 
     #[test]

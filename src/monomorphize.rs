@@ -184,6 +184,12 @@ impl<'a> Mono<'a> {
                 }
             }
             Ty::Var(v) => format!("?{}", v), // should not happen post-substitution
+            // Function types are outside the monomorphizing/compiled subset; they
+            // are rejected before reaching codegen, but give a stable name here.
+            Ty::Fn(params, ret) => {
+                let inner: Vec<String> = params.iter().map(Self::ty_component).collect();
+                format!("Fn_{}__{}", inner.join("_"), Self::ty_component(ret))
+            }
         }
     }
 
@@ -469,6 +475,9 @@ impl<'a> Mono<'a> {
             }
             // If / Match / Block need full rewriting to type; skip for seeding.
             Expr::If(_, _, _) | Expr::Match(_, _) | Expr::Block(_, _) => None,
+            // Function values are outside the compiled subset; contribute nothing
+            // to seeding (they are rejected in the rewriting pass).
+            Expr::Lambda(_, _) | Expr::Apply(_, _) => None,
         }
     }
 
@@ -679,6 +688,11 @@ impl<'a> Mono<'a> {
                 let (rlast, lt) = self.rewrite_expr(last, &mut scope, tymap, expected)?;
                 Ok((Expr::Block(rstmts, Box::new(rlast)), lt))
             }
+
+            Expr::Lambda(_, _) | Expr::Apply(_, _) => Err(
+                "monomorphize: function values (lambdas / higher-order calls) are not supported by the compiled backends yet"
+                    .to_string(),
+            ),
         }
     }
 

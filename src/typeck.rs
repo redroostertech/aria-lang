@@ -40,6 +40,10 @@ pub fn show(t: &Ty) -> String {
                 format!("{}[{}]", n, inner.join(", "))
             }
         }
+        Ty::Fn(params, ret) => {
+            let inner: Vec<String> = params.iter().map(show).collect();
+            format!("({}) -> {}", inner.join(", "), show(ret))
+        }
     }
 }
 
@@ -173,6 +177,12 @@ pub fn check(program: &Program) -> Result<(), Vec<String>> {
                 }
             }
             Ty::Var(_) => {} // a declared generic parameter; fine
+            Ty::Fn(fn_params, ret) => {
+                for p in fn_params {
+                    known(p, types, params, errs, ctx);
+                }
+                known(ret, types, params, errs, ctx);
+            }
             _ => {}
         }
     }
@@ -301,6 +311,13 @@ fn collect_calls(e: &Expr, out: &mut HashSet<String>) {
                 collect_calls(a, out);
             }
         }
+        Expr::Lambda(_, body) => collect_calls(body, out),
+        Expr::Apply(callee, args) => {
+            collect_calls(callee, out);
+            for a in args {
+                collect_calls(a, out);
+            }
+        }
         Expr::Unary(_, x) => collect_calls(x, out),
         Expr::Binary(_, a, b) => {
             collect_calls(a, out);
@@ -418,6 +435,10 @@ impl Checker {
             Ty::Named(n, args) => {
                 Ty::Named(n.clone(), args.iter().map(|a| Self::apply_map(a, map)).collect())
             }
+            Ty::Fn(params, ret) => Ty::Fn(
+                params.iter().map(|p| Self::apply_map(p, map)).collect(),
+                Box::new(Self::apply_map(ret, map)),
+            ),
             other => other.clone(),
         }
     }
@@ -439,6 +460,10 @@ impl Checker {
             Ty::Named(n, args) => {
                 Ty::Named(n, args.iter().map(|a| self.resolve(a)).collect())
             }
+            Ty::Fn(params, ret) => Ty::Fn(
+                params.iter().map(|p| self.resolve(p)).collect(),
+                Box::new(self.resolve(&ret)),
+            ),
             other => other,
         }
     }
@@ -447,6 +472,9 @@ impl Checker {
         match self.prune(ty) {
             Ty::Var(n) => n == var,
             Ty::Named(_, args) => args.iter().any(|a| self.occurs(var, a)),
+            Ty::Fn(params, ret) => {
+                params.iter().any(|p| self.occurs(var, p)) || self.occurs(var, &ret)
+            }
             _ => false,
         }
     }
@@ -487,6 +515,13 @@ impl Checker {
                 }
                 Ok(())
             }
+            // Function types unify structurally: same arity, params + return.
+            (Ty::Fn(p1, r1), Ty::Fn(p2, r2)) if p1.len() == p2.len() => {
+                for (x, y) in p1.iter().zip(p2.iter()) {
+                    self.unify(x, y)?;
+                }
+                self.unify(r1, r2)
+            }
             _ => Err(format!(
                 "expected {}, found {}",
                 show(&self.resolve(&a)),
@@ -505,8 +540,20 @@ impl Checker {
             Expr::Str(_) => Ok(Ty::Str),
             Expr::Unit => Ok(Ty::Unit),
 
-            Expr::Var(name) => Checker::lookup_var(scope, name)
-                .ok_or_else(|| format!("unbound variable `{}`", name)),
+            Expr::Var(name) => {
+                if let Some(t) = Checker::lookup_var(scope, name) {
+                    Ok(t)
+                } else if let Some(sig) = self.fns.get(name).cloned() {
+                    // A bare top-level function name used as a VALUE: its type is
+                    // its function type, with generic parameters instantiated.
+                    let map = self.instantiate_map(&sig.type_params);
+                    let params = sig.params.iter().map(|p| Self::apply_map(p, &map)).collect();
+                    let ret = Self::apply_map(&sig.ret, &map);
+                    Ok(Ty::Fn(params, Box::new(ret)))
+                } else {
+                    Err(format!("unbound variable `{}`", name))
+                }
+            }
 
             Expr::Ctor(name, args) => {
                 let sig = self
@@ -540,6 +587,12 @@ impl Checker {
             }
 
             Expr::Call(name, args) => {
+                // A local binding shadowing a name (e.g. a function-valued
+                // parameter `f`) is applied as a function VALUE, not a by-name
+                // top-level call. This makes `f(x)` work inside a HOF.
+                if let Some(local) = Checker::lookup_var(scope, name) {
+                    return self.synth_apply(&local, args, scope, &format!("`{}`", name));
+                }
                 let (params, ret, type_params) =
                     if let Some((p, r)) = builtin_sig(name) {
                         (p, r, Vec::new())
@@ -602,6 +655,37 @@ impl Checker {
 
             Expr::Match(scrut, arms) => self.synth_match(scrut, arms, scope),
 
+            Expr::Lambda(params, body) => {
+                // Parameters are typed from their annotations. An unannotated
+                // `\x -> ...` carries a parser-supplied placeholder var (`$lamN`);
+                // give it a FRESH unification variable so its type can be solved
+                // from the surrounding context (e.g. the function-type parameter
+                // it is passed to). Check the body in the extended scope; the
+                // lambda's type is the resulting `Ty::Fn`.
+                let mut frame = HashMap::new();
+                let mut param_tys: Vec<Ty> = Vec::new();
+                for (n, t) in params {
+                    let pt = match t {
+                        Ty::Var(v) if v.starts_with("$lam") => self.fresh(),
+                        other => other.clone(),
+                    };
+                    frame.insert(n.clone(), pt.clone());
+                    param_tys.push(pt);
+                }
+                scope.push(frame);
+                let body_ty = self.synth(body, scope);
+                scope.pop();
+                let body_ty = body_ty?;
+                let param_tys: Vec<Ty> =
+                    param_tys.iter().map(|t| self.resolve(t)).collect();
+                Ok(Ty::Fn(param_tys, Box::new(self.resolve(&body_ty))))
+            }
+
+            Expr::Apply(callee, args) => {
+                let ct = self.synth(callee, scope)?;
+                self.synth_apply(&ct, args, scope, "value")
+            }
+
             Expr::Block(stmts, last) => {
                 scope.push(HashMap::new());
                 let result = (|| {
@@ -635,6 +719,50 @@ impl Checker {
                 result
             }
         }
+    }
+
+    // Type an application of a value of type `callee` to `args`. The callee must
+    // unify with a function type of matching arity; each argument is checked
+    // against the corresponding parameter type, and the application's type is the
+    // function's return type.
+    fn synth_apply(
+        &self,
+        callee: &Ty,
+        args: &[Expr],
+        scope: &mut Scope,
+        what: &str,
+    ) -> Result<Ty, String> {
+        let pruned = self.prune(callee);
+        // If the callee is already a concrete function type, check arity directly
+        // for a clearer message; otherwise force it to a function type by
+        // unifying with a fresh `Fn`.
+        if let Ty::Fn(params, _) = &pruned {
+            if params.len() != args.len() {
+                return Err(format!(
+                    "applying {} expects {} argument(s), got {}",
+                    what,
+                    params.len(),
+                    args.len()
+                ));
+            }
+        }
+        let arg_vars: Vec<Ty> = (0..args.len()).map(|_| self.fresh()).collect();
+        let ret_var = self.fresh();
+        let want = Ty::Fn(arg_vars.clone(), Box::new(ret_var.clone()));
+        self.unify(&want, &pruned).map_err(|_| {
+            format!(
+                "cannot apply {}: it is not a function of {} argument(s) (its type is {})",
+                what,
+                args.len(),
+                show(&self.resolve(&pruned))
+            )
+        })?;
+        for (i, (arg, pv)) in args.iter().zip(arg_vars.iter()).enumerate() {
+            let at = self.synth(arg, scope)?;
+            self.unify(pv, &at)
+                .map_err(|e| format!("applying {} argument {}: {}", what, i, e))?;
+        }
+        Ok(self.resolve(&ret_var))
     }
 
     fn synth_match(&self, scrut: &Expr, arms: &[Arm], scope: &mut Scope) -> Result<Ty, String> {
@@ -771,8 +899,21 @@ impl Checker {
 
     fn synth_binary(&self, op: BinOp, lt: &Ty, rt: &Ty) -> Result<Ty, String> {
         use BinOp::*;
-        let lt = self.prune(lt);
-        let rt = self.prune(rt);
+        let mut lt = self.prune(lt);
+        let mut rt = self.prune(rt);
+        // If exactly one operand is still an unsolved unification variable (e.g.
+        // the parameter of an unannotated lambda whose type is fixed by the
+        // other operand), unify them so the variable is driven to the concrete
+        // operand's type. This makes `\x -> x + n` (with `n: Int`) infer `x: Int`
+        // before the surrounding application pins it. We only do this when one
+        // side is concrete to avoid prematurely tying two unknowns together.
+        let l_open = matches!(&lt, Ty::Var(v) if is_fresh(v));
+        let r_open = matches!(&rt, Ty::Var(v) if is_fresh(v));
+        if l_open ^ r_open {
+            let _ = self.unify(&lt, &rt);
+            lt = self.prune(&lt);
+            rt = self.prune(&rt);
+        }
         let both = |t: &Ty| lt == *t && rt == *t;
         match op {
             And | Or => {
@@ -1068,5 +1209,86 @@ mod tests {
     fn main_may_be_io() {
         let src = "fn main() -> Int = { print_int(5); 0 }";
         assert!(check_src(src).is_ok());
+    }
+
+    // ---- first-class functions / closures --------------------------------
+
+    #[test]
+    fn lambda_and_application_check() {
+        // A lambda value applied to an argument yields its return type.
+        let src = "fn main() -> Int = (\\(x: Int) -> x + 1)(41)";
+        assert!(check_src(src).is_ok(), "got: {:?}", check_src(src));
+    }
+
+    #[test]
+    fn hof_with_function_type_param_checks() {
+        let src = r#"
+            type L = | Nil | Cons(Int, L)
+            fn map(f: (Int) -> Int, xs: L) -> L =
+              match xs { Nil => Nil, Cons(h, r) => Cons(f(h), map(f, r)), }
+            fn sum(xs: L) -> Int = match xs { Nil => 0, Cons(h, r) => h + sum(r), }
+            fn main() -> Int = {
+                let n = 10;
+                sum(map(\x -> x + n, Cons(1, Cons(2, Nil))))
+            }
+        "#;
+        assert!(check_src(src).is_ok(), "got: {:?}", check_src(src));
+    }
+
+    #[test]
+    fn function_passed_by_name_checks() {
+        // A top-level function used as a value (not immediately called).
+        let src = r#"
+            type L = | Nil | Cons(Int, L)
+            fn inc(x: Int) -> Int = x + 1
+            fn map(f: (Int) -> Int, xs: L) -> L =
+              match xs { Nil => Nil, Cons(h, r) => Cons(f(h), map(f, r)), }
+            fn main() -> L = map(inc, Cons(1, Nil))
+        "#;
+        assert!(check_src(src).is_ok(), "got: {:?}", check_src(src));
+    }
+
+    #[test]
+    fn generic_hof_checks() {
+        // A fully generic higher-order map[T,U].
+        let src = r#"
+            type L[T] = | Nil | Cons(T, L[T])
+            fn map[T, U](f: (T) -> U, xs: L[T]) -> L[U] =
+              match xs { Nil => Nil, Cons(h, r) => Cons(f(h), map(f, r)), }
+            fn main() -> Int = { let xs = map(\(x: Int) -> x == 0, Cons(1, Nil)); 0 }
+        "#;
+        assert!(check_src(src).is_ok(), "got: {:?}", check_src(src));
+    }
+
+    #[test]
+    fn applying_a_non_function_is_error() {
+        let src = "fn main() -> Int = { let x = 5; x(3) }";
+        let errs = check_src(src).unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains("not a function")),
+            "got: {:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn lambda_wrong_argument_type_is_error() {
+        // Applying an `(Int) -> Int` lambda to a Bool must be rejected.
+        let src = "fn main() -> Int = (\\(x: Int) -> x + 1)(true)";
+        let errs = check_src(src).unwrap_err();
+        assert!(!errs.is_empty(), "expected a type error");
+    }
+
+    #[test]
+    fn hof_wrong_function_type_is_error() {
+        // Passing a `(Bool) -> Int` where `(Int) -> Int` is required.
+        let src = r#"
+            type L = | Nil | Cons(Int, L)
+            fn map(f: (Int) -> Int, xs: L) -> L =
+              match xs { Nil => Nil, Cons(h, r) => Cons(f(h), map(f, r)), }
+            fn main() -> L = map(\(b: Bool) -> 0, Cons(1, Nil))
+        "#;
+        let errs = check_src(src).unwrap_err();
+        assert!(!errs.is_empty(), "expected a type error");
     }
 }

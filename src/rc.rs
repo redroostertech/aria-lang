@@ -351,8 +351,19 @@ mod tests {
     }
 
     fn ast_result(src: &str) -> String {
-        let prog = parser::parse(lexer::lex(src).unwrap()).unwrap();
-        interp::Interp::new(&prog).unwrap().run_main().unwrap().display()
+        // Run on a large-stack thread, exactly as the CLI does (see main.rs): the
+        // tree-walking interpreter recurses with the Aria call stack, and a deep
+        // (but legal) recursion would overflow the small default test stack.
+        let src = src.to_string();
+        std::thread::Builder::new()
+            .stack_size(1 << 30)
+            .spawn(move || {
+                let prog = parser::parse(lexer::lex(&src).unwrap()).unwrap();
+                interp::Interp::new(&prog).unwrap().run_main().unwrap().display()
+            })
+            .unwrap()
+            .join()
+            .unwrap()
     }
 
     /// For an Int/Bool-returning program, the RC pass must be garbage-free:

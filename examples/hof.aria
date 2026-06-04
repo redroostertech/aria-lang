@@ -1,0 +1,64 @@
+-- Higher-order functions, lambdas, and closures.
+--
+-- Functions are first-class values: they have a function TYPE `(Int) -> Int`,
+-- can be passed as arguments, and a lambda `\x -> body` captures the variables
+-- in scope where it is written (a closure). The canonical lambda spelling is a
+-- leading backslash: `\x -> e` (one inferred parameter) or
+-- `\(x: Int, y: Int) -> e` (explicit annotations).
+
+type List[T] =
+  | Nil
+  | Cons(T, List[T])
+
+-- map: apply a function to every element.
+fn map(f: (Int) -> Int, xs: List[Int]) -> List[Int] =
+  match xs {
+    Nil           => Nil,
+    Cons(h, rest) => Cons(f(h), map(f, rest)),
+  }
+
+-- filter: keep the elements a predicate accepts.
+fn filter(p: (Int) -> Bool, xs: List[Int]) -> List[Int] =
+  match xs {
+    Nil           => Nil,
+    Cons(h, rest) => if p(h) { Cons(h, filter(p, rest)) } else { filter(p, rest) },
+  }
+
+-- fold: left fold with a binary function and an accumulator.
+fn fold(f: (Int, Int) -> Int, acc: Int, xs: List[Int]) -> Int =
+  match xs {
+    Nil           => acc,
+    Cons(h, rest) => fold(f, f(acc, h), rest),
+  }
+
+fn sum(xs: List[Int]) -> Int =
+  match xs {
+    Nil           => 0,
+    Cons(h, rest) => h + sum(rest),
+  }
+
+-- A plain top-level function, used below as a value passed by name.
+fn double(x: Int) -> Int = x * 2
+
+fn main() -> Int = {
+  let xs = Cons(1, Cons(2, Cons(3, Cons(4, Nil))));
+
+  -- A closure that captures the local `n`.
+  let n = 10;
+  let shifted = sum(map(\x -> x + n, xs));        -- (1+10)+..+(4+10) = 50
+  print_str(concat("map (+n)  = ", int_to_str(shifted)));
+
+  -- A function passed by name.
+  let doubled = sum(map(double, xs));             -- 2+4+6+8 = 20
+  print_str(concat("map double= ", int_to_str(doubled)));
+
+  -- A predicate lambda.
+  let odds = sum(filter(\x -> x % 2 == 1, xs));   -- 1 + 3 = 4
+  print_str(concat("filter odd= ", int_to_str(odds)));
+
+  -- A binary lambda folded over the list.
+  let total = fold(\(a: Int, b: Int) -> a + b, 0, xs);  -- 10
+  print_str(concat("fold (+)  = ", int_to_str(total)));
+
+  total
+}
