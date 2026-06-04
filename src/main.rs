@@ -8,6 +8,8 @@
 //!   aria bench                      run the compression benchmark
 //!   aria wasm   <file.aria> <out>   compile the pure Int/Bool subset to wasm
 //!   aria wasm-run <file.aria>       compile to wasm and run it via Node
+//!   aria native <file.aria> <out>   transpile to C and build a native exe via cc
+//!   aria native-run <file.aria>     transpile to C, build, run, print the result
 
 // Many runtime modules expose library-style APIs not all wired into the CLI yet.
 #![allow(dead_code)]
@@ -15,6 +17,7 @@
 mod arith;
 mod ast;
 mod builtins;
+mod c_backend;
 mod interp;
 mod ir;
 mod lexer;
@@ -40,7 +43,7 @@ use std::process::ExitCode;
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: aria <run|check|ast|pack|unpack|npack|nunpack|bench|demo|mem|wasm|wasm-run> [args...]");
+        eprintln!("usage: aria <run|check|ast|pack|unpack|npack|nunpack|bench|demo|mem|wasm|wasm-run|native|native-run> [args...]");
         return ExitCode::from(2);
     }
 
@@ -58,6 +61,8 @@ fn main() -> ExitCode {
         "mem" => run_mem(&args),
         "wasm" => run_wasm_compile(&args),
         "wasm-run" => run_wasm_run(&args),
+        "native" => run_native_compile(&args),
+        "native-run" => run_native_run(&args),
         other => {
             eprintln!("unknown command `{}`", other);
             ExitCode::from(2)
@@ -266,6 +271,97 @@ fn run_wasm_run(args: &[String]) -> ExitCode {
         }
         Err(e) => {
             eprintln!("error: could not run node (is it installed?): {}", e);
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Parse + type-check a file and transpile it to C source (native backend).
+fn compile_to_c(path: &str) -> Result<String, String> {
+    let src = std::fs::read_to_string(path).map_err(|e| format!("cannot read {}: {}", path, e))?;
+    let prog = lexer::lex(&src).and_then(parser::parse)?;
+    typeck::check(&prog).map_err(|errs| errs.join("; "))?;
+    c_backend::compile(&prog)
+}
+
+/// Invoke the system C compiler `cc` to build `c_src` into the executable at
+/// `out_path`. Returns the `cc` stderr on failure.
+fn cc_build(c_src: &str, out_path: &std::path::Path) -> Result<(), String> {
+    let c_path = std::env::temp_dir().join(format!("aria_{}.c", std::process::id()));
+    std::fs::write(&c_path, c_src).map_err(|e| format!("cannot write temp C: {}", e))?;
+    let status = std::process::Command::new("cc")
+        .arg("-O2")
+        .arg("-std=c11")
+        .arg("-o")
+        .arg(out_path)
+        .arg(&c_path)
+        .output();
+    let _ = std::fs::remove_file(&c_path);
+    match status {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => Err(format!("cc failed: {}", String::from_utf8_lossy(&o.stderr))),
+        Err(e) => Err(format!("could not run cc (is a C compiler installed?): {}", e)),
+    }
+}
+
+/// `aria native <file.aria> <out>`: transpile to C and build a native exe.
+fn run_native_compile(args: &[String]) -> ExitCode {
+    if args.len() < 4 {
+        eprintln!("usage: aria native <file.aria> <out>");
+        return ExitCode::from(2);
+    }
+    let c_src = match compile_to_c(&args[2]) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+    let out = std::path::Path::new(&args[3]);
+    if let Err(e) = cc_build(&c_src, out) {
+        eprintln!("error: {}", e);
+        return ExitCode::FAILURE;
+    }
+    eprintln!("built {}", args[3]);
+    ExitCode::SUCCESS
+}
+
+/// `aria native-run <file.aria>`: transpile to C, build in a temp dir, run, and
+/// print `main`'s result. The native live-cell count is forwarded on stderr.
+fn run_native_run(args: &[String]) -> ExitCode {
+    if args.len() < 3 {
+        eprintln!("usage: aria native-run <file.aria>");
+        return ExitCode::from(2);
+    }
+    let c_src = match compile_to_c(&args[2]) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+    let exe = std::env::temp_dir().join(format!("aria_exe_{}", std::process::id()));
+    if let Err(e) = cc_build(&c_src, &exe) {
+        eprintln!("error: {}", e);
+        return ExitCode::FAILURE;
+    }
+    let out = std::process::Command::new(&exe).output();
+    let _ = std::fs::remove_file(&exe);
+    match out {
+        Ok(o) => {
+            use std::io::Write;
+            let _ = std::io::stdout().write_all(&o.stdout);
+            if !o.stderr.is_empty() {
+                eprint!("{}", String::from_utf8_lossy(&o.stderr));
+            }
+            if o.status.success() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+        Err(e) => {
+            eprintln!("error: could not run native executable: {}", e);
             ExitCode::FAILURE
         }
     }
