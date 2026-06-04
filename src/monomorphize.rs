@@ -49,7 +49,12 @@ use crate::ast::*;
 /// `Ty::Var` and no remaining type parameters. Generic items unreachable from
 /// `main` are dropped.
 pub fn monomorphize(program: &Program) -> Result<Program, String> {
-    Mono::new(program).run()
+    // Back-annotate the concrete types of any unannotated lambda parameters
+    // (e.g. `let f = \x -> ..`) so specialization and the backends see a type
+    // even when only the surrounding context fixes it.
+    let mut program = program.clone();
+    crate::typeck::annotate_lambda_params(&mut program);
+    Mono::new(&program).run()
 }
 
 // ---- signatures gathered from the source program ---------------------------

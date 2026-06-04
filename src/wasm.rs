@@ -6132,6 +6132,16 @@ mod tests {
                h(10) + h(20)\n\
              }",
         );
+        // Unannotated lambdas bound to bare lets (parameter types fixed only by a
+        // later use) — typeck back-annotates them so they compile.
+        differential_gc(
+            "fn compose(f: (Int)->Int, g: (Int)->Int) -> (Int)->Int = \\x -> f(g(x))\n\
+             fn main() -> Int = {\n\
+               let inc = \\x -> x + 1;\n\
+               let dbl = \\x -> x * 2;\n\
+               compose(inc, dbl)(10)\n\
+             }",
+        );
     }
 
     #[test]

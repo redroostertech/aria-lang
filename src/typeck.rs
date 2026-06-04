@@ -80,6 +80,13 @@ struct Checker {
     // Union-find / substitution for unification variables, plus a fresh counter.
     subst: RefCell<HashMap<String, Ty>>,
     counter: RefCell<u64>,
+    // For each unannotated lambda parameter encountered while checking the
+    // CURRENT function, the parser placeholder name (`$lamN`) paired with the
+    // fresh unification variable assigned to it. After the function's body is
+    // checked these resolve to concrete types, which `annotate_lambda_params`
+    // writes back into the AST so the compiled backends can type unannotated
+    // lambdas (e.g. `let f = \x -> ..`). Cleared per function.
+    lam_vars: RefCell<Vec<(String, Ty)>>,
 }
 
 /// Type-check a whole program. Returns every error found, not just the first.
@@ -228,6 +235,7 @@ pub fn check(program: &Program) -> Result<(), Vec<String>> {
         types,
         subst: RefCell::new(HashMap::new()),
         counter: RefCell::new(0),
+        lam_vars: RefCell::new(Vec::new()),
     };
 
     // Pass 3: check each function body against its declared return type. Each
@@ -287,6 +295,138 @@ pub fn check(program: &Program) -> Result<(), Vec<String>> {
         Ok(())
     } else {
         Err(errors)
+    }
+}
+
+/// Infer and write back the concrete types of *unannotated* lambda parameters
+/// into the AST, so later passes (monomorphization, the compiled backends) see a
+/// type even for a bare `let f = \x -> ..` whose parameter type only the
+/// surrounding context fixes. Best-effort: it assumes the program already
+/// type-checked (callers run `check` first), re-runs body inference solely to
+/// resolve each lambda placeholder, and rewrites `Expr::Lambda` parameter
+/// annotations in place. Anything it cannot resolve is left untouched.
+pub fn annotate_lambda_params(program: &mut Program) {
+    // Pass 1 (mirrors `check`): gather declarations.
+    let mut fns: HashMap<String, FnSig> = HashMap::new();
+    let mut ctors: HashMap<String, CtorSig> = HashMap::new();
+    let mut types: HashMap<String, (Vec<String>, Vec<String>)> = HashMap::new();
+    for item in &program.items {
+        match item {
+            Item::Type(t) => {
+                let mut variants = Vec::new();
+                for v in &t.variants {
+                    variants.push(v.name.clone());
+                    ctors.entry(v.name.clone()).or_insert(CtorSig {
+                        type_params: t.params.clone(),
+                        fields: v.fields.clone(),
+                        tyname: t.name.clone(),
+                    });
+                }
+                types.entry(t.name.clone()).or_insert((t.params.clone(), variants));
+            }
+            Item::Fn(f) => {
+                let params = f.params.iter().map(|p| p.ty.clone()).collect();
+                fns.entry(f.name.clone()).or_insert(FnSig {
+                    type_params: f.type_params.clone(),
+                    params,
+                    ret: f.ret.clone(),
+                });
+            }
+        }
+    }
+    let checker = Checker {
+        fns,
+        ctors,
+        types,
+        subst: RefCell::new(HashMap::new()),
+        counter: RefCell::new(0),
+        lam_vars: RefCell::new(Vec::new()),
+    };
+    // Resolve each lambda placeholder by re-checking each body (a fresh context
+    // per function, exactly like `check`'s Pass 3).
+    let mut resolved: HashMap<String, Ty> = HashMap::new();
+    for item in &program.items {
+        if let Item::Fn(f) = item {
+            checker.subst.borrow_mut().clear();
+            checker.lam_vars.borrow_mut().clear();
+            let mut scope: Scope = vec![HashMap::new()];
+            for p in &f.params {
+                scope[0].insert(p.name.clone(), p.ty.clone());
+            }
+            if checker.synth(&f.body, &mut scope).is_ok() {
+                for (name, var) in checker.lam_vars.borrow().iter() {
+                    let r = checker.resolve(var);
+                    // Only useful if it does not stay an unbound inference var.
+                    if !matches!(&r, Ty::Var(v) if v.starts_with('?')) {
+                        resolved.insert(name.clone(), r);
+                    }
+                }
+            }
+        }
+    }
+    if resolved.is_empty() {
+        return;
+    }
+    for item in &mut program.items {
+        if let Item::Fn(f) = item {
+            annotate_expr(&mut f.body, &resolved);
+        }
+    }
+}
+
+/// Replace any unannotated lambda parameter annotation (`Ty::Var("$lamN")`) with
+/// its resolved type, recursing through the whole expression tree.
+fn annotate_expr(e: &mut Expr, resolved: &HashMap<String, Ty>) {
+    match e {
+        Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Unit | Expr::Var(_) => {}
+        Expr::Ctor(_, args) | Expr::Call(_, args) => {
+            for a in args {
+                annotate_expr(a, resolved);
+            }
+        }
+        Expr::Lambda(params, body, _) => {
+            for (_, ty) in params.iter_mut() {
+                if let Ty::Var(v) = ty {
+                    if v.starts_with("$lam") {
+                        if let Some(r) = resolved.get(v) {
+                            *ty = r.clone();
+                        }
+                    }
+                }
+            }
+            annotate_expr(body, resolved);
+        }
+        Expr::Apply(callee, args, _) => {
+            annotate_expr(callee, resolved);
+            for a in args {
+                annotate_expr(a, resolved);
+            }
+        }
+        Expr::Unary(_, inner) => annotate_expr(inner, resolved),
+        Expr::Binary(_, l, r) => {
+            annotate_expr(l, resolved);
+            annotate_expr(r, resolved);
+        }
+        Expr::If(c, t, e2) => {
+            annotate_expr(c, resolved);
+            annotate_expr(t, resolved);
+            annotate_expr(e2, resolved);
+        }
+        Expr::Match(scrut, arms) => {
+            annotate_expr(scrut, resolved);
+            for arm in arms {
+                annotate_expr(&mut arm.body, resolved);
+            }
+        }
+        Expr::Block(stmts, last) => {
+            for s in stmts {
+                match s {
+                    Stmt::Let(_, _, v) => annotate_expr(v, resolved),
+                    Stmt::Expr(ex) => annotate_expr(ex, resolved),
+                }
+            }
+            annotate_expr(last, resolved);
+        }
     }
 }
 
@@ -666,7 +806,14 @@ impl Checker {
                 let mut param_tys: Vec<Ty> = Vec::new();
                 for (n, t) in params {
                     let pt = match t {
-                        Ty::Var(v) if v.starts_with("$lam") => self.fresh(),
+                        Ty::Var(v) if v.starts_with("$lam") => {
+                            // Unannotated parameter: solve its type from context,
+                            // recording the placeholder -> fresh-var link so it can
+                            // be back-annotated into the AST after checking.
+                            let fresh = self.fresh();
+                            self.lam_vars.borrow_mut().push((v.clone(), fresh.clone()));
+                            fresh
+                        }
                         other => other.clone(),
                     };
                     frame.insert(n.clone(), pt.clone());

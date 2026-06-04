@@ -1859,6 +1859,21 @@ mod tests {
     }
 
     #[test]
+    fn closure_unannotated_let_bound() {
+        // An unannotated lambda bound to a bare `let` (its parameter type fixed
+        // only by a later use) — typeck back-annotates the inferred type so the
+        // backend can compile it.
+        differential(
+            "fn compose(f: (Int)->Int, g: (Int)->Int) -> (Int)->Int = \\x -> f(g(x))\n\
+             fn main() -> Int = {\n\
+               let inc = \\x -> x + 1;\n\
+               let dbl = \\x -> x * 2;\n\
+               compose(inc, dbl)(10)\n\
+             }",
+        );
+    }
+
+    #[test]
     fn closure_applied_twice_and_composed() {
         // A closure stored, then applied twice (rc dup), and a closure that
         // captures two other closures (Ref captures released on the cell's drop).
