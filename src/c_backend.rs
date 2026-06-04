@@ -1874,6 +1874,27 @@ mod tests {
     }
 
     #[test]
+    fn closure_thunk_escape_and_reuse() {
+        // A zero-parameter thunk capturing a value, applied twice.
+        differential(
+            "fn force(t: () -> Int) -> Int = t()\n\
+             fn main() -> Int = { let k = 77; let t = \\() -> k + 1; force(t) + force(t) }",
+        );
+        // Closures escaping from both branches of an `if`, then applied.
+        differential(
+            "fn choose(c: Bool, n: Int) -> (Int) -> Int = if c { \\x -> x + n } else { \\x -> x - n }\n\
+             fn main() -> Int = choose(true, 10)(100) + choose(false, 3)(100)",
+        );
+        // FBIP in-place reuse of a cell that carries a closure field.
+        differential(
+            "type Box = | B(Int, (Int) -> Int)\n\
+             fn bump(bx: Box) -> Box = match bx { B(n, f) => B(n + 1, f), }\n\
+             fn run(bx: Box) -> Int = match bx { B(n, f) => f(n), }\n\
+             fn main() -> Int = run(bump(bump(B(10, \\x -> x * 2))))",
+        );
+    }
+
+    #[test]
     fn local_binding_shadows_global_function() {
         // A lambda parameter, a `let`, and a match binder may each shadow a
         // top-level function of the same name — the backend must resolve the
