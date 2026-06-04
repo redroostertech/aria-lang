@@ -55,14 +55,9 @@ use std::collections::HashMap;
 use crate::ast::{BinOp, Item, Program, Ty, UnOp};
 use crate::ir::{self, Atom, Bind, IExpr, IFn};
 
-/// Error message when a program uses closures (lambdas / higher-order calls),
-/// which the wasm backend does not yet compile. The native backend does.
-const WASM_CLOSURE_UNSUPPORTED: &str =
-    "wasm backend: closures (lambdas / higher-order calls) are not supported yet — use the native backend";
-
 /// A wasm-level value type. On the operand stack we keep `Int` as i64, `Bool`
 /// as i32, and a heap reference (`Ref`) as i32 (a wasm32 linear-memory address).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum WType {
     I64, // Aria Int
     I32, // Aria Bool
@@ -104,6 +99,9 @@ impl WType {
             // A named ADT becomes a heap reference. (Generics — args present —
             // are out of the 2b subset and rejected below.)
             Ty::Named(_, args) if args.is_empty() => Ok(WType::Ref),
+            // A closure value is a heap reference (cell: tag = lambda id,
+            // fields = captures).
+            Ty::Fn(_, _) => Ok(WType::Ref),
             other => Err(format!(
                 "wasm backend: unsupported type `{:?}` (subset: Int/Bool/String and non-generic ADTs)",
                 other
@@ -659,6 +657,35 @@ struct LocalEnv<'a> {
     /// the value is never produced, but the block still needs a blocktype, and
     /// the function return type is the consistent choice.
     fn_ret: WType,
+    /// Closure (lifted-lambda) dispatch metadata: the closure-tag base, each
+    /// lambda's closure tag, and the `call_indirect` type index for every
+    /// closure machine-signature.
+    closures: &'a ClosureWasm,
+}
+
+/// Lifted-lambda dispatch metadata for the wasm backend.
+struct ClosureWasm {
+    /// First closure tag (one past the last constructor tag) so closure tags
+    /// never collide with ADT constructor tags. A closure cell stores
+    /// `base + table_index` in its tag word; `call_indirect` recovers the table
+    /// index as `tag - base`.
+    base: i64,
+    /// Lambda name -> its closure tag (`base + table_index`).
+    tags: HashMap<String, i64>,
+    /// Closure machine-signature `(i32 closure :: params, ret)` -> the wasm type
+    /// index used by `call_indirect`. Since a defined function's type index
+    /// equals its function index, this is the first lifted lambda with that
+    /// signature.
+    sig_typeidx: HashMap<(Vec<WType>, WType), u32>,
+}
+
+/// Per-closure-tag information `__drop` needs to release a dead closure cell:
+/// its tag, capture count (for `__free`), and the indices + kinds of its
+/// reference-counted captures (`Ref` -> `__drop`, `Str` -> `__drop_str`).
+struct ClosureDropInfo {
+    tag: i64,
+    ncaps: usize,
+    managed: Vec<(usize, WType)>,
 }
 
 /// Tail-loop context for a self-tail-recursive wasm function.
@@ -743,10 +770,13 @@ fn atom_type(a: &Atom, env: &LocalEnv) -> Result<WType, String> {
 fn bind_type(bind: &Bind, env: &LocalEnv) -> Result<WType, String> {
     match bind {
         Bind::Atom(a) => atom_type(a, env),
-        // Closures are not yet supported by the wasm backend (the native backend
-        // compiles them). A closure value would be a heap reference.
+        // A closure value is a heap reference; applying one yields the lambda's
+        // return type, attached by monomorphization.
         Bind::MakeClosure(_, _) => Ok(WType::Ref),
-        Bind::ApplyClosure(_, _, _) => Err(WASM_CLOSURE_UNSUPPORTED.into()),
+        Bind::ApplyClosure(_, _, ret) => match ret {
+            Some(t) => WType::from_ty(t),
+            None => Err("wasm backend: closure application missing its result type".into()),
+        },
         Bind::Prim(op, l, _) => Ok(match op {
             // Arithmetic keeps the operand type: Int -> i64, Float -> f64.
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => atom_type(l, env)?,
@@ -859,6 +889,7 @@ fn match_type(scrut: &Atom, arms: &[ir::IArm], env: &LocalEnv) -> Result<WType, 
             block_depth: env.block_depth,
             tail: env.tail.clone(),
             fn_ret: env.fn_ret,
+            closures: env.closures,
         };
         // A diverging arm (dead Unit marker, or one ending in a `TailCall` loop
         // back-edge) yields no value and imposes no type constraint; skip it.
@@ -955,6 +986,7 @@ fn iexpr_type(e: &IExpr, env: &LocalEnv) -> Result<WType, String> {
             block_depth: env.block_depth,
             tail: env.tail.clone(),
             fn_ret: env.fn_ret,
+            closures: env.closures,
             };
             iexpr_type(body, &probe)
         }
@@ -983,6 +1015,7 @@ fn iexpr_type(e: &IExpr, env: &LocalEnv) -> Result<WType, String> {
             block_depth: env.block_depth,
             tail: env.tail.clone(),
             fn_ret: env.fn_ret,
+            closures: env.closures,
             };
             iexpr_type(body, &probe)
         }
@@ -1044,8 +1077,9 @@ fn emit_atom(a: &Atom, env: &LocalEnv, code: &mut Vec<u8>) -> Result<WType, Stri
 fn emit_bind(bind: &Bind, env: &mut LocalEnv, code: &mut Vec<u8>) -> Result<WType, String> {
     match bind {
         Bind::Atom(a) => emit_atom(a, env, code),
-        Bind::MakeClosure(_, _) | Bind::ApplyClosure(_, _, _) => {
-            Err(WASM_CLOSURE_UNSUPPORTED.into())
+        Bind::MakeClosure(lam, caps) => emit_make_closure(lam, caps, env, code),
+        Bind::ApplyClosure(callee, args, ret) => {
+            emit_apply_closure(callee, args, ret.as_ref(), env, code)
         }
         Bind::Prim(op, l, r) => {
             // String `==`/`!=`: structural (len + byte) compare via `__streq`.
@@ -1601,6 +1635,120 @@ fn emit_ctor(
     code.push(0x20); // local.get scratch
     leb_u(scratch as u64, code);
     Ok(WType::Ref)
+}
+
+/// Emit a `Bind::MakeClosure(lam, caps)`: allocate a closure cell — a heap cell
+/// whose tag word is the lifted lambda's closure tag and whose fields are the
+/// captured values — and yield the pointer (an i32 Ref). Mirrors `emit_ctor`,
+/// except the tag identifies a lambda (for `call_indirect`) rather than an ADT
+/// constructor, and the field types come from the captured atoms themselves.
+fn emit_make_closure(
+    lam: &str,
+    caps: &[Atom],
+    env: &mut LocalEnv,
+    code: &mut Vec<u8>,
+) -> Result<WType, String> {
+    let tag = *env
+        .closures
+        .tags
+        .get(lam)
+        .ok_or_else(|| format!("wasm backend: unknown lambda `{}`", lam))?;
+    let scratch = env.scratch();
+    let alloc = env.heap_index(HeapHelper::Alloc);
+    // ptr = __alloc(ncaps)  (sets rc=1, live++)
+    code.push(0x41); // i32.const ncaps
+    leb_s(caps.len() as i64, code);
+    code.push(0x10); // call __alloc
+    leb_u(alloc as u64, code);
+    code.push(0x21); // local.set scratch (ptr)
+    leb_u(scratch as u64, code);
+    // store tag at [ptr+8]
+    code.push(0x20); // local.get scratch
+    leb_u(scratch as u64, code);
+    code.push(0x42); // i64.const tag
+    leb_s(tag, code);
+    i64_store(8, code);
+    // store each capture at [ptr + 16 + 8*i]
+    for (i, a) in caps.iter().enumerate() {
+        code.push(0x20); // local.get scratch (address)
+        leb_u(scratch as u64, code);
+        let t = emit_atom(a, env, code)?;
+        let off = CELL_HEADER + SLOT * i as u64;
+        match t {
+            WType::F64 => f64_store(off, code),
+            WType::I64 => i64_store(off, code),
+            WType::I32 | WType::Ref | WType::Str | WType::Tensor => {
+                code.push(0xAD); // i64.extend_i32_u
+                i64_store(off, code);
+            }
+            WType::F32 => unreachable!("F32 is not an Aria capture type"),
+        }
+    }
+    // result = ptr
+    code.push(0x20); // local.get scratch
+    leb_u(scratch as u64, code);
+    Ok(WType::Ref)
+}
+
+/// Emit a `Bind::ApplyClosure(callee, args, ret)`: dispatch a closure value
+/// through the function table with `call_indirect`. The lifted lambda's wasm
+/// signature is `(i32 closure, args...) -> ret`; we push the closure pointer,
+/// the arguments, and finally the table index recovered from the closure cell's
+/// tag (`tag - closure_base`), then `call_indirect`. This application owns one
+/// reference to the closure (the rc pass dup'd it for any further use), so we
+/// `__drop` it afterwards — the lambda body borrowed the captures (dup'ing each),
+/// so freeing the cell here only releases this application's hold.
+fn emit_apply_closure(
+    callee: &Atom,
+    args: &[Atom],
+    ret: Option<&Ty>,
+    env: &mut LocalEnv,
+    code: &mut Vec<u8>,
+) -> Result<WType, String> {
+    let ret_ty = ret.ok_or("wasm backend: closure application missing its result type")?;
+    let ret_wty = WType::from_ty(ret_ty)?;
+    // Evaluate the closure pointer once into a fresh local (used as arg 0, for the
+    // table index, and for the trailing drop).
+    let clo = env.fresh_i32();
+    let ct = emit_atom(callee, env, code)?;
+    if ct != WType::Ref {
+        return Err("wasm backend: applying a non-closure value".into());
+    }
+    code.push(0x21); // local.set clo
+    leb_u(clo as u64, code);
+    // arg 0 = closure pointer
+    code.push(0x20); // local.get clo
+    leb_u(clo as u64, code);
+    // remaining args, recording their wasm types for the call_indirect signature
+    let mut sig_params = vec![WType::I32]; // closure ptr
+    for a in args {
+        let t = emit_atom(a, env, code)?;
+        sig_params.push(t);
+    }
+    // table index = (tag - closure_base) as i32
+    code.push(0x20); // local.get clo
+    leb_u(clo as u64, code);
+    i64_load(8, code); // tag
+    code.push(0x42); // i64.const base
+    leb_s(env.closures.base, code);
+    code.push(0x7D); // i64.sub
+    code.push(0xA7); // i32.wrap_i64
+    // call_indirect typeidx tableidx
+    let key = (sig_params, ret_wty);
+    let typeidx = *env.closures.sig_typeidx.get(&key).ok_or_else(|| {
+        "wasm backend: no function-table type for this closure signature (internal)".to_string()
+    })?;
+    code.push(0x11); // call_indirect
+    leb_u(typeidx as u64, code);
+    code.push(0x00); // table index 0
+    // drop our reference to the closure cell.
+    let drop_idx = env.heap_index(HeapHelper::Drop);
+    code.push(0x20); // local.get clo
+    leb_u(clo as u64, code);
+    code.push(0x10); // call __drop
+    leb_u(drop_idx as u64, code);
+    code.push(0x1A); // drop dummy result
+    Ok(ret_wty)
 }
 
 /// Emit a `Bind::CtorReuse(tok, name, fields)`: if the reuse token `tok` (an i32
@@ -2250,6 +2398,7 @@ fn emit_heap_helper(
     heap_base: u32,
     exp_idx: u32,
     embed_scratch: u64,
+    closure_drops: &[ClosureDropInfo],
 ) -> Vec<u8> {
     const LOCAL_GET: u8 = 0x20;
     const LOCAL_SET: u8 = 0x21;
@@ -2487,6 +2636,41 @@ fn emit_heap_helper(
                 leb_u(free_idx as u64, &mut body);
                 body.push(DROP); // dummy result
                 body.push(END); // end if tag==T
+            }
+            // Closure cells: per closure tag, release the reference-counted
+            // captures (`Ref` -> __drop, `Str` -> __drop_str), then free the cell
+            // (arity = capture count). Same shape as the constructor branches.
+            for cd in closure_drops {
+                body.push(LOCAL_GET);
+                leb_u(0, &mut body); // ptr
+                i64_load(8, &mut body); // tag
+                body.push(I64_CONST);
+                leb_s(cd.tag, &mut body);
+                body.push(I64_EQ);
+                body.push(IF);
+                body.push(BT_VOID);
+                for (i, t) in &cd.managed {
+                    body.push(LOCAL_GET);
+                    leb_u(0, &mut body); // ptr
+                    i64_load(CELL_HEADER + SLOT * *i as u64, &mut body);
+                    body.push(I32_WRAP_I64); // capture address
+                    body.push(CALL);
+                    let idx = match t {
+                        WType::Str => drop_str_idx,
+                        _ => drop_idx,
+                    };
+                    leb_u(idx as u64, &mut body);
+                    body.push(DROP); // dummy result
+                }
+                // free(ptr, ncaps)
+                body.push(LOCAL_GET);
+                leb_u(0, &mut body); // ptr
+                body.push(I32_CONST);
+                leb_s(cd.ncaps as i64, &mut body);
+                body.push(CALL);
+                leb_u(free_idx as u64, &mut body);
+                body.push(DROP); // dummy result
+                body.push(END); // end if tag==closure_tag
             }
             body.push(END); // end if rc==0
             body.push(I32_CONST);
@@ -5208,14 +5392,78 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
     // ownership of the new args transfers to the params as a real call's binding.
     let fns: HashMap<String, IFn> = ir::tail_call_optimize(rcd);
 
-    // Helper function indices come after the imports and every user function:
-    //   [imports...] [user fns...] [overflow helpers x4] [heap helpers...]
-    let ovf_base = N_IMPORTS + order.len() as u32;
+    // 2c. Closure (lifted-lambda) table. Every lowered function carrying a
+    //     `lam_sig` is a lifted lambda, emitted as a wasm function with the
+    //     closure calling convention `(i32 closure, params...) -> ret` and
+    //     dispatched via `call_indirect`. Lambda wasm functions are placed right
+    //     after the user functions (so their indices stay deterministic) and
+    //     before the runtime helpers. A defined function's wasm type index equals
+    //     its function index, so each lambda's signature doubles as the
+    //     `call_indirect` type for its machine-signature.
+    let mut lam_names: Vec<String> =
+        fns.iter().filter(|(_, f)| f.lam_sig.is_some()).map(|(n, _)| n.clone()).collect();
+    lam_names.sort();
+    let closure_base = ctors.by_name.len() as i64;
+    let mut closure_tags: HashMap<String, i64> = HashMap::new();
+    let mut sig_typeidx: HashMap<(Vec<WType>, WType), u32> = HashMap::new();
+    // Per-lambda wasm layout, in `lam_names` (table-index) order.
+    struct LamLayout {
+        name: String,
+        tag: i64,
+        param_wtys: Vec<WType>,
+        ret_wty: WType,
+        cap_wtys: Vec<WType>,
+        fn_index: u32,
+    }
+    let mut lam_layouts: Vec<LamLayout> = Vec::new();
+    for (j, name) in lam_names.iter().enumerate() {
+        let sig = fns[name]
+            .lam_sig
+            .as_ref()
+            .ok_or_else(|| format!("wasm backend: lambda `{}` missing its signature", name))?;
+        let param_wtys = sig
+            .param_tys
+            .iter()
+            .map(WType::from_ty)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("lambda `{}`: {}", name, e))?;
+        let ret_wty = WType::from_ty(&sig.ret_ty).map_err(|e| format!("lambda `{}`: {}", name, e))?;
+        let cap_wtys = sig
+            .capture_tys
+            .iter()
+            .map(WType::from_ty)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("lambda `{}`: {}", name, e))?;
+        let tag = closure_base + j as i64;
+        let fn_index = N_IMPORTS + order.len() as u32 + j as u32;
+        closure_tags.insert(name.clone(), tag);
+        // call_indirect signature: (i32 closure :: params) -> ret. Keep the FIRST
+        // lambda with each signature (its type index == its function index).
+        let mut key_params = vec![WType::I32];
+        key_params.extend(param_wtys.iter().copied());
+        sig_typeidx.entry((key_params, ret_wty)).or_insert(fn_index);
+        lam_layouts.push(LamLayout {
+            name: name.clone(),
+            tag,
+            param_wtys,
+            ret_wty,
+            cap_wtys,
+            fn_index,
+        });
+    }
+    let closures = ClosureWasm { base: closure_base, tags: closure_tags, sig_typeidx };
+    let n_lambdas = lam_layouts.len() as u32;
+
+    // Helper function indices come after the imports, the user functions, AND the
+    // lifted lambdas:
+    //   [imports] [user fns] [lambdas] [overflow helpers x4] [heap helpers...]
+    let ovf_base = N_IMPORTS + order.len() as u32 + n_lambdas;
     let heap_base = ovf_base + OvfHelper::ALL.len() as u32;
 
-    // Collect the program's distinct String literals (their raw UTF-8 bytes).
+    // Collect the program's distinct String literals (their raw UTF-8 bytes),
+    // including those inside lifted lambda bodies.
     let mut lit_list: Vec<Vec<u8>> = Vec::new();
-    for name in &order {
+    for name in order.iter().chain(lam_names.iter()) {
         if let Some(ifn) = fns.get(name) {
             collect_str_lits_iexpr(&ifn.body, &mut lit_list);
         }
@@ -5296,6 +5544,7 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
             block_depth: 0,
             tail: None,
             fn_ret: sig.ret,
+            closures: &closures,
         };
         // Self-tail-recursive functions are emitted with their body wrapped in a
         // `loop` (result type = the function's return type). A `TailCall`
@@ -5350,6 +5599,114 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
         type_section_funcs.push((sig.params.clone(), sig.ret));
     }
 
+    // 3a'. Append a code entry per lifted lambda, in `lam_layouts` order, with the
+    //      closure calling convention: param 0 is the closure cell pointer (i32),
+    //      params 1.. are the lambda's value parameters, and the captured values
+    //      are loaded from the cell into fresh locals (dup'ing the
+    //      reference-counted ones) in a prologue before the body runs.
+    for layout in &lam_layouts {
+        let ifn = fns
+            .get(&layout.name)
+            .ok_or_else(|| format!("wasm backend: lambda `{}` missing from IR", layout.name))?;
+        if ifn.params.len() != layout.param_wtys.len() || ifn.captures.len() != layout.cap_wtys.len() {
+            return Err(format!("wasm backend: lambda `{}` arity/signature mismatch", layout.name));
+        }
+        let mut types = HashMap::new();
+        let mut index = HashMap::new();
+        // Lambda value parameters occupy locals 1.. (local 0 is the closure ptr).
+        for (i, (pn, pty)) in ifn.params.iter().zip(layout.param_wtys.iter()).enumerate() {
+            types.insert(pn.clone(), *pty);
+            index.insert(pn.clone(), (i + 1) as u32);
+        }
+        for (fname, fidx) in &fn_index {
+            index.insert(fn_index_key(fname), *fidx);
+        }
+        let n_params = 1 + ifn.params.len() as u32;
+        let mut env = LocalEnv {
+            types,
+            index,
+            locals: Vec::new(),
+            n_params,
+            sigs: &sigs,
+            ovf_base,
+            heap_base,
+            ctors: &ctors,
+            scratch_ptr: None,
+            str_lits: &str_lits,
+            print_str_idx: PRINT_STR_IDX,
+            print_float_idx: PRINT_FLOAT_IDX,
+            print_int_idx: PRINT_INT_IDX,
+            print_bool_idx: PRINT_BOOL_IDX,
+            exp_idx: EXP_IDX,
+            block_depth: 0,
+            tail: None,
+            fn_ret: layout.ret_wty,
+            closures: &closures,
+        };
+        let mut body_code = Vec::new();
+        // Prologue: load each capture from the closure cell into a fresh local,
+        // dup'ing the reference-counted ones so the body owns them.
+        let dup_idx = env.heap_index(HeapHelper::Dup);
+        let dup_str_idx = env.heap_index(HeapHelper::DupStr);
+        for (i, (cn, ct)) in ifn.captures.iter().zip(layout.cap_wtys.iter()).enumerate() {
+            env.add_local(cn, *ct);
+            let slot = env.var_index(cn)?;
+            body_code.push(0x20); // local.get 0 (closure ptr)
+            leb_u(0, &mut body_code);
+            let off = CELL_HEADER + SLOT * i as u64;
+            match ct {
+                WType::F64 => f64_load(off, &mut body_code),
+                WType::I64 => i64_load(off, &mut body_code),
+                WType::I32 | WType::Ref | WType::Str | WType::Tensor => {
+                    i64_load(off, &mut body_code);
+                    body_code.push(0xA7); // i32.wrap_i64
+                }
+                WType::F32 => unreachable!("F32 is not an Aria capture type"),
+            }
+            body_code.push(0x21); // local.set slot
+            leb_u(slot as u64, &mut body_code);
+            match ct {
+                WType::Ref => {
+                    body_code.push(0x20);
+                    leb_u(slot as u64, &mut body_code);
+                    body_code.push(0x10);
+                    leb_u(dup_idx as u64, &mut body_code);
+                    body_code.push(0x1A); // drop dummy
+                }
+                WType::Str => {
+                    body_code.push(0x20);
+                    leb_u(slot as u64, &mut body_code);
+                    body_code.push(0x10);
+                    leb_u(dup_str_idx as u64, &mut body_code);
+                    body_code.push(0x1A); // drop dummy
+                }
+                _ => {}
+            }
+        }
+        let result_ty = emit_iexpr(&ifn.body, &mut env, &mut body_code)?;
+        if result_ty != layout.ret_wty {
+            return Err(format!(
+                "wasm backend: lambda `{}` body produces {:?} but its type is {:?}",
+                layout.name, result_ty, layout.ret_wty
+            ));
+        }
+        let mut entry = Vec::new();
+        leb_u(env.locals.len() as u64, &mut entry);
+        for lty in &env.locals {
+            leb_u(1, &mut entry);
+            entry.push(lty.byte());
+        }
+        entry.extend_from_slice(&body_code);
+        entry.push(0x0B); // end
+        let mut sized = Vec::new();
+        vec_bytes(&entry, &mut sized);
+        code_entries.push(sized);
+        // Type: (i32 closure, params...) -> ret.
+        let mut params = vec![WType::I32];
+        params.extend(layout.param_wtys.iter().copied());
+        type_section_funcs.push((params, layout.ret_wty));
+    }
+
     // 3b. Append the checked-arithmetic helper functions, in `OvfHelper::ALL`
     //     order, so their indices line up with `ovf_base + offset`.
     for h in OvfHelper::ALL {
@@ -5360,11 +5717,28 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
         code_entries.push(sized);
     }
 
+    // Closure-cell drop information: `__drop` must release a dead closure cell's
+    // reference-counted captures, then free it, per closure tag.
+    let closure_drops: Vec<ClosureDropInfo> = lam_layouts
+        .iter()
+        .map(|l| ClosureDropInfo {
+            tag: l.tag,
+            ncaps: l.cap_wtys.len(),
+            managed: l
+                .cap_wtys
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| matches!(t, WType::Ref | WType::Str))
+                .map(|(i, t)| (i, *t))
+                .collect(),
+        })
+        .collect();
+
     // 3c. Append the heap-runtime helpers (alloc/free/dup/drop/live), in
     //     `HeapHelper::ALL` order, so indices line up with `heap_base + offset`.
     for h in HeapHelper::ALL {
         type_section_funcs.push(h.sig());
-        let entry = emit_heap_helper(h, &ctors, heap_base, EXP_IDX, embed_scratch);
+        let entry = emit_heap_helper(h, &ctors, heap_base, EXP_IDX, embed_scratch, &closure_drops);
         let mut sized = Vec::new();
         vec_bytes(&entry, &mut sized);
         code_entries.push(sized);
@@ -5486,6 +5860,18 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
         section(3, &content, &mut out);
     }
 
+    // Table section (id 4): one funcref table sized to hold every lifted lambda,
+    // used by `call_indirect` for closure dispatch. Omitted when there are no
+    // lambdas (no closures in the program).
+    if n_lambdas > 0 {
+        let mut content = Vec::new();
+        leb_u(1, &mut content); // one table
+        content.push(0x70); // element type = funcref
+        content.push(0x00); // limits: flags=0 (min only)
+        leb_u(n_lambdas as u64, &mut content); // min size
+        section(4, &content, &mut out);
+    }
+
     // Memory section (id 5): one memory, min `MEM_PAGES` pages, no max.
     {
         let mut content = Vec::new();
@@ -5527,6 +5913,23 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
         content.push(0x02); // export kind = memory
         leb_u(0, &mut content);
         section(7, &content, &mut out);
+    }
+
+    // Element section (id 9): initialize the funcref table — `table[j]` is the
+    // wasm function index of the j-th lifted lambda (a closure cell of tag
+    // `closure_base + j` dispatches to it). One active segment at table offset 0.
+    if n_lambdas > 0 {
+        let mut content = Vec::new();
+        leb_u(1, &mut content); // one element segment
+        content.push(0x00); // flags=0: active, table 0, i32.const offset
+        content.push(0x41); // i32.const 0
+        leb_s(0, &mut content);
+        content.push(0x0B); // end of offset expr
+        leb_u(n_lambdas as u64, &mut content); // function count
+        for layout in &lam_layouts {
+            leb_u(layout.fn_index as u64, &mut content);
+        }
+        section(9, &content, &mut out);
     }
 
     // Code section (id 10): vec of sized function bodies.
@@ -5651,6 +6054,84 @@ mod tests {
         }
         let wasm = run_wasm(&bytes).expect("running wasm");
         assert_eq!(interp, wasm, "wasm != interpreter for:\n{}", src);
+    }
+
+    /// Differential + garbage-free for closures: the compiled wasm result must
+    /// equal the interpreter AND leave `__live == 0` (every closure/ADT cell
+    /// freed). Handles both Int- and String-returning `main` (closure programs
+    /// that print).
+    fn differential_gc(src: &str) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let interp = interp_result(src).expect("interpreter should succeed on battery");
+        let bytes = compile_src(src).expect("compile should succeed on battery");
+        if !node_available() {
+            return;
+        }
+        let path = std::env::temp_dir().join(format!(
+            "aria_wasm_gc_{}_{}.wasm",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, &bytes).expect("write wasm");
+        let script = format!(
+            "const fs=require('fs');\
+             const dec=new TextDecoder();\
+             const imp={{env:{{print_str:(p,n)=>{{}},print_float:(x)=>{{}},print_int:(n)=>{{}},print_bool:(b)=>{{}},exp:Math.exp}}}};\
+             WebAssembly.instantiate(fs.readFileSync({:?}),imp).then(r=>{{\
+             const ex=r.instance.exports;const v=ex.main();\
+             let s;if(typeof v==='bigint'){{s=String(v);}}\
+             else{{const mem=new Uint8Array(ex.memory.buffer);\
+             const dv=new DataView(ex.memory.buffer);\
+             const len=Number(dv.getBigInt64(v+8,true));\
+             s=dec.decode(mem.subarray(v+16,v+16+len));}}\
+             process.stdout.write(s+'\\x00'+String(ex.__live()));\
+             }}).catch(e=>process.stdout.write('TRAP\\x000'));",
+            path.to_string_lossy()
+        );
+        let out = Command::new("node").arg("-e").arg(&script).output().expect("node run");
+        let _ = std::fs::remove_file(&path);
+        let s = String::from_utf8_lossy(&out.stdout).to_string();
+        let (wasm, live) = s.split_once('\u{0}').expect("harness output");
+        assert_eq!(interp, wasm, "wasm != interpreter for:\n{}", src);
+        assert_eq!(live.parse::<i64>().unwrap_or(-1), 0, "wasm not garbage-free for:\n{}", src);
+    }
+
+    #[test]
+    fn wasm_closures_match_and_are_garbage_free() {
+        // Immediate application, currying via a returned closure, and a captured
+        // local — all dispatched through the function table garbage-free.
+        differential_gc("fn main() -> Int = (\\x -> x * 2)(21)");
+        differential_gc(
+            "fn add(x: Int) -> (Int) -> Int = \\y -> x + y\n\
+             fn main() -> Int = add(3)(4)",
+        );
+        // Generic higher-order map with a capturing lambda and a function by name,
+        // plus a Ref-captured heap list released when the closure cell dies.
+        differential_gc(
+            "type List = | Nil | Cons(Int, List)\n\
+             fn map(f: (Int) -> Int, xs: List) -> List = match xs { Nil => Nil, Cons(h, t) => Cons(f(h), map(f, t)), }\n\
+             fn sum(xs: List) -> Int = match xs { Nil => 0, Cons(h, t) => h + sum(t), }\n\
+             fn dbl(x: Int) -> Int = x * 2\n\
+             fn main() -> Int = {\n\
+               let n = 10;\n\
+               let xs = Cons(1, Cons(2, Cons(3, Nil)));\n\
+               sum(map(\\x -> x + n, xs)) + sum(map(dbl, xs))\n\
+             }",
+        );
+        // A closure stored then applied twice, and compose (a closure capturing
+        // two other closures).
+        differential_gc(
+            "fn twice(f: (Int) -> Int, x: Int) -> Int = f(f(x))\n\
+             fn main() -> Int = twice(\\n -> n + 5, 100)",
+        );
+        differential_gc(
+            "fn compose(f: (Int)->Int, g: (Int)->Int) -> (Int)->Int = \\x -> f(g(x))\n\
+             fn main() -> Int = {\n\
+               let h = compose(\\(a: Int) -> a + 1, \\(b: Int) -> b * 2);\n\
+               h(10) + h(20)\n\
+             }",
+        );
     }
 
     #[test]
