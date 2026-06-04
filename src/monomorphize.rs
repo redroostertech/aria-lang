@@ -472,6 +472,14 @@ impl<'a> Mono<'a> {
     /// collapse to their monomorphic names. Used for lookahead expectations.
     fn mangle_concrete(&mut self, ty: &Ty) -> Ty {
         match ty {
+            // `Array` is a builtin generic — never ADT-mangle it (keep
+            // `Array[elem]`); the element-kind call suffix carries the element
+            // type. Mangling it to `Array$Int` would hide the element from the
+            // array-builtin element inference (e.g. an empty `[]` in a tuple).
+            Ty::Named(n, args) if n == "Array" => {
+                let cargs: Vec<Ty> = args.iter().map(|a| self.mangle_concrete(a)).collect();
+                Ty::Named("Array".to_string(), cargs)
+            }
             Ty::Named(n, args) if !args.is_empty() => {
                 let cargs: Vec<Ty> = args.iter().map(|a| self.mangle_concrete(a)).collect();
                 Ty::Named(self.mangle_type_name(n, &cargs), Vec::new())
