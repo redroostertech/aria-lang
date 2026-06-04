@@ -19,7 +19,7 @@
 //!   * arity/field checks on calls and constructors.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::ast::*;
 
@@ -247,11 +247,136 @@ pub fn check(program: &Program) -> Result<(), Vec<String>> {
         }
     }
 
+    // Pass 4: effect inference and `pure` checking.
+    //
+    // Aria has a single effect, `IO`, produced only by the four `print_*`
+    // builtins. A function is IO iff it (transitively) calls a `print_*` builtin
+    // or another IO function. We compute the IO set by a fixpoint over the call
+    // graph (which naturally handles mutual recursion), then reject any function
+    // annotated `pure` whose inferred effect set contains IO. Effects are erased
+    // after this pass: it changes no runtime behavior and no backend codegen.
+    let io = infer_io(program);
+    for item in &program.items {
+        if let Item::Fn(f) = item {
+            if f.pure && io.contains(&f.name) {
+                // Report a concrete cause: a directly-called `print_*` builtin if
+                // there is one, otherwise the transitive nature of the violation.
+                let reason = match direct_io_builtin(&f.body) {
+                    Some(b) => format!("calls `{}`", b),
+                    None => "transitively calls IO code".to_string(),
+                };
+                errors.push(format!(
+                    "function `{}` is declared `pure` but performs IO ({})",
+                    f.name, reason
+                ));
+            }
+        }
+    }
+
     if errors.is_empty() {
         Ok(())
     } else {
         Err(errors)
     }
+}
+
+/// Names of the IO-producing builtins. Everything else is pure.
+const IO_BUILTINS: &[&str] = &["print_int", "print_float", "print_bool", "print_str"];
+
+/// Collect the names called (directly) inside an expression, into `out`. This is
+/// a pure syntactic walk over calls; it records both builtin and user-function
+/// callees by name.
+fn collect_calls(e: &Expr, out: &mut HashSet<String>) {
+    match e {
+        Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Unit
+        | Expr::Var(_) => {}
+        Expr::Ctor(_, args) => {
+            for a in args {
+                collect_calls(a, out);
+            }
+        }
+        Expr::Call(name, args) => {
+            out.insert(name.clone());
+            for a in args {
+                collect_calls(a, out);
+            }
+        }
+        Expr::Unary(_, x) => collect_calls(x, out),
+        Expr::Binary(_, a, b) => {
+            collect_calls(a, out);
+            collect_calls(b, out);
+        }
+        Expr::If(c, t, e2) => {
+            collect_calls(c, out);
+            collect_calls(t, out);
+            collect_calls(e2, out);
+        }
+        Expr::Match(scrut, arms) => {
+            collect_calls(scrut, out);
+            for a in arms {
+                collect_calls(&a.body, out);
+            }
+        }
+        Expr::Block(stmts, tail) => {
+            for s in stmts {
+                match s {
+                    Stmt::Let(_, _, x) => collect_calls(x, out),
+                    Stmt::Expr(x) => collect_calls(x, out),
+                }
+            }
+            collect_calls(tail, out);
+        }
+    }
+}
+
+/// If the expression directly calls an IO builtin, return its name (for a clearer
+/// error message). Only inspects direct calls, not transitive ones.
+fn direct_io_builtin(e: &Expr) -> Option<String> {
+    let mut calls = HashSet::new();
+    collect_calls(e, &mut calls);
+    IO_BUILTINS
+        .iter()
+        .find(|b| calls.contains(**b))
+        .map(|b| b.to_string())
+}
+
+/// Infer the set of user-function names that perform IO. A function is IO iff it
+/// (transitively) calls a `print_*` builtin or another IO function. Computed by a
+/// least-fixpoint over the call graph: start with every function pure, then keep
+/// marking functions IO whose body calls a `print_*` builtin or an already-IO
+/// function, until nothing changes. This converges (the IO set only grows and is
+/// bounded by the function count) and handles mutual recursion correctly.
+fn infer_io(program: &Program) -> HashSet<String> {
+    // Precompute each function's direct callee set.
+    let mut callees: HashMap<String, HashSet<String>> = HashMap::new();
+    for item in &program.items {
+        if let Item::Fn(f) = item {
+            let mut c = HashSet::new();
+            collect_calls(&f.body, &mut c);
+            callees.insert(f.name.clone(), c);
+        }
+    }
+
+    let mut io: HashSet<String> = HashSet::new();
+    loop {
+        let mut changed = false;
+        for (name, c) in &callees {
+            if io.contains(name) {
+                continue;
+            }
+            let performs_io = c.iter().any(|callee| {
+                IO_BUILTINS.contains(&callee.as_str()) || io.contains(callee)
+            });
+            if performs_io {
+                io.insert(name.clone());
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    io
 }
 
 // Built-in nullary types that need no user declaration but must pass the
@@ -840,6 +965,108 @@ mod tests {
             fn wrap[T](x: T) -> Option[T] = Some(x)
             fn main() -> Int = { let o = wrap(7); 0 }
         "#;
+        assert!(check_src(src).is_ok());
+    }
+
+    // ---- effect system (purity) -----------------------------------------
+
+    #[test]
+    fn pure_with_direct_io_is_error() {
+        let src = "pure fn f(x: Int) -> Int = { print_int(x); x }";
+        let errs = check_src(src).unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains("pure") && e.contains("print_int")),
+            "got: {:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn genuinely_pure_function_ok() {
+        let src = "pure fn g(x: Int) -> Int = x + 1";
+        assert!(check_src(src).is_ok());
+    }
+
+    #[test]
+    fn pure_calling_pure_function_ok() {
+        let src = r#"
+            pure fn g(x: Int) -> Int = x + 1
+            pure fn h(x: Int) -> Int = g(x)
+        "#;
+        assert!(check_src(src).is_ok());
+    }
+
+    #[test]
+    fn pure_recursive_calling_pure_ok() {
+        // Recursive `pure` function that also calls another `pure` function.
+        let src = r#"
+            pure fn add(a: Int, b: Int) -> Int = a + b
+            pure fn sum_to(n: Int) -> Int =
+              match n { 0 => 0, _ => add(n, sum_to(n - 1)), }
+        "#;
+        assert!(check_src(src).is_ok(), "got: {:?}", check_src(src));
+    }
+
+    #[test]
+    fn pure_with_transitive_io_is_error() {
+        let src = r#"
+            fn f2(x: Int) -> Int = { print_int(x); x }
+            pure fn bad(x: Int) -> Int = f2(x)
+        "#;
+        let errs = check_src(src).unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains("`bad`") && e.contains("pure")),
+            "got: {:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn pure_in_mutual_recursion_to_io_is_error() {
+        // ping/pong mutually recurse; pong performs IO, so both are IO.
+        let src = r#"
+            pure fn ping(n: Int) -> Int =
+              match n { 0 => 0, _ => pong(n - 1), }
+            fn pong(n: Int) -> Int =
+              match n { 0 => { print_int(0); 0 }, _ => ping(n - 1), }
+        "#;
+        let errs = check_src(src).unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains("`ping`") && e.contains("pure")),
+            "got: {:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn pure_mutual_recursion_cycle_without_io_ok() {
+        let src = r#"
+            pure fn even(n: Int) -> Bool =
+              match n { 0 => true, _ => odd(n - 1), }
+            pure fn odd(n: Int) -> Bool =
+              match n { 0 => false, _ => even(n - 1), }
+        "#;
+        assert!(check_src(src).is_ok(), "got: {:?}", check_src(src));
+    }
+
+    #[test]
+    fn io_inference_classifies_io_function() {
+        // An un-annotated function that prints is inferred IO (no error), and
+        // a `pure` caller of it is rejected, confirming the classification.
+        let src = r#"
+            fn logger(x: Int) -> Int = { print_int(x); x }
+            pure fn caller(x: Int) -> Int = logger(x)
+        "#;
+        let prog = parser::parse(lexer::lex(src).expect("lex")).expect("parse");
+        let io = infer_io(&prog);
+        assert!(io.contains("logger"));
+        assert!(io.contains("caller"));
+        assert!(check(&prog).is_err());
+    }
+
+    #[test]
+    fn main_may_be_io() {
+        let src = "fn main() -> Int = { print_int(5); 0 }";
         assert!(check_src(src).is_ok());
     }
 }

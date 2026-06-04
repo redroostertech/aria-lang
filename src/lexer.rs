@@ -12,6 +12,7 @@ pub enum Tok {
     Ident(String),
     // Keywords
     Fn,
+    Pure,
     Type,
     Let,
     Match,
@@ -217,6 +218,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             let word: String = chars[start..i].iter().collect();
             let tok = match word.as_str() {
                 "fn" => Tok::Fn,
+                "pure" => Tok::Pure,
                 "type" => Tok::Type,
                 "let" => Tok::Let,
                 "match" => Tok::Match,

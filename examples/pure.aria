@@ -1,0 +1,33 @@
+-- Aria effect-system (purity) example.
+--
+-- Aria tracks a single effect, `IO`, produced only by the `print_*` builtins.
+-- A function may be annotated `pure`; the compiler then PROVES it performs no
+-- IO (directly or transitively) or rejects the program. `main` may do IO.
+--
+-- This lets a model/compiler reason about which code can and can't have effects.
+
+-- A leaf pure function: arithmetic only.
+pure fn add(a: Int, b: Int) -> Int = a + b
+
+-- A recursive pure function that calls another pure function. The compiler
+-- infers its effect set is empty and accepts the `pure` annotation.
+pure fn sum_to(n: Int) -> Int =
+  match n {
+    0 => 0,
+    _ => add(n, sum_to(n - 1)),
+  }
+
+-- Mutually-recursive pure functions (a pure cycle) — also accepted.
+pure fn is_even(n: Int) -> Bool =
+  match n { 0 => true, _ => is_odd(n - 1), }
+
+pure fn is_odd(n: Int) -> Bool =
+  match n { 0 => false, _ => is_even(n - 1), }
+
+-- `main` is allowed to perform IO; effects are erased after checking, so the
+-- pure functions above are compiled and run exactly as any other function.
+fn main() -> Int = {
+  print_int(sum_to(5));
+  print_bool(is_even(10));
+  0
+}

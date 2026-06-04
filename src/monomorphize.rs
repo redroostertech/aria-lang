@@ -354,6 +354,7 @@ impl<'a> Mono<'a> {
 
         let decl = FnDecl {
             name: mangled.clone(),
+            pure: info.decl.pure,
             type_params: Vec::new(),
             params,
             ret,

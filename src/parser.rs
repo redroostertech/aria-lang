@@ -76,10 +76,10 @@ impl Parser {
 
     fn parse_item(&mut self) -> Result<Item, String> {
         match self.peek() {
-            Tok::Fn => Ok(Item::Fn(self.parse_fn()?)),
+            Tok::Fn | Tok::Pure => Ok(Item::Fn(self.parse_fn()?)),
             Tok::Type => Ok(Item::Type(self.parse_type_decl()?)),
             other => Err(format!(
-                "line {}: expected `fn` or `type`, found {:?}",
+                "line {}: expected `fn`, `pure`, or `type`, found {:?}",
                 self.line(),
                 other
             )),
@@ -87,6 +87,14 @@ impl Parser {
     }
 
     fn parse_fn(&mut self) -> Result<FnDecl, String> {
+        // Optional `pure` annotation before `fn`. Canonical form: `pure` may
+        // only appear immediately before `fn` and nowhere else.
+        let pure = if *self.peek() == Tok::Pure {
+            self.advance();
+            true
+        } else {
+            false
+        };
         self.expect(&Tok::Fn)?;
         let name = self.expect_ident()?;
         let type_params = self.parse_type_params()?;
@@ -115,6 +123,7 @@ impl Parser {
         self.type_params = Vec::new();
         Ok(FnDecl {
             name,
+            pure,
             type_params,
             params,
             ret,

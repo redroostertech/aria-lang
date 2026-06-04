@@ -93,6 +93,9 @@ pub struct Param {
 #[derive(Debug, Clone)]
 pub struct FnDecl {
     pub name: String,
+    /// `true` if the function carries a `pure` annotation. The effect checker
+    /// (`typeck`) verifies such a function performs no IO. Erased afterwards.
+    pub pure: bool,
     /// Declared generic type parameters, e.g. `[T, U]`.
     pub type_params: Vec<String>,
     pub params: Vec<Param>,
