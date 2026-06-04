@@ -24,6 +24,15 @@ pub enum Ty {
     Fn(Vec<Ty>, Box<Ty>),
 }
 
+/// Concrete closure type information attached to an `Expr::Lambda` by the
+/// monomorphizer: the captured free variables (in the order they are stored in
+/// the closure cell) with their concrete types, and the lambda's return type.
+#[derive(Debug, Clone)]
+pub struct ClosureSig {
+    pub captures: Vec<(String, Ty)>,
+    pub ret: Ty,
+}
+
 #[derive(Debug, Clone)]
 pub enum Expr {
     Int(i64),
@@ -37,12 +46,17 @@ pub enum Expr {
     /// Function or builtin call, e.g. `factorial(5)`.
     Call(String, Vec<Expr>),
     /// A lambda with typed parameters and a body, e.g. `\(x: Int) -> x + 1`.
-    /// Evaluates to a closure capturing the defining environment.
-    Lambda(Vec<(String, Ty)>, Box<Expr>),
+    /// Evaluates to a closure capturing the defining environment. The third field
+    /// is concrete closure type information (captured variables with their types,
+    /// and the return type); it is `None` as produced by the parser and filled in
+    /// by `monomorphize` so the compiled backends can lay out the closure cell and
+    /// type the lifted lambda. The interpreter ignores it.
+    Lambda(Vec<(String, Ty)>, Box<Expr>, Option<ClosureSig>),
     /// Application of an arbitrary expression (a lambda, a function-valued
     /// variable, or a call result) to arguments, e.g. `f(3)` where `f` is a
-    /// local function value, or `(\x -> x)(5)`.
-    Apply(Box<Expr>, Vec<Expr>),
+    /// local function value, or `(\x -> x)(5)`. The third field is the concrete
+    /// result type, filled in by `monomorphize` (`None` from the parser).
+    Apply(Box<Expr>, Vec<Expr>, Option<Ty>),
     Unary(UnOp, Box<Expr>),
     Binary(BinOp, Box<Expr>, Box<Expr>),
     If(Box<Expr>, Box<Expr>, Box<Expr>),

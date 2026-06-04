@@ -55,6 +55,11 @@ use std::collections::HashMap;
 use crate::ast::{BinOp, Item, Program, Ty, UnOp};
 use crate::ir::{self, Atom, Bind, IExpr, IFn};
 
+/// Error message when a program uses closures (lambdas / higher-order calls),
+/// which the wasm backend does not yet compile. The native backend does.
+const WASM_CLOSURE_UNSUPPORTED: &str =
+    "wasm backend: closures (lambdas / higher-order calls) are not supported yet — use the native backend";
+
 /// A wasm-level value type. On the operand stack we keep `Int` as i64, `Bool`
 /// as i32, and a heap reference (`Ref`) as i32 (a wasm32 linear-memory address).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -738,6 +743,10 @@ fn atom_type(a: &Atom, env: &LocalEnv) -> Result<WType, String> {
 fn bind_type(bind: &Bind, env: &LocalEnv) -> Result<WType, String> {
     match bind {
         Bind::Atom(a) => atom_type(a, env),
+        // Closures are not yet supported by the wasm backend (the native backend
+        // compiles them). A closure value would be a heap reference.
+        Bind::MakeClosure(_, _) => Ok(WType::Ref),
+        Bind::ApplyClosure(_, _, _) => Err(WASM_CLOSURE_UNSUPPORTED.into()),
         Bind::Prim(op, l, _) => Ok(match op {
             // Arithmetic keeps the operand type: Int -> i64, Float -> f64.
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => atom_type(l, env)?,
@@ -1035,6 +1044,9 @@ fn emit_atom(a: &Atom, env: &LocalEnv, code: &mut Vec<u8>) -> Result<WType, Stri
 fn emit_bind(bind: &Bind, env: &mut LocalEnv, code: &mut Vec<u8>) -> Result<WType, String> {
     match bind {
         Bind::Atom(a) => emit_atom(a, env, code),
+        Bind::MakeClosure(_, _) | Bind::ApplyClosure(_, _, _) => {
+            Err(WASM_CLOSURE_UNSUPPORTED.into())
+        }
         Bind::Prim(op, l, r) => {
             // String `==`/`!=`: structural (len + byte) compare via `__streq`.
             // Operand ownership mirrors the rc pass: a Prim does NOT consume its
@@ -5069,6 +5081,17 @@ fn collect_str_lits_iexpr(e: &IExpr, out: &mut Vec<Vec<u8>>) {
 fn collect_str_lits_bind(b: &Bind, out: &mut Vec<Vec<u8>>) {
     match b {
         Bind::Atom(a) | Bind::Unary(_, a) => collect_str_lits_atom(a, out),
+        Bind::MakeClosure(_, atoms) => {
+            for a in atoms {
+                collect_str_lits_atom(a, out);
+            }
+        }
+        Bind::ApplyClosure(callee, atoms, _) => {
+            collect_str_lits_atom(callee, out);
+            for a in atoms {
+                collect_str_lits_atom(a, out);
+            }
+        }
         Bind::Prim(_, l, r) => {
             collect_str_lits_atom(l, out);
             collect_str_lits_atom(r, out);

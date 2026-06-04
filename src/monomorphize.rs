@@ -137,15 +137,42 @@ impl<'a> Mono<'a> {
             return Ok(self.program.clone());
         }
 
-        // Fast path: a program with no generics at all passes through verbatim
-        // (preserves declaration order and avoids dropping unreferenced items,
-        // matching prior behaviour for the existing concrete test corpus).
+        // Fast path: a program with no generics needs no specialization, but its
+        // function bodies are still rewritten in place so lambdas get their
+        // concrete `ClosureSig` and applied local function values become typed
+        // `Apply`s. With no generics, names/types pass through unchanged, so all
+        // items and their declaration order are preserved (and no unreferenced
+        // item is dropped).
         let has_generics = self.program.items.iter().any(|it| match it {
             Item::Fn(f) => !f.type_params.is_empty(),
             Item::Type(t) => !t.params.is_empty(),
         });
         if !has_generics {
-            return Ok(self.program.clone());
+            let empty: HashMap<String, Ty> = HashMap::new();
+            let mut items = Vec::new();
+            for it in &self.program.items {
+                match it {
+                    Item::Type(t) => items.push(Item::Type(t.clone())),
+                    Item::Fn(f) => {
+                        let mut env: HashMap<String, Ty> = f
+                            .params
+                            .iter()
+                            .map(|p| (p.name.clone(), p.ty.clone()))
+                            .collect();
+                        let (body, _) =
+                            self.rewrite_expr(&f.body, &mut env, &empty, Some(&f.ret))?;
+                        items.push(Item::Fn(FnDecl {
+                            name: f.name.clone(),
+                            pure: f.pure,
+                            type_params: Vec::new(),
+                            params: f.params.clone(),
+                            ret: f.ret.clone(),
+                            body,
+                        }));
+                    }
+                }
+            }
+            return Ok(Program { items });
         }
 
         self.specialize_fn("main", &[])?;
@@ -240,6 +267,11 @@ impl<'a> Mono<'a> {
                 let mangled = self.mangle_type_name(n, &cargs);
                 self.enqueue_type(n, &cargs)?;
                 Ok(Ty::Named(mangled, Vec::new()))
+            }
+            Ty::Fn(ps, r) => {
+                let ps2 = ps.iter().map(|p| self.subst_ty(p, map)).collect::<Result<_, _>>()?;
+                let r2 = self.subst_ty(r, map)?;
+                Ok(Ty::Fn(ps2, Box::new(r2)))
             }
             other => Ok(other.clone()),
         }
@@ -389,6 +421,12 @@ impl<'a> Mono<'a> {
                     .collect::<Option<_>>()?;
                 Some(Ty::Named(self.mangle_type_name(n, &cargs), Vec::new()))
             }
+            Ty::Fn(ps, r) => {
+                let ps2: Vec<Ty> =
+                    ps.iter().map(|p| self.subst_ty_partial(p, sub)).collect::<Option<_>>()?;
+                let r2 = self.subst_ty_partial(r, sub)?;
+                Some(Ty::Fn(ps2, Box::new(r2)))
+            }
             other => Some(other.clone()),
         }
     }
@@ -401,6 +439,10 @@ impl<'a> Mono<'a> {
                 let cargs: Vec<Ty> = args.iter().map(|a| self.mangle_concrete(a)).collect();
                 Ty::Named(self.mangle_type_name(n, &cargs), Vec::new())
             }
+            Ty::Fn(ps, r) => Ty::Fn(
+                ps.iter().map(|a| self.mangle_concrete(a)).collect(),
+                Box::new(self.mangle_concrete(r)),
+            ),
             other => other.clone(),
         }
     }
@@ -475,9 +517,28 @@ impl<'a> Mono<'a> {
             }
             // If / Match / Block need full rewriting to type; skip for seeding.
             Expr::If(_, _, _) | Expr::Match(_, _) | Expr::Block(_, _) => None,
-            // Function values are outside the compiled subset; contribute nothing
-            // to seeding (they are rejected in the rewriting pass).
-            Expr::Lambda(_, _) | Expr::Apply(_, _) => None,
+            // A lambda: best-effort `Fn` type from annotated params + synthesized
+            // body. Unannotated params block synthesis (handled by full rewriting).
+            Expr::Lambda(params, body, _) => {
+                let mut ptys = Vec::new();
+                for (_, ann) in params {
+                    if contains_var(ann) {
+                        return None;
+                    }
+                    ptys.push(ann.clone());
+                }
+                let mut inner = env.clone();
+                for (n, ann) in params {
+                    inner.insert(n.clone(), ann.clone());
+                }
+                let bt = self.synth_ty(body, &inner)?;
+                Some(Ty::Fn(ptys, Box::new(bt)))
+            }
+            // An application: the callee's `Fn` return type, if synthesizable.
+            Expr::Apply(callee, _, _) => match self.synth_ty(callee, env)? {
+                Ty::Fn(_, ret) => Some(*ret),
+                _ => None,
+            },
         }
     }
 
@@ -505,11 +566,28 @@ impl<'a> Mono<'a> {
             Expr::Unit => Ok((Expr::Unit, Ty::Unit)),
 
             Expr::Var(name) => {
-                let ty = env
-                    .get(name)
-                    .cloned()
-                    .ok_or_else(|| format!("monomorphize: unbound variable `{}`", name))?;
-                Ok((Expr::Var(name.clone()), ty))
+                if let Some(ty) = env.get(name).cloned() {
+                    return Ok((Expr::Var(name.clone()), ty));
+                }
+                // A top-level function referenced as a value (e.g. passed by name
+                // to a higher-order function). Specialize it — non-generic only,
+                // since a generic function used as a bare value gives no way to
+                // pick its type arguments — and yield its function type. Lowering
+                // wraps it in a zero-capture closure.
+                if let Some(info) = self.fns.get(name).cloned() {
+                    if !info.decl.type_params.is_empty() {
+                        return Err(format!(
+                            "monomorphize: generic function `{}` used as a value is unsupported (apply it instead)",
+                            name
+                        ));
+                    }
+                    let target = self.specialize_fn(name, &[])?;
+                    let pts: Vec<Ty> =
+                        info.decl.params.iter().map(|p| self.mangle_concrete(&p.ty)).collect();
+                    let rt = self.mangle_concrete(&info.decl.ret);
+                    return Ok((Expr::Var(target), Ty::Fn(pts, Box::new(rt))));
+                }
+                Err(format!("monomorphize: unbound variable `{}`", name))
             }
 
             Expr::Ctor(name, args) => {
@@ -560,6 +638,29 @@ impl<'a> Mono<'a> {
             }
 
             Expr::Call(name, args) => {
+                // A local `Fn`-typed binding applied by name (e.g. a function
+                // parameter `f` in `f(x)`) — the tree-walker resolves the scope
+                // before the global function table, so do the same here. Keep it
+                // an `Expr::Call`; lowering turns a non-global, non-builtin callee
+                // into a closure application.
+                if let Some(Ty::Fn(param_tys, ret)) = env.get(name).cloned() {
+                    let mut rargs = Vec::new();
+                    for (i, a) in args.iter().enumerate() {
+                        let (ra, _at) = self.rewrite_expr(a, env, tymap, param_tys.get(i))?;
+                        rargs.push(ra);
+                    }
+                    // Emit a typed application so the backends know the result
+                    // type; lowering turns an applied local variable into a
+                    // closure call.
+                    return Ok((
+                        Expr::Apply(
+                            Box::new(Expr::Var(name.clone())),
+                            rargs,
+                            Some((*ret).clone()),
+                        ),
+                        (*ret).clone(),
+                    ));
+                }
                 // Builtin?  (Identified by NOT being a user function.) Builtins
                 // are non-generic, so just rewrite args with no expectations.
                 if !self.fns.contains_key(name) {
@@ -689,10 +790,99 @@ impl<'a> Mono<'a> {
                 Ok((Expr::Block(rstmts, Box::new(rlast)), lt))
             }
 
-            Expr::Lambda(_, _) | Expr::Apply(_, _) => Err(
-                "monomorphize: function values (lambdas / higher-order calls) are not supported by the compiled backends yet"
-                    .to_string(),
-            ),
+            Expr::Lambda(params, body, _) => {
+                // Concrete parameter types come from the expected `Fn` type when
+                // the lambda flows into a known position (a function argument or a
+                // direct application); otherwise fall back to the (substituted)
+                // annotation. The body is rewritten in the extended scope; the
+                // lambda's type is the resulting `Ty::Fn`.
+                let exp_params: Option<Vec<Ty>> = match expected {
+                    Some(Ty::Fn(ps, _)) => Some(ps.clone()),
+                    _ => None,
+                };
+                let exp_ret: Option<Ty> = match expected {
+                    Some(Ty::Fn(_, r)) => Some((**r).clone()),
+                    _ => None,
+                };
+                // Captures: free variables of the lambda that name an in-scope
+                // local (globals/builtins are not in `env`). Computed against the
+                // OUTER scope, with concrete types, in a stable (sorted) order.
+                let mut param_set = std::collections::HashSet::new();
+                for (n, _) in params {
+                    param_set.insert(n.clone());
+                }
+                let mut fvs = std::collections::HashSet::new();
+                crate::ir::ast_free(body, &param_set, &mut fvs);
+                let mut captures: Vec<(String, Ty)> = fvs
+                    .into_iter()
+                    .filter_map(|n| env.get(&n).map(|t| (n, t.clone())))
+                    .collect();
+                captures.sort_by(|a, b| a.0.cmp(&b.0));
+                // Rewrite the body with the parameters bound to concrete types.
+                let mut body_scope = env.clone();
+                let mut rparams: Vec<(String, Ty)> = Vec::new();
+                for (i, (pn, pann)) in params.iter().enumerate() {
+                    let pty = match exp_params.as_ref().and_then(|ps| ps.get(i)) {
+                        Some(t) => t.clone(),
+                        // No expectation from context: rely on the annotation. An
+                        // unannotated parameter (a parser `$lam` placeholder) whose
+                        // type only the surrounding context could fix — e.g. a bare
+                        // `let f = \x -> ..` later passed to a typed position — is
+                        // not yet supported by the compiled backends; ask for an
+                        // annotation rather than emitting a confusing internal error.
+                        None => match pann {
+                            Ty::Var(v) if v.starts_with("$lam") => {
+                                return Err(format!(
+                                    "monomorphize: cannot infer the type of unannotated lambda parameter `{}` in this context — annotate it, e.g. `\\({}: Int) -> ...`",
+                                    pn, pn
+                                ))
+                            }
+                            other => self.subst_ty(other, tymap)?,
+                        },
+                    };
+                    body_scope.insert(pn.clone(), pty.clone());
+                    rparams.push((pn.clone(), pty));
+                }
+                let (rbody, bt) =
+                    self.rewrite_expr(body, &mut body_scope, tymap, exp_ret.as_ref())?;
+                let lam_ty = Ty::Fn(
+                    rparams.iter().map(|(_, t)| t.clone()).collect(),
+                    Box::new(bt.clone()),
+                );
+                let sig = crate::ast::ClosureSig { captures, ret: bt };
+                Ok((Expr::Lambda(rparams, Box::new(rbody), Some(sig)), lam_ty))
+            }
+
+            Expr::Apply(callee, args, _) => {
+                // Rewrite the arguments first so a directly-applied lambda
+                // (`(\x -> ..)(5)`) can take its parameter types from them.
+                let mut rargs = Vec::new();
+                let mut arg_tys = Vec::new();
+                for a in args {
+                    let (ra, at) = self.rewrite_expr(a, env, tymap, None)?;
+                    rargs.push(ra);
+                    arg_tys.push(at);
+                }
+                let callee_expect = Ty::Fn(
+                    arg_tys.clone(),
+                    Box::new(expected.cloned().unwrap_or(Ty::Unit)),
+                );
+                let (rcallee, ct) =
+                    self.rewrite_expr(callee, env, tymap, Some(&callee_expect))?;
+                let ret_ty = match &ct {
+                    Ty::Fn(_, r) => (**r).clone(),
+                    other => {
+                        return Err(format!(
+                            "monomorphize: applying a non-function value of type {:?}",
+                            other
+                        ))
+                    }
+                };
+                Ok((
+                    Expr::Apply(Box::new(rcallee), rargs, Some(ret_ty.clone())),
+                    ret_ty,
+                ))
+            }
         }
     }
 
@@ -813,6 +1003,13 @@ impl<'a> Mono<'a> {
                 }
                 Ok(())
             }
+            // Function types unify componentwise (closure-typed parameters).
+            (Ty::Fn(p1, r1), Ty::Fn(p2, r2)) if p1.len() == p2.len() => {
+                for (x, y) in p1.iter().zip(p2.iter()) {
+                    self.unify_decl(x, y, sub)?;
+                }
+                self.unify_decl(r1, r2, sub)
+            }
             // Declared generic `Named(g, [..])`, concrete mangled `Named(m, [])`.
             (Ty::Named(g, gargs), Ty::Named(m, margs))
                 if !gargs.is_empty() && margs.is_empty() =>
@@ -870,6 +1067,10 @@ fn resolve(ty: &Ty, sub: &HashMap<String, Ty>) -> Ty {
             None => ty.clone(),
         },
         Ty::Named(n, args) => Ty::Named(n.clone(), args.iter().map(|a| resolve(a, sub)).collect()),
+        Ty::Fn(ps, r) => Ty::Fn(
+            ps.iter().map(|a| resolve(a, sub)).collect(),
+            Box::new(resolve(r, sub)),
+        ),
         other => other.clone(),
     }
 }
@@ -878,6 +1079,7 @@ fn contains_var(ty: &Ty) -> bool {
     match ty {
         Ty::Var(_) => true,
         Ty::Named(_, args) => args.iter().any(contains_var),
+        Ty::Fn(ps, r) => ps.iter().any(contains_var) || contains_var(r),
         _ => false,
     }
 }

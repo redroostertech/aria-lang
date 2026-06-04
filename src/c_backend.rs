@@ -75,6 +75,8 @@ impl CType {
             Ty::Float => Ok(CType::Float),
             Ty::Str => Ok(CType::Str),
             Ty::Named(_, args) if args.is_empty() => Ok(CType::Ref),
+            // A closure value is a heap cell (tag = lambda id, fields = captures).
+            Ty::Fn(_, _) => Ok(CType::Ref),
             other => Err(format!(
                 "c backend: unsupported type `{:?}` (subset: Int/Bool/Float/String and non-generic ADTs)",
                 other
@@ -202,6 +204,22 @@ struct Env<'a> {
     /// the temp is never read, but C/wasm still need a type, and the function
     /// return type is the consistent choice (these are tail constructs).
     fn_ret: CType,
+    /// Closure (lifted-lambda) table: maps each lambda's name to its closure
+    /// tag and records the tag base, so `MakeClosure` can tag the cell and
+    /// `ApplyClosure` can index the function-pointer table.
+    closures: &'a ClosureTable,
+}
+
+/// Lifted-lambda dispatch metadata shared across the C codegen.
+struct ClosureTable {
+    /// First closure tag (one past the last constructor tag), so closure tags
+    /// never collide with ADT constructor tags.
+    base: i64,
+    /// Lambda names in tag order; index `i` has tag `base + i` and lives at
+    /// `__aria_lam_table[i]`.
+    names: Vec<String>,
+    /// Lambda name -> closure tag.
+    tags: HashMap<String, i64>,
 }
 
 impl<'a> Env<'a> {
@@ -304,6 +322,14 @@ fn bind_type(bind: &Bind, env: &Env) -> Result<CType, String> {
             env.ctors.get(name)?;
             Ok(CType::Ref)
         }
+        // A closure value is a heap cell.
+        Bind::MakeClosure(_, _) => Ok(CType::Ref),
+        // The result of applying a closure is the lambda's return type, attached
+        // by monomorphization.
+        Bind::ApplyClosure(_, _, ret) => match ret {
+            Some(t) => CType::from_ty(t),
+            None => Err("c backend: closure application missing its result type".into()),
+        },
         Bind::If(_, then, els) => {
             let t = iexpr_type(then, env);
             let e = iexpr_type(els, env);
@@ -342,7 +368,7 @@ fn match_type(scrut: &Atom, arms: &[ir::IArm], env: &Env) -> Result<CType, Strin
         } else if let Some(b) = arm.binders.first() {
             types.insert(b.clone(), CType::Ref);
         }
-        let probe = Env { types, sigs: env.sigs, ctors: env.ctors, tmp: env.tmp, str_lits: env.str_lits, tail_params: env.tail_params, fn_ret: env.fn_ret };
+        let probe = Env { types, sigs: env.sigs, ctors: env.ctors, tmp: env.tmp, str_lits: env.str_lits, tail_params: env.tail_params, fn_ret: env.fn_ret, closures: env.closures };
         match iexpr_type(&arm.body, &probe) {
             Ok(t) => {
                 if let Some(prev) = result {
@@ -411,14 +437,14 @@ fn iexpr_type(e: &IExpr, env: &Env) -> Result<CType, String> {
             let t = bind_type(bind, env)?;
             let mut types = env.types.clone();
             types.insert(x.clone(), t);
-            let probe = Env { types, sigs: env.sigs, ctors: env.ctors, tmp: env.tmp, str_lits: env.str_lits, tail_params: env.tail_params, fn_ret: env.fn_ret };
+            let probe = Env { types, sigs: env.sigs, ctors: env.ctors, tmp: env.tmp, str_lits: env.str_lits, tail_params: env.tail_params, fn_ret: env.fn_ret, closures: env.closures };
             iexpr_type(body, &probe)
         }
         IExpr::Dup(_, body) | IExpr::Drop(_, body) => iexpr_type(body, env),
         IExpr::DropReuse(_, tok, body) => {
             let mut types = env.types.clone();
             types.insert(tok.clone(), CType::Ref); // a reuse token is a void* (cell ptr or NULL)
-            let probe = Env { types, sigs: env.sigs, ctors: env.ctors, tmp: env.tmp, str_lits: env.str_lits, tail_params: env.tail_params, fn_ret: env.fn_ret };
+            let probe = Env { types, sigs: env.sigs, ctors: env.ctors, tmp: env.tmp, str_lits: env.str_lits, tail_params: env.tail_params, fn_ret: env.fn_ret, closures: env.closures };
             iexpr_type(body, &probe)
         }
         // A `TailCall` is a loop back-edge: it yields no value here. Report it as
@@ -577,7 +603,95 @@ fn emit_bind(
             Ok(())
         }
         Bind::Match(scrut, arms) => emit_match(scrut, arms, dst, dst_ty, env, ind, out),
+        Bind::MakeClosure(lam, caps) => emit_make_closure(lam, caps, dst, env, ind, out),
+        Bind::ApplyClosure(callee, args, ret) => {
+            emit_apply_closure(callee, args, ret.as_ref(), dst, env, ind, out)
+        }
     }
+}
+
+/// Allocate a closure cell: a heap cell tagged with the lifted lambda's closure
+/// tag, whose fields are the captured values (stored by their static type).
+fn emit_make_closure(
+    lam: &str,
+    caps: &[Atom],
+    dst: &str,
+    env: &mut Env,
+    ind: &str,
+    out: &mut String,
+) -> Result<(), String> {
+    let tag = *env
+        .closures
+        .tags
+        .get(lam)
+        .ok_or_else(|| format!("c backend: unknown lambda `{}`", lam))?;
+    let _ = writeln!(out, "{}{} = aria_alloc({});", ind, dst, caps.len());
+    let _ = writeln!(out, "{}aria_set_tag({}, INT64_C({}));", ind, dst, tag);
+    for (i, a) in caps.iter().enumerate() {
+        let (t, ex) = emit_atom(a, env, out)?;
+        match t {
+            CType::Int | CType::Bool => {
+                let _ = writeln!(out, "{}aria_field({}, {}) = (int64_t)({});", ind, dst, i, ex);
+            }
+            CType::Float => {
+                let _ = writeln!(out, "{}aria_field({}, {}) = aria_f2i({});", ind, dst, i, ex);
+            }
+            CType::Ref | CType::Str => {
+                let _ = writeln!(out, "{}aria_field({}, {}) = (int64_t)(uintptr_t)({});", ind, dst, i, ex);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Apply a closure: read its tag, index the function-pointer table, and call the
+/// lifted lambda with the closure cell followed by the argument values. The cast
+/// reconstructs the lambda's C signature `ret (void*, args...)` from the call
+/// site's statically-known argument and result types.
+fn emit_apply_closure(
+    callee: &Atom,
+    args: &[Atom],
+    ret: Option<&Ty>,
+    dst: &str,
+    env: &mut Env,
+    ind: &str,
+    out: &mut String,
+) -> Result<(), String> {
+    let ret_ty = ret.ok_or("c backend: closure application missing its result type")?;
+    let ret_ct = CType::from_ty(ret_ty)?;
+    let (ct, cx) = emit_atom(callee, env, out)?;
+    if ct != CType::Ref {
+        return Err("c backend: applying a non-closure value".into());
+    }
+    // Evaluate arguments and collect their C types for the function-pointer cast.
+    let mut arg_exprs = Vec::new();
+    let mut arg_ctys = Vec::new();
+    for a in args {
+        let (at, ax) = emit_atom(a, env, out)?;
+        arg_ctys.push(at.decl().to_string());
+        arg_exprs.push(ax);
+    }
+    let mut sig_params = vec!["void*".to_string()];
+    sig_params.extend(arg_ctys);
+    let fnptr_ty = format!("{} (*)({})", ret_ct.decl(), sig_params.join(", "));
+    let mut call_args = vec![format!("(void*){}", cx)];
+    call_args.extend(arg_exprs);
+    let idx = format!("(aria_tag({}) - INT64_C({}))", cx, env.closures.base);
+    let _ = writeln!(
+        out,
+        "{}{} = (({}) __aria_lam_table[{}])({});",
+        ind,
+        dst,
+        fnptr_ty,
+        idx,
+        call_args.join(", ")
+    );
+    // This application owns one reference to the closure (the rc pass dup'd it if
+    // it is used again); release it now. The lambda body borrowed the cell's
+    // captures (dup'ing each), so freeing the cell here releases only this
+    // application's hold — at rc 0 the captures are released too.
+    let _ = writeln!(out, "{}aria_drop((void*){});", ind, cx);
+    Ok(())
 }
 
 fn emit_prim(
@@ -1020,7 +1134,13 @@ fn collect_lits_bind(b: &Bind, out: &mut Vec<Vec<u8>>) {
             collect_lit_atom(l, out);
             collect_lit_atom(r, out);
         }
-        Bind::Ctor(_, fs) | Bind::Call(_, fs) | Bind::CtorReuse(_, _, fs) => {
+        Bind::Ctor(_, fs) | Bind::Call(_, fs) | Bind::CtorReuse(_, _, fs) | Bind::MakeClosure(_, fs) => {
+            for a in fs {
+                collect_lit_atom(a, out);
+            }
+        }
+        Bind::ApplyClosure(callee, fs, _) => {
+            collect_lit_atom(callee, out);
             for a in fs {
                 collect_lit_atom(a, out);
             }
@@ -1249,9 +1369,25 @@ pub fn compile(program: &Program) -> Result<String, String> {
     // transfers to the params exactly as a real call's binding would.
     let fns: HashMap<String, IFn> = ir::tail_call_optimize(rcd);
 
+    // 2b. Closure table: every lowered function carrying a `lam_sig` is a lifted
+    //     lambda. Assign each a closure tag past the last constructor tag (so the
+    //     tag never collides with an ADT tag) and a function-table index.
+    let mut lam_names: Vec<String> = fns
+        .iter()
+        .filter(|(_, f)| f.lam_sig.is_some())
+        .map(|(n, _)| n.clone())
+        .collect();
+    lam_names.sort();
+    let closure_base = ctors.by_name.len() as i64;
+    let mut tags = HashMap::new();
+    for (i, n) in lam_names.iter().enumerate() {
+        tags.insert(n.clone(), closure_base + i as i64);
+    }
+    let closures = ClosureTable { base: closure_base, names: lam_names.clone(), tags };
+
     // 3. Collect string literals -> a stable C global per distinct literal.
     let mut lit_list: Vec<Vec<u8>> = Vec::new();
-    for name in &order {
+    for name in order.iter().chain(lam_names.iter()) {
         if let Some(ifn) = fns.get(name) {
             collect_lits_iexpr(&ifn.body, &mut lit_list);
         }
@@ -1292,11 +1428,33 @@ pub fn compile(program: &Program) -> Result<String, String> {
         };
         let _ = writeln!(src, "static {} {}({});", sig.ret.decl(), cfn(name), params);
     }
+    // 4b. Forward-declare every lifted lambda with the closure calling
+    //     convention `ret (void* closure, params...)`, then build the
+    //     function-pointer dispatch table indexed by `tag - closure_base`.
+    for name in &lam_names {
+        let ifn = &fns[name];
+        let (ret_ct, param_cts, _) = lam_c_types(ifn)?;
+        let mut decls = vec!["void*".to_string()];
+        decls.extend(param_cts.iter().map(|t| t.decl().to_string()));
+        let _ = writeln!(src, "static {} {}({});", ret_ct.decl(), cfn(name), decls.join(", "));
+    }
+    let _ = write!(src, "static void* __aria_lam_table[] = {{");
+    for (i, name) in lam_names.iter().enumerate() {
+        if i > 0 {
+            src.push_str(", ");
+        }
+        let _ = write!(src, "(void*){}", cfn(name));
+    }
+    // A trailing dummy keeps a zero-lambda table a legal non-empty array.
+    if lam_names.is_empty() {
+        src.push_str("0");
+    }
+    src.push_str("};\n");
     src.push('\n');
 
     // 5. Emit the per-tag structural-equality and child-release helpers.
     emit_eq_helper(&ctors, &mut src);
-    emit_drop_children_helper(&ctors, &mut src);
+    emit_drop_children_helper(&ctors, &closures, &fns, &mut src)?;
 
     // 6. Emit each user function body.
     for name in &order {
@@ -1345,6 +1503,7 @@ pub fn compile(program: &Program) -> Result<String, String> {
             str_lits: &str_lits,
             tail_params: &tail_params,
             fn_ret: sig.ret,
+            closures: &closures,
         };
         let _ = writeln!(src, "    {} aria_ret;", sig.ret.decl());
         if ifn.tail_recursive {
@@ -1354,6 +1513,12 @@ pub fn compile(program: &Program) -> Result<String, String> {
         let _ = writeln!(src, "    return aria_ret;");
         let _ = writeln!(src, "}}");
         src.push('\n');
+    }
+
+    // 6b. Emit each lifted lambda body with the closure calling convention.
+    for name in &lam_names {
+        let ifn = &fns[name];
+        emit_lambda(name, ifn, &sigs, &ctors, &str_lits, &closures, &mut src)?;
     }
 
     // 7. The C `main`: run aria_main, print its result, and report the live
@@ -1422,7 +1587,87 @@ fn emit_eq_helper(ctors: &CtorTable, out: &mut String) {
 
 /// Emit `aria_drop_children`: per-tag release of a dead cell's Ref/Str fields,
 /// recursing via `aria_drop`/`aria_str_drop`.
-fn emit_drop_children_helper(ctors: &CtorTable, out: &mut String) {
+/// The C value types of a lifted lambda: (return, parameters, captures).
+fn lam_c_types(ifn: &IFn) -> Result<(CType, Vec<CType>, Vec<CType>), String> {
+    let sig = ifn
+        .lam_sig
+        .as_ref()
+        .ok_or("c backend: lifted lambda missing its type signature")?;
+    let ret = CType::from_ty(&sig.ret_ty)?;
+    let params = sig.param_tys.iter().map(CType::from_ty).collect::<Result<Vec<_>, _>>()?;
+    let caps = sig.capture_tys.iter().map(CType::from_ty).collect::<Result<Vec<_>, _>>()?;
+    Ok((ret, params, caps))
+}
+
+/// Emit a lifted lambda as a C function `ret f(void* closure, params...)`. The
+/// prologue loads each captured value from the closure cell and `dup`s the
+/// reference-counted ones, so the body owns its captures exactly like parameters
+/// (the cell retains its own reference until it is itself dropped).
+fn emit_lambda(
+    name: &str,
+    ifn: &IFn,
+    sigs: &HashMap<String, FnSig>,
+    ctors: &CtorTable,
+    str_lits: &HashMap<Vec<u8>, String>,
+    closures: &ClosureTable,
+    out: &mut String,
+) -> Result<(), String> {
+    let (ret_ct, param_cts, cap_cts) = lam_c_types(ifn)?;
+    if ifn.params.len() != param_cts.len() || ifn.captures.len() != cap_cts.len() {
+        return Err(format!("c backend: lambda `{}` arity/signature mismatch", name));
+    }
+    let mut decls = vec!["void* __aria_clo".to_string()];
+    for (pn, pt) in ifn.params.iter().zip(param_cts.iter()) {
+        decls.push(format!("{} {}", pt.decl(), cvar(pn)));
+    }
+    let _ = writeln!(out, "static {} {}({}) {{", ret_ct.decl(), cfn(name), decls.join(", "));
+    let mut types = HashMap::new();
+    for (i, (cn, ct)) in ifn.captures.iter().zip(cap_cts.iter()).enumerate() {
+        types.insert(cn.clone(), *ct);
+        let load = match ct {
+            CType::Int | CType::Bool => format!("(int64_t)aria_field(__aria_clo, {})", i),
+            CType::Float => format!("aria_i2f(aria_field(__aria_clo, {}))", i),
+            CType::Ref | CType::Str => format!("(void*)(uintptr_t)aria_field(__aria_clo, {})", i),
+        };
+        let _ = writeln!(out, "    {} {} = {};", ct.decl(), cvar(cn), load);
+        match ct {
+            CType::Ref => {
+                let _ = writeln!(out, "    aria_dup({});", cvar(cn));
+            }
+            CType::Str => {
+                let _ = writeln!(out, "    aria_str_dup({});", cvar(cn));
+            }
+            _ => {}
+        }
+    }
+    for (pn, pt) in ifn.params.iter().zip(param_cts.iter()) {
+        types.insert(pn.clone(), *pt);
+    }
+    let tail_params: Vec<(String, CType)> = Vec::new();
+    let mut env = Env {
+        types,
+        sigs,
+        ctors,
+        tmp: 0,
+        str_lits,
+        tail_params: &tail_params,
+        fn_ret: ret_ct,
+        closures,
+    };
+    let _ = writeln!(out, "    {} aria_ret;", ret_ct.decl());
+    emit_iexpr(&ifn.body, "aria_ret", ret_ct, &mut env, "    ", out)?;
+    let _ = writeln!(out, "    return aria_ret;");
+    let _ = writeln!(out, "}}");
+    out.push('\n');
+    Ok(())
+}
+
+fn emit_drop_children_helper(
+    ctors: &CtorTable,
+    closures: &ClosureTable,
+    fns: &HashMap<String, IFn>,
+    out: &mut String,
+) -> Result<(), String> {
     out.push_str("static void aria_drop_children(void* p) {\n");
     out.push_str("    int64_t tag = aria_tag(p);\n");
     for (_, info) in ctors.sorted() {
@@ -1451,8 +1696,40 @@ fn emit_drop_children_helper(ctors: &CtorTable, out: &mut String) {
         out.push_str("        return;\n");
         out.push_str("    }\n");
     }
+    // Closure cells: release each reference-counted captured value.
+    for name in &closures.names {
+        let ifn = fns
+            .get(name)
+            .ok_or_else(|| format!("c backend: lambda `{}` missing from IR", name))?;
+        let (_, _, cap_cts) = lam_c_types(ifn)?;
+        let managed: Vec<(usize, CType)> = cap_cts
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| matches!(t, CType::Ref | CType::Str))
+            .map(|(i, t)| (i, *t))
+            .collect();
+        if managed.is_empty() {
+            continue;
+        }
+        let tag = closures.tags[name];
+        let _ = writeln!(out, "    if (tag == INT64_C({})) {{", tag);
+        for (i, t) in managed {
+            match t {
+                CType::Ref => {
+                    let _ = writeln!(out, "        aria_drop((void*)(uintptr_t)aria_field(p, {}));", i);
+                }
+                CType::Str => {
+                    let _ = writeln!(out, "        aria_str_drop((void*)(uintptr_t)aria_field(p, {}));", i);
+                }
+                _ => {}
+            }
+        }
+        out.push_str("        return;\n");
+        out.push_str("    }\n");
+    }
     out.push_str("    (void)tag;\n");
     out.push_str("}\n\n");
+    Ok(())
 }
 
 // ---- differential tests --------------------------------------------------
@@ -1551,6 +1828,50 @@ mod tests {
         differential(
             "fn fac(n: Int) -> Int = match n { 0 => 1, _ => n * fac(n - 1), }\n\
              fn main() -> Int = fac(10)",
+        );
+    }
+
+    #[test]
+    fn closure_immediate_and_curry() {
+        // An immediately-applied lambda, and currying via a returned closure.
+        differential("fn main() -> Int = (\\x -> x * 2)(21)");
+        differential(
+            "fn add(x: Int) -> (Int) -> Int = \\y -> x + y\n\
+             fn main() -> Int = add(3)(4)",
+        );
+    }
+
+    #[test]
+    fn closure_captures_and_higher_order() {
+        // A closure passed to a generic higher-order function, capturing a local,
+        // plus a function used by name — all reference-counted garbage-free.
+        differential(
+            "type List = | Nil | Cons(Int, List)\n\
+             fn map(f: (Int) -> Int, xs: List) -> List = match xs { Nil => Nil, Cons(h, t) => Cons(f(h), map(f, t)), }\n\
+             fn sum(xs: List) -> Int = match xs { Nil => 0, Cons(h, t) => h + sum(t), }\n\
+             fn dbl(x: Int) -> Int = x * 2\n\
+             fn main() -> Int = {\n\
+               let n = 10;\n\
+               let xs = Cons(1, Cons(2, Cons(3, Nil)));\n\
+               sum(map(\\x -> x + n, xs)) + sum(map(dbl, xs))\n\
+             }",
+        );
+    }
+
+    #[test]
+    fn closure_applied_twice_and_composed() {
+        // A closure stored, then applied twice (rc dup), and a closure that
+        // captures two other closures (Ref captures released on the cell's drop).
+        differential(
+            "fn twice(f: (Int) -> Int, x: Int) -> Int = f(f(x))\n\
+             fn main() -> Int = twice(\\n -> n + 5, 100)",
+        );
+        differential(
+            "fn compose(f: (Int)->Int, g: (Int)->Int) -> (Int)->Int = \\x -> f(g(x))\n\
+             fn main() -> Int = {\n\
+               let h = compose(\\(a: Int) -> a + 1, \\(b: Int) -> b * 2);\n\
+               h(10) + h(20)\n\
+             }",
         );
     }
 

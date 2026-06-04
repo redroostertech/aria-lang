@@ -255,7 +255,7 @@ impl Interp {
                 Err(format!("no match arm for value {}", v.display()))
             }
 
-            Expr::Lambda(params, body) => {
+            Expr::Lambda(params, body, _) => {
                 // Capture the current environment by flattening all in-scope
                 // frames (inner shadowing outer) into the closure's env.
                 let mut env = HashMap::new();
@@ -271,7 +271,7 @@ impl Interp {
                 })))
             }
 
-            Expr::Apply(callee, args) => {
+            Expr::Apply(callee, args, _) => {
                 let f = self.eval(callee, scope)?;
                 let mut vals = Vec::with_capacity(args.len());
                 for a in args {

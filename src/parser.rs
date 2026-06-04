@@ -341,7 +341,7 @@ impl Parser {
         }
         self.expect(&Tok::Arrow)?;
         let body = self.parse_expr(0)?;
-        Ok(Expr::Lambda(params, Box::new(body)))
+        Ok(Expr::Lambda(params, Box::new(body), None))
     }
 
     // Parse an atom, then any trailing `(args)` applications. A trailing call on
@@ -356,7 +356,7 @@ impl Parser {
         // general application of the callee value.
         while *self.peek() == Tok::LParen {
             let args = self.parse_args()?;
-            e = Expr::Apply(Box::new(e), args);
+            e = Expr::Apply(Box::new(e), args, None);
         }
         Ok(e)
     }

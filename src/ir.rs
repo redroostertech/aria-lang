@@ -51,6 +51,19 @@ pub enum Bind {
     /// Match on an ADT scrutinee. Arms are keyed by constructor; an arm with
     /// `ctor == None` is a catch-all (binds the whole scrutinee).
     Match(Atom, Vec<IArm>),
+    /// Allocate a closure: a heap cell whose constructor tag is the lifted
+    /// lambda's name and whose fields are the captured values. Behaves exactly
+    /// like `Ctor` for reference counting (the captures are moved into the cell;
+    /// the cell is dropped at its last use).
+    MakeClosure(String, Vec<Atom>),
+    /// Apply a closure value to arguments. The first atom evaluates to a closure
+    /// cell; dispatch reads its lambda tag, re-binds the captured fields plus
+    /// these argument atoms, and runs the lifted lambda body. Behaves like
+    /// `Call` for reference counting (callee + args are consumed). The final
+    /// field is the concrete result type (from monomorphization), which the
+    /// backends need to type the result temporary; `None` on the untyped
+    /// interpreter path.
+    ApplyClosure(Atom, Vec<Atom>, Option<crate::ast::Ty>),
 }
 
 #[derive(Debug, Clone)]
@@ -90,6 +103,20 @@ pub enum IExpr {
 #[derive(Debug, Clone)]
 pub struct IFn {
     pub params: Vec<String>,
+    /// Free variables captured from the enclosing scope, for a *lifted lambda*
+    /// (empty for ordinary functions). A closure value is a heap cell whose
+    /// constructor tag is this lambda's name and whose fields are the captured
+    /// values, in this order. The closure calling convention passes the closure
+    /// cell plus the call arguments; each backend's lambda prologue re-binds
+    /// these capture names from the cell's fields (dup'ing each so the body owns
+    /// its captures exactly like `params`), and the `rc` pass therefore treats
+    /// `captures` as additional owned inputs alongside `params`.
+    pub captures: Vec<String>,
+    /// Concrete type signature for a lifted lambda (`None` for ordinary
+    /// functions, whose signature the backends read from the source `FnDecl`).
+    /// Lets a backend build a function-table entry and type the lambda body even
+    /// though the lambda has no `FnDecl`.
+    pub lam_sig: Option<LamSig>,
     pub body: IExpr,
     /// Set by the `tco` pass when `body` contains `IExpr::TailCall` back-edges.
     /// The backends then emit the body wrapped in a loop whose header is the
@@ -99,6 +126,15 @@ pub struct IFn {
 }
 
 pub struct LowerError(pub String);
+
+/// Concrete type signature of a lifted lambda: the parameter types, the captured
+/// variable types (in closure-cell field order), and the return type.
+#[derive(Debug, Clone)]
+pub struct LamSig {
+    pub param_tys: Vec<crate::ast::Ty>,
+    pub capture_tys: Vec<crate::ast::Ty>,
+    pub ret_ty: crate::ast::Ty,
+}
 
 /// Builtins the IR interpreter implements. Other declared builtins (tensor/RAG/
 /// compression) are outside the IR subset and rejected at lowering.
@@ -135,6 +171,110 @@ const WASM_ONLY_BUILTINS: &[&str] = &[
 
 struct Lowerer {
     tmp: usize,
+    /// Counter for fresh lifted-lambda names.
+    lam: usize,
+    /// Arity of every top-level function (used to tell a *global function* —
+    /// called directly or wrapped as a value — from a *local* `Fn`-typed
+    /// variable, which is applied as a closure).
+    fn_arities: HashMap<String, usize>,
+    /// Concrete (param types, return type) of each top-level function — used to
+    /// give a value-wrapper closure its type signature.
+    fn_sigs: HashMap<String, (Vec<crate::ast::Ty>, crate::ast::Ty)>,
+    /// Lambdas (and top-level-function value wrappers) lifted to the top level
+    /// during lowering. Merged into the program's function map afterwards.
+    lifted: Vec<(String, IFn)>,
+    /// Wrapper names already emitted for top-level functions used as values
+    /// (so each global function gets exactly one `$fnval$` wrapper).
+    wrappers: std::collections::HashSet<String>,
+}
+
+/// Variable names a pattern binds (used by the closure free-variable walk).
+pub(crate) fn pattern_vars(p: &Pattern, acc: &mut std::collections::HashSet<String>) {
+    match p {
+        Pattern::Var(n) => {
+            acc.insert(n.clone());
+        }
+        Pattern::Wild | Pattern::Int(_) | Pattern::Bool(_) => {}
+        Pattern::Ctor(_, subs) => {
+            for s in subs {
+                pattern_vars(s, acc);
+            }
+        }
+    }
+}
+
+/// Collect the free variables of an expression — names referenced but not bound
+/// within it. `bound` is the set of names already in scope (lambda params, lets,
+/// match binders). A `Call`/`Apply` callee name counts as a use; constructor
+/// names do not. This drives closure capture: a lambda captures exactly its free
+/// variables that are not top-level functions or builtins.
+pub(crate) fn ast_free(e: &Expr, bound: &std::collections::HashSet<String>, acc: &mut std::collections::HashSet<String>) {
+    use std::collections::HashSet;
+    match e {
+        Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Unit => {}
+        Expr::Var(n) => {
+            if !bound.contains(n) {
+                acc.insert(n.clone());
+            }
+        }
+        Expr::Ctor(_, args) => {
+            for a in args {
+                ast_free(a, bound, acc);
+            }
+        }
+        Expr::Call(name, args) => {
+            if !bound.contains(name) {
+                acc.insert(name.clone());
+            }
+            for a in args {
+                ast_free(a, bound, acc);
+            }
+        }
+        Expr::Apply(callee, args, _) => {
+            ast_free(callee, bound, acc);
+            for a in args {
+                ast_free(a, bound, acc);
+            }
+        }
+        Expr::Unary(_, inner) => ast_free(inner, bound, acc),
+        Expr::Binary(_, l, r) => {
+            ast_free(l, bound, acc);
+            ast_free(r, bound, acc);
+        }
+        Expr::If(c, t, e2) => {
+            ast_free(c, bound, acc);
+            ast_free(t, bound, acc);
+            ast_free(e2, bound, acc);
+        }
+        Expr::Match(s, arms) => {
+            ast_free(s, bound, acc);
+            for arm in arms {
+                let mut b = bound.clone();
+                pattern_vars(&arm.pat, &mut b);
+                ast_free(&arm.body, &b, acc);
+            }
+        }
+        Expr::Lambda(params, body, _) => {
+            let mut b = bound.clone();
+            for (n, _) in params {
+                b.insert(n.clone());
+            }
+            ast_free(body, &b, acc);
+        }
+        Expr::Block(stmts, last) => {
+            let mut b: HashSet<String> = bound.clone();
+            for s in stmts {
+                match s {
+                    Stmt::Let(name, _, v) => {
+                        ast_free(v, &b, acc);
+                        b.insert(name.clone());
+                    }
+                    Stmt::Expr(ex) => ast_free(ex, &b, acc),
+                }
+            }
+            ast_free(last, &b, acc);
+        }
+    }
 }
 
 impl Lowerer {
@@ -142,6 +282,37 @@ impl Lowerer {
         let n = self.tmp;
         self.tmp += 1;
         format!("$t{}", n)
+    }
+
+    /// Return (creating on first use) the name of a zero-capture closure wrapper
+    /// that forwards to the top-level function `name` — used when a function is
+    /// referenced as a value rather than called. The wrapper's parameters forward
+    /// positionally to a direct `Call`.
+    fn fn_value_wrapper(&mut self, name: &str) -> String {
+        let w = format!("$fnval${}", name);
+        if !self.wrappers.contains(&w) {
+            self.wrappers.insert(w.clone());
+            let arity = *self.fn_arities.get(name).unwrap_or(&0);
+            let params: Vec<String> = (0..arity).map(|i| format!("$a{}", i)).collect();
+            let call_args: Vec<Atom> = params.iter().map(|p| Atom::Var(p.clone())).collect();
+            let t = format!("$w{}", self.lam);
+            self.lam += 1;
+            let body = IExpr::Let(
+                t.clone(),
+                Bind::Call(name.to_string(), call_args),
+                Box::new(IExpr::Ret(Atom::Var(t))),
+            );
+            let lam_sig = self.fn_sigs.get(name).map(|(ptys, ret)| LamSig {
+                param_tys: ptys.clone(),
+                capture_tys: vec![],
+                ret_ty: ret.clone(),
+            });
+            self.lifted.push((
+                w.clone(),
+                IFn { params, captures: vec![], lam_sig, body, tail_recursive: false },
+            ));
+        }
+        w
     }
 
     /// Lower `e` into a complete IExpr (lets ending in `Ret`).
@@ -164,7 +335,19 @@ impl Lowerer {
             Expr::Bool(b) => Ok(Atom::Bool(*b)),
             Expr::Str(s) => Ok(Atom::Str(s.clone())),
             Expr::Unit => Ok(Atom::Unit),
-            Expr::Var(n) => Ok(Atom::Var(n.clone())),
+            Expr::Var(n) => {
+                // A bare top-level function name in value position (it would be an
+                // `Expr::Call` if it were applied) becomes a closure over a
+                // zero-capture wrapper that forwards to the direct call.
+                if self.fn_arities.contains_key(n) {
+                    let w = self.fn_value_wrapper(n);
+                    let t = self.fresh();
+                    stmts.push((t.clone(), Bind::MakeClosure(w, vec![])));
+                    Ok(Atom::Var(t))
+                } else {
+                    Ok(Atom::Var(n.clone()))
+                }
+            }
 
             Expr::Binary(op, l, r) => {
                 // Short-circuit `&&` / `||` must NOT evaluate the rhs eagerly —
@@ -200,6 +383,16 @@ impl Lowerer {
                 Ok(Atom::Var(t))
             }
             Expr::Call(name, args) => {
+                // A name that is neither a top-level function nor a builtin must be
+                // a local `Fn`-typed binding (parameter / let) being applied — a
+                // closure call, exactly as the tree-walker treats a shadowing local
+                // (it looks up the scope before the global function table).
+                if !self.fn_arities.contains_key(name) && crate::builtins::lookup(name).is_none() {
+                    let atoms = self.lower_all(args, stmts)?;
+                    let t = self.fresh();
+                    stmts.push((t.clone(), Bind::ApplyClosure(Atom::Var(name.clone()), atoms, None)));
+                    return Ok(Atom::Var(t));
+                }
                 // Builtins the IR doesn't implement (tensors/RAG/compression) are
                 // outside the IR subset — reject at lowering with a clear message
                 // rather than failing confusingly at run time.
@@ -232,11 +425,66 @@ impl Lowerer {
                 stmts.push((t.clone(), bind));
                 Ok(Atom::Var(t))
             }
-            Expr::Lambda(_, _) | Expr::Apply(_, _) => {
-                return Err(LowerError(
-                    "function values (lambdas / higher-order calls) are not supported by the compiled backends yet"
-                        .to_string(),
+            Expr::Lambda(params, body, sig) => {
+                // Lift the lambda to a top-level function and allocate a closure
+                // cell holding its captured free variables. When monomorphization
+                // has attached a concrete `ClosureSig`, take the capture list (and
+                // types) from it so the cell layout, the lifted lambda's prologue,
+                // and the backends' types all agree. Otherwise (the untyped IR
+                // interpreter path) recover the captures syntactically.
+                let (capture_names, lam_sig) = match sig {
+                    Some(cs) => {
+                        let names: Vec<String> = cs.captures.iter().map(|(n, _)| n.clone()).collect();
+                        let sig = LamSig {
+                            param_tys: params.iter().map(|(_, t)| t.clone()).collect(),
+                            capture_tys: cs.captures.iter().map(|(_, t)| t.clone()).collect(),
+                            ret_ty: cs.ret.clone(),
+                        };
+                        (names, Some(sig))
+                    }
+                    None => {
+                        let mut param_set = std::collections::HashSet::new();
+                        for (n, _) in params {
+                            param_set.insert(n.clone());
+                        }
+                        let mut fvs = std::collections::HashSet::new();
+                        ast_free(body, &param_set, &mut fvs);
+                        let mut captures: Vec<String> = fvs
+                            .into_iter()
+                            .filter(|n| {
+                                !self.fn_arities.contains_key(n)
+                                    && crate::builtins::lookup(n).is_none()
+                            })
+                            .collect();
+                        captures.sort();
+                        (captures, None)
+                    }
+                };
+                let lam_name = format!("$lam{}", self.lam);
+                self.lam += 1;
+                let lam_params: Vec<String> = params.iter().map(|(n, _)| n.clone()).collect();
+                let lam_body = self.lower_block(body)?;
+                self.lifted.push((
+                    lam_name.clone(),
+                    IFn {
+                        params: lam_params,
+                        captures: capture_names.clone(),
+                        lam_sig,
+                        body: lam_body,
+                        tail_recursive: false,
+                    },
                 ));
+                let cap_atoms = capture_names.into_iter().map(Atom::Var).collect();
+                let t = self.fresh();
+                stmts.push((t.clone(), Bind::MakeClosure(lam_name, cap_atoms)));
+                Ok(Atom::Var(t))
+            }
+            Expr::Apply(callee, args, result_ty) => {
+                let c = self.lower(callee, stmts)?;
+                let atoms = self.lower_all(args, stmts)?;
+                let t = self.fresh();
+                stmts.push((t.clone(), Bind::ApplyClosure(c, atoms, result_ty.clone())));
+                Ok(Atom::Var(t))
             }
             Expr::Block(block_stmts, last) => {
                 for s in block_stmts {
@@ -360,13 +608,38 @@ impl Lowerer {
 /// uses a feature outside the IR subset.
 pub fn lower_program(program: &Program) -> Result<HashMap<String, IFn>, String> {
     let mut fns = HashMap::new();
-    let mut lw = Lowerer { tmp: 0 };
+    let mut fn_arities = HashMap::new();
+    let mut fn_sigs = HashMap::new();
+    for item in &program.items {
+        if let Item::Fn(f) = item {
+            fn_arities.insert(f.name.clone(), f.params.len());
+            fn_sigs.insert(
+                f.name.clone(),
+                (f.params.iter().map(|p| p.ty.clone()).collect::<Vec<_>>(), f.ret.clone()),
+            );
+        }
+    }
+    let mut lw = Lowerer {
+        tmp: 0,
+        lam: 0,
+        fn_arities,
+        fn_sigs,
+        lifted: Vec::new(),
+        wrappers: std::collections::HashSet::new(),
+    };
     for item in &program.items {
         if let Item::Fn(f) = item {
             let body = lw.lower_block(&f.body).map_err(|e| format!("fn `{}`: {}", f.name, e.0))?;
             let params = f.params.iter().map(|p| p.name.clone()).collect();
-            fns.insert(f.name.clone(), IFn { params, body, tail_recursive: false });
+            fns.insert(
+                f.name.clone(),
+                IFn { params, captures: vec![], lam_sig: None, body, tail_recursive: false },
+            );
         }
+    }
+    // Merge lifted lambdas / function-value wrappers into the program map.
+    for (name, f) in lw.lifted {
+        fns.insert(name, f);
     }
     Ok(fns)
 }
@@ -399,7 +672,16 @@ pub fn tail_call_optimize(fns: HashMap<String, IFn>) -> HashMap<String, IFn> {
             let arity = f.params.len();
             let mut found = false;
             let body = rewrite_tail(&name, arity, f.body, &mut found);
-            (name, IFn { params: f.params, body, tail_recursive: found })
+            (
+                name,
+                IFn {
+                    params: f.params,
+                    captures: f.captures,
+                    lam_sig: f.lam_sig,
+                    body,
+                    tail_recursive: found,
+                },
+            )
         })
         .collect()
 }
@@ -861,6 +1143,79 @@ impl IrInterp {
                 }
                 Err(format!("ir: no match arm for {}", cell.ctor))
             }
+            // A closure: a heap cell whose constructor tag is the lifted lambda's
+            // name and whose fields are the captured values — exactly like `Ctor`.
+            Bind::MakeClosure(lam, caps) => {
+                let fields = caps.iter().map(|a| self.atom(a, env)).collect::<Result<_, _>>()?;
+                self.metrics.allocations += 1;
+                self.metrics.live += 1;
+                self.metrics.peak_live = self.metrics.peak_live.max(self.metrics.live);
+                self.heap.push(Some(Cell { ctor: lam.clone(), fields, rc: 1 }));
+                Ok(IValue::Ref(self.heap.len() - 1))
+            }
+            // Apply a closure: read its lambda tag, bind the captured fields plus
+            // the argument atoms, and run the lifted lambda body. The captures are
+            // dup'd out of the cell so the body owns them exactly like parameters
+            // (the body's rc'd drops then balance); the closure cell itself is
+            // dropped by the rc pass's inserted `Drop`, not here.
+            Bind::ApplyClosure(callee, args, _) => {
+                let cv = self.atom(callee, env)?;
+                let addr = match cv {
+                    IValue::Ref(a) => a,
+                    _ => return Err("ir: apply of non-closure value".into()),
+                };
+                let cell = self.heap[addr].clone().ok_or("ir: apply use-after-free")?;
+                let f = self
+                    .fns
+                    .get(&cell.ctor)
+                    .cloned()
+                    .ok_or_else(|| format!("ir: apply of unknown lambda `{}`", cell.ctor))?;
+                let argvals: Vec<IValue> =
+                    args.iter().map(|a| self.atom(a, env)).collect::<Result<_, _>>()?;
+                if f.captures.len() != cell.fields.len() || f.params.len() != argvals.len() {
+                    return Err(format!(
+                        "ir: closure `{}` arity mismatch (captures {}/{}, params {}/{})",
+                        cell.ctor,
+                        f.captures.len(),
+                        cell.fields.len(),
+                        f.params.len(),
+                        argvals.len()
+                    ));
+                }
+                let d = self.depth + 1;
+                if d > MAX_IR_CALL_DEPTH {
+                    return Err(format!("ir: maximum recursion depth ({}) exceeded", MAX_IR_CALL_DEPTH));
+                }
+                self.depth = d;
+                let mut frame = Env::new();
+                for (cn, fv) in f.captures.iter().zip(cell.fields.iter()) {
+                    if self.manage_rc {
+                        if let IValue::Ref(a) = fv {
+                            match &mut self.heap[*a] {
+                                Some(c) => c.rc += 1,
+                                None => return Err("ir: dup of freed capture".into()),
+                            }
+                            self.metrics.dups += 1;
+                        }
+                    }
+                    frame.insert(cn.clone(), fv.clone());
+                }
+                for (p, v) in f.params.iter().zip(argvals.into_iter()) {
+                    frame.insert(p.clone(), v);
+                }
+                let result = self.eval(&f.body, frame);
+                self.depth = d - 1;
+                let result = result?;
+                // This application owns one reference to the closure cell (the rc
+                // pass dup'd it for any further use); release it now. The body
+                // borrowed the captures (dup'ing each), so this only drops this
+                // application's hold; at rc 0 the captured fields are released too.
+                if self.manage_rc {
+                    self.metrics.drops += 1;
+                    self.drop_cell(addr)?;
+                }
+                Ok(result)
+            }
         }
     }
 
@@ -1011,21 +1366,18 @@ mod tests {
     }
 
     #[test]
-    fn function_values_rejected_by_compiled_backend() {
-        // A program using a lambda / higher-order call type-checks and runs in the
-        // interpreter, but the IR (and thus the wasm/native backends) must reject
-        // it with a clean Err — never a panic.
-        let src = r#"
-            fn apply1(f: (Int) -> Int, x: Int) -> Int = f(x)
-            fn main() -> Int = apply1(\y -> y + 1, 41)
-        "#;
-        let prog = parser::parse(lexer::lex(src).unwrap()).unwrap();
-        typeck::check(&prog).expect("must type-check");
-        let err = lower_program(&prog).unwrap_err();
-        assert!(
-            err.contains("not supported by the compiled backends"),
-            "got: {}",
-            err
+    fn function_values_lower_and_match_interpreter() {
+        // Lambdas and higher-order calls now lower to closures (lifted lambdas +
+        // closure cells) and the IR interpreter agrees with the tree-walker and
+        // stays garbage-free — the native backend compiles these (the wasm
+        // backend still rejects them for now).
+        differential(
+            "fn apply1(f: (Int) -> Int, x: Int) -> Int = f(x)\nfn main() -> Int = apply1(\\y -> y + 1, 41)",
+        );
+        // A captured variable, an immediately-applied lambda, and currying.
+        differential("fn main() -> Int = (\\x -> x * 2)(21)");
+        differential(
+            "fn add(x: Int) -> (Int) -> Int = \\y -> x + y\nfn main() -> Int = add(3)(4)",
         );
     }
 

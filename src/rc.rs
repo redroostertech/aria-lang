@@ -54,14 +54,25 @@ pub fn insert_rc(fns: &HashMap<String, IFn>) -> HashMap<String, IFn> {
     fns.iter()
         .map(|(name, f)| {
             let mut body = rc(&f.body, &HashSet::new());
-            // Parameters are owned on entry; drop any the body never uses.
+            // Parameters and (for a lifted lambda) captured variables are owned on
+            // entry — the closure calling convention dup's each capture out of the
+            // cell before the body runs — so drop any the body never uses.
             let body_fv = fv_expr(&f.body);
-            for p in f.params.iter().rev() {
+            for p in f.params.iter().chain(f.captures.iter()).rev() {
                 if !body_fv.contains(p) {
                     body = IExpr::Drop(p.clone(), Box::new(body));
                 }
             }
-            (name.clone(), IFn { params: f.params.clone(), body, tail_recursive: f.tail_recursive })
+            (
+                name.clone(),
+                IFn {
+                    params: f.params.clone(),
+                    captures: f.captures.clone(),
+                    lam_sig: f.lam_sig.clone(),
+                    body,
+                    tail_recursive: f.tail_recursive,
+                },
+            )
         })
         .collect()
 }
@@ -119,6 +130,17 @@ fn collect_fv_bind(bind: &Bind, acc: &mut HashSet<String>) {
                 add_atom(a, acc);
             }
         }
+        Bind::MakeClosure(_, atoms) => {
+            for a in atoms {
+                add_atom(a, acc);
+            }
+        }
+        Bind::ApplyClosure(callee, atoms, _) => {
+            add_atom(callee, acc);
+            for a in atoms {
+                add_atom(a, acc);
+            }
+        }
         Bind::If(c, t, e) => {
             add_atom(c, acc);
             collect_fv(t, acc);
@@ -148,8 +170,12 @@ fn collect_fv_bind(bind: &Bind, acc: &mut HashSet<String>) {
 fn consumed(bind: &Bind) -> Vec<String> {
     match bind {
         Bind::Atom(Atom::Var(v)) => vec![v.clone()],
-        Bind::Ctor(_, atoms) | Bind::Call(_, atoms) => atoms
+        Bind::Ctor(_, atoms) | Bind::Call(_, atoms) | Bind::MakeClosure(_, atoms) => atoms
             .iter()
+            .filter_map(|a| if let Atom::Var(v) = a { Some(v.clone()) } else { None })
+            .collect(),
+        Bind::ApplyClosure(callee, atoms, _) => std::iter::once(callee)
+            .chain(atoms.iter())
             .filter_map(|a| if let Atom::Var(v) = a { Some(v.clone()) } else { None })
             .collect(),
         Bind::Prim(crate::ast::BinOp::Eq | crate::ast::BinOp::Ne, a, b) => [a, b]

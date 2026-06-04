@@ -311,8 +311,8 @@ fn collect_calls(e: &Expr, out: &mut HashSet<String>) {
                 collect_calls(a, out);
             }
         }
-        Expr::Lambda(_, body) => collect_calls(body, out),
-        Expr::Apply(callee, args) => {
+        Expr::Lambda(_, body, _) => collect_calls(body, out),
+        Expr::Apply(callee, args, _) => {
             collect_calls(callee, out);
             for a in args {
                 collect_calls(a, out);
@@ -655,7 +655,7 @@ impl Checker {
 
             Expr::Match(scrut, arms) => self.synth_match(scrut, arms, scope),
 
-            Expr::Lambda(params, body) => {
+            Expr::Lambda(params, body, _) => {
                 // Parameters are typed from their annotations. An unannotated
                 // `\x -> ...` carries a parser-supplied placeholder var (`$lamN`);
                 // give it a FRESH unification variable so its type can be solved
@@ -681,7 +681,7 @@ impl Checker {
                 Ok(Ty::Fn(param_tys, Box::new(self.resolve(&body_ty))))
             }
 
-            Expr::Apply(callee, args) => {
+            Expr::Apply(callee, args, _) => {
                 let ct = self.synth(callee, scope)?;
                 self.synth_apply(&ct, args, scope, "value")
             }
