@@ -693,7 +693,8 @@ fn run_wasm_live(bytes: &[u8]) -> Result<(String, i64), String> {
          process.stdout.write('\\n');}},\
          print_float:(x)=>{{process.stdout.write(String(x));process.stdout.write('\\n');}},\
          print_int:(n)=>{{process.stdout.write(String(n));process.stdout.write('\\n');}},\
-         print_bool:(b)=>{{process.stdout.write(b?'true':'false');process.stdout.write('\\n');}}}}}};\
+         print_bool:(b)=>{{process.stdout.write(b?'true':'false');process.stdout.write('\\n');}},\
+         exp:Math.exp}}}};\
          const b=fs.readFileSync({:?});\
          WebAssembly.instantiate(b,imp).then(r=>{{\
          const ex=r.instance.exports;memref=ex.memory;\

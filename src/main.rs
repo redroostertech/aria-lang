@@ -237,7 +237,8 @@ fn run_wasm_run(args: &[String]) -> ExitCode {
          print_int:(n)=>{{process.stdout.write(String(n));\
          process.stdout.write('\\n');}},\
          print_bool:(b)=>{{process.stdout.write(b?'true':'false');\
-         process.stdout.write('\\n');}}}}}};\
+         process.stdout.write('\\n');}},\
+         exp:Math.exp}}}};\
          try{{const b=fs.readFileSync({:?});\
          WebAssembly.instantiate(b,imp).then(r=>{{\
          try{{const ex=r.instance.exports;memref=ex.memory;\

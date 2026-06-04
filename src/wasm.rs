@@ -64,6 +64,10 @@ enum WType {
     F64, // Aria Float (unboxed IEEE-754 double)
     Ref, // pointer into linear memory (i32 address) — Phase 2b ADT cell
     Str, // pointer into linear memory (i32 address) — Phase 2d String object
+    Tensor, // pointer into linear memory (i32 address) — Phase 2f Tensor object
+    F32, // INTERNAL ONLY: a scalar f32 used for Tensor-helper locals/scratch.
+         // No Aria value ever has this type (Tensor data is f32 but is read out
+         // as f64); it exists purely so helper bodies can declare f32 locals.
 }
 
 impl WType {
@@ -73,7 +77,8 @@ impl WType {
         match self {
             WType::I64 => 0x7E,
             WType::F64 => 0x7C,
-            WType::I32 | WType::Ref | WType::Str => 0x7F,
+            WType::F32 => 0x7D,
+            WType::I32 | WType::Ref | WType::Str | WType::Tensor => 0x7F,
         }
     }
 
@@ -87,6 +92,10 @@ impl WType {
             Ty::Float => Ok(WType::F64),
             // An immutable, reference-counted heap String (Phase 2d).
             Ty::Str => Ok(WType::Str),
+            // The opaque, reference-counted heap Tensor (Phase 2f). It is the
+            // builtin ADT name `Tensor`; distinguish it before the generic
+            // named-ADT case so it gets its own heap object kind.
+            Ty::Named(n, args) if n == "Tensor" && args.is_empty() => Ok(WType::Tensor),
             // A named ADT becomes a heap reference. (Generics — args present —
             // are out of the 2b subset and rejected below.)
             Ty::Named(_, args) if args.is_empty() => Ok(WType::Ref),
@@ -173,6 +182,15 @@ impl CtorTable {
                         .map(WType::from_ty)
                         .collect::<Result<Vec<_>, _>>()
                         .map_err(|e| format!("type `{}` ctor `{}`: {}", t.name, v.name, e))?;
+                    // A Tensor field inside an ADT cell is outside the subset:
+                    // __drop has no per-tag knowledge to release Tensor children,
+                    // so it would leak. Reject cleanly (never a panic).
+                    if field_types.contains(&WType::Tensor) {
+                        return Err(format!(
+                            "wasm backend: type `{}` ctor `{}` has a Tensor field (outside the subset)",
+                            t.name, v.name
+                        ));
+                    }
                     max_arity = max_arity.max(field_types.len());
                     by_name.insert(v.name.clone(), CtorInfo { tag, field_types });
                     tag += 1;
@@ -248,6 +266,40 @@ const STR_HEADER: u64 = 16; // rc(8) + len(8)
 /// just not reclaimed). Covers strings up to ~`(STR_MAX_CLASS*8 - 8)` bytes.
 const STR_MAX_CLASS: u64 = 64;
 
+// ---- Tensor heap objects (Phase 2f) -------------------------------------
+//
+// A Tensor is an opaque, reference-counted heap object, distinct from ADT
+// cells and Strings. It mirrors the interpreter's `crate::tensor::Tensor`
+// (row-major, f32 storage). Layout at pointer `p`:
+//   [p+0]   rc    (i64)
+//   [p+8]   rows  (i64)
+//   [p+16]  cols  (i64)
+//   [p+24 .. p+24+4*rows*cols]  row-major f32 elements
+// We store f32 (not f64) so `tensor_get` reproduces the interpreter's exact
+// stored precision (it does `*v as f32` on set and `t.at(..) as f64` on get).
+//
+// A Tensor has no Ref/Str/Tensor children, so dropping it at rc 0 just frees
+// it (decrementing `__live`). Distinguishing Tensors from ADT cells / Strings
+// in drop: like Strings, Tensors get their OWN runtime helpers
+// `__alloc_tensor`/`__drop_tensor`. The backend knows statically (from the AST
+// type) whether a value is a Tensor (`WType::Tensor`) and calls the matching
+// dup/drop (a Tensor reuses `__dup_str`'s rc-bump shape via `DupStr`-like code,
+// but for clarity gets its own helpers).
+//
+// Allocation: a Tensor is variable-size. `__alloc_tensor(rows, cols)` rounds
+// the total object size (24 + 4*rows*cols) up to an 8-byte boundary, computes a
+// size class = (rounded_total - CELL_HEADER) / SLOT, clamps it to
+// TENSOR_MAX_CLASS, and reuses the segregated `__alloc`/`__free` machinery on
+// that class — so Tensor allocs/frees flow through the SAME bump + free-list
+// allocator and the SAME `__live` counter (garbage-free invariant intact).
+const TENSOR_HEADER: u64 = 24; // rc(8) + rows(8) + cols(8)
+
+/// Largest Tensor size class that gets an exact-size free-list bucket. The
+/// free-list array is sized to `max(max_arity, STR_MAX_CLASS, TENSOR_MAX_CLASS)
+/// + 1`. A Tensor whose class exceeds this is bump-allocated and, on free,
+/// decrements `__live` but is not bucketed (still garbage-free by `__live`).
+const TENSOR_MAX_CLASS: u64 = 256;
+
 /// The emitted checked-arithmetic helper functions. Each detects signed-i64
 /// overflow and executes `unreachable` (a wasm trap) on overflow; otherwise it
 /// returns the wrapped result. They are appended to the module after all user
@@ -308,10 +360,25 @@ enum HeapHelper {
     StrLit,   // (data_addr:i32, len:i32) -> ptr:i32   alloc + copy a literal
     // ---- structural ADT equality (Phase 2e) ----
     Eq, // (a:i32, b:i32) -> i32   recursive structural ADT equality (1/0)
+    // ---- Tensor runtime (Phase 2f) ----
+    AllocTensor, // (rows:i32, cols:i32) -> ptr:i32  alloc a Tensor (rc=1, hdr set, data uninit)
+    DupTensor,   // (ptr:i32) -> i32   rc++ on a Tensor
+    DropTensor,  // (ptr:i32) -> i32   rc--; free at 0 (no children)
+    TensorZeros, // (rows:i64, cols:i64) -> ptr:i32  zeroed Tensor (traps on negative/overflow)
+    TensorSet,   // (t:i32, r:i64, c:i64, v:f64) -> ptr:i32  clone + write one element
+    TensorGet,   // (t:i32, r:i64, c:i64) -> f64   read one element (traps OOB), consumes t
+    TensorRows,  // (t:i32) -> i64    rows header, consumes t
+    TensorCols,  // (t:i32) -> i64    cols header, consumes t
+    Matmul,      // (a:i32, b:i32) -> ptr:i32   matrix multiply, consumes a and b (traps on shape)
+    Transpose,   // (t:i32) -> ptr:i32   2D transpose, consumes t
+    Relu,        // (t:i32) -> ptr:i32   elementwise relu, consumes t
+    Softmax,     // (t:i32) -> ptr:i32   row-wise softmax (uses env.exp), consumes t
+    EmbedSim,    // (a:i32, b:i32) -> f64  embed_similarity, consumes both Strings
+    HashEmbed,   // (s:i32, vec_addr:i32) -> () write a dim-64 normalized embedding to vec_addr
 }
 
 impl HeapHelper {
-    const ALL: [HeapHelper; 15] = [
+    const ALL: [HeapHelper; 29] = [
         HeapHelper::Alloc,
         HeapHelper::Free,
         HeapHelper::Dup,
@@ -327,6 +394,20 @@ impl HeapHelper {
         HeapHelper::StrEq,
         HeapHelper::StrLit,
         HeapHelper::Eq,
+        HeapHelper::AllocTensor,
+        HeapHelper::DupTensor,
+        HeapHelper::DropTensor,
+        HeapHelper::TensorZeros,
+        HeapHelper::TensorSet,
+        HeapHelper::TensorGet,
+        HeapHelper::TensorRows,
+        HeapHelper::TensorCols,
+        HeapHelper::Matmul,
+        HeapHelper::Transpose,
+        HeapHelper::Relu,
+        HeapHelper::Softmax,
+        HeapHelper::EmbedSim,
+        HeapHelper::HashEmbed,
     ];
 
     fn offset(self) -> u32 {
@@ -346,6 +427,20 @@ impl HeapHelper {
             HeapHelper::StrEq => 12,
             HeapHelper::StrLit => 13,
             HeapHelper::Eq => 14,
+            HeapHelper::AllocTensor => 15,
+            HeapHelper::DupTensor => 16,
+            HeapHelper::DropTensor => 17,
+            HeapHelper::TensorZeros => 18,
+            HeapHelper::TensorSet => 19,
+            HeapHelper::TensorGet => 20,
+            HeapHelper::TensorRows => 21,
+            HeapHelper::TensorCols => 22,
+            HeapHelper::Matmul => 23,
+            HeapHelper::Transpose => 24,
+            HeapHelper::Relu => 25,
+            HeapHelper::Softmax => 26,
+            HeapHelper::EmbedSim => 27,
+            HeapHelper::HashEmbed => 28,
         }
     }
 
@@ -369,6 +464,22 @@ impl HeapHelper {
             HeapHelper::StrEq => (vec![WType::I32, WType::I32], WType::I32),
             HeapHelper::StrLit => (vec![WType::I32, WType::I32], WType::I32),
             HeapHelper::Eq => (vec![WType::I32, WType::I32], WType::I32),
+            HeapHelper::AllocTensor => (vec![WType::I32, WType::I32], WType::I32),
+            HeapHelper::DupTensor => (vec![WType::I32], WType::I32),
+            HeapHelper::DropTensor => (vec![WType::I32], WType::I32),
+            HeapHelper::TensorZeros => (vec![WType::I64, WType::I64], WType::I32),
+            HeapHelper::TensorSet => {
+                (vec![WType::I32, WType::I64, WType::I64, WType::F64], WType::I32)
+            }
+            HeapHelper::TensorGet => (vec![WType::I32, WType::I64, WType::I64], WType::F64),
+            HeapHelper::TensorRows => (vec![WType::I32], WType::I64),
+            HeapHelper::TensorCols => (vec![WType::I32], WType::I64),
+            HeapHelper::Matmul => (vec![WType::I32, WType::I32], WType::I32),
+            HeapHelper::Transpose => (vec![WType::I32], WType::I32),
+            HeapHelper::Relu => (vec![WType::I32], WType::I32),
+            HeapHelper::Softmax => (vec![WType::I32], WType::I32),
+            HeapHelper::EmbedSim => (vec![WType::I32, WType::I32], WType::F64),
+            HeapHelper::HashEmbed => (vec![WType::I32, WType::I32], WType::I32),
         }
     }
 }
@@ -434,6 +545,20 @@ fn f64_store(offset: u64, out: &mut Vec<u8>) {
 fn f64_load(offset: u64, out: &mut Vec<u8>) {
     out.push(0x2B); // f64.load
     leb_u(3, out);
+    leb_u(offset, out);
+}
+
+/// `f32.store` with the given byte offset (2 = align 2^2 = 4 bytes).
+fn f32_store(offset: u64, out: &mut Vec<u8>) {
+    out.push(0x38); // f32.store
+    leb_u(2, out);
+    leb_u(offset, out);
+}
+
+/// `f32.load` with the given byte offset (align 2^2 = 4 bytes).
+fn f32_load(offset: u64, out: &mut Vec<u8>) {
+    out.push(0x2A); // f32.load
+    leb_u(2, out);
     leb_u(offset, out);
 }
 
@@ -510,6 +635,9 @@ struct LocalEnv<'a> {
     print_int_idx: u32,
     /// Wasm function index of the imported `env.print_bool` (always 3).
     print_bool_idx: u32,
+    /// Wasm function index of the imported `env.exp` (always 4); used by the
+    /// Tensor `softmax` helper for a libm-faithful `exp`.
+    exp_idx: u32,
 }
 
 impl<'a> LocalEnv<'a> {
@@ -598,6 +726,9 @@ fn bind_type(bind: &Bind, env: &LocalEnv) -> Result<WType, String> {
             if is_str_builtin(name) {
                 return Ok(str_builtin_ret(name));
             }
+            if let Some(ret) = tensor_builtin_ret(name) {
+                return Ok(ret);
+            }
             let sig = env
                 .sigs
                 .get(name)
@@ -684,6 +815,7 @@ fn match_type(scrut: &Atom, arms: &[ir::IArm], env: &LocalEnv) -> Result<WType, 
             print_float_idx: env.print_float_idx,
             print_int_idx: env.print_int_idx,
             print_bool_idx: env.print_bool_idx,
+            exp_idx: env.exp_idx,
         };
         let at = iexpr_type(&arm.body, &probe)?;
         match result {
@@ -741,6 +873,7 @@ fn iexpr_type(e: &IExpr, env: &LocalEnv) -> Result<WType, String> {
             print_float_idx: env.print_float_idx,
             print_int_idx: env.print_int_idx,
             print_bool_idx: env.print_bool_idx,
+            exp_idx: env.exp_idx,
             };
             iexpr_type(body, &probe)
         }
@@ -765,6 +898,7 @@ fn iexpr_type(e: &IExpr, env: &LocalEnv) -> Result<WType, String> {
             print_float_idx: env.print_float_idx,
             print_int_idx: env.print_int_idx,
             print_bool_idx: env.print_bool_idx,
+            exp_idx: env.exp_idx,
             };
             iexpr_type(body, &probe)
         }
@@ -888,7 +1022,7 @@ fn emit_bind(bind: &Bind, env: &mut LocalEnv, code: &mut Vec<u8>) -> Result<WTyp
                         code.push(0x9A); // f64.neg
                         Ok(WType::F64)
                     }
-                    WType::I32 | WType::Ref | WType::Str => {
+                    WType::I32 | WType::Ref | WType::Str | WType::Tensor | WType::F32 => {
                         Err("wasm backend: numeric negation requires an Int or Float".into())
                     }
                 }
@@ -907,6 +1041,11 @@ fn emit_bind(bind: &Bind, env: &mut LocalEnv, code: &mut Vec<u8>) -> Result<WTyp
             // arguments, matching the rc pass's "Call args are consumed" rule).
             if is_str_builtin(name) {
                 return emit_str_builtin(name, args, env, code);
+            }
+            // Tensor / embedding builtins are emitted as calls into the heap
+            // helpers (they consume their heap arguments, matching the rc pass).
+            if tensor_builtin_ret(name).is_some() {
+                return emit_tensor_builtin(name, args, env, code);
             }
             let sig_ret;
             let sig_params;
@@ -1027,10 +1166,12 @@ fn emit_store_cell_fields(
         match fty {
             WType::F64 => f64_store(off, code),
             WType::I64 => i64_store(off, code),
-            WType::I32 | WType::Ref | WType::Str => {
+            WType::I32 | WType::Ref | WType::Str | WType::Tensor => {
                 code.push(0xAD); // i64.extend_i32_u
                 i64_store(off, code);
             }
+            // F32 is an internal helper-local type, never an ADT field.
+            WType::F32 => unreachable!("F32 is not an Aria field type"),
         }
     }
     Ok(())
@@ -1171,6 +1312,90 @@ fn emit_str_builtin(
         }
         _ => Err(format!("wasm backend: unknown string builtin `{}`", name)),
     }
+}
+
+/// The Tensor / embedding builtins the wasm backend implements (Phase 2f).
+/// Returns the wasm result type of `name`, or `None` if it is not one of them.
+/// The codec builtins (`compressed_size`, `neural_bits_per_byte`) are
+/// intentionally NOT here — they remain a clean Err (deferred).
+fn tensor_builtin_ret(name: &str) -> Option<WType> {
+    Some(match name {
+        "tensor_zeros" | "tensor_set" | "matmul" | "transpose" | "softmax" | "relu" => {
+            WType::Tensor
+        }
+        "tensor_get" | "embed_similarity" => WType::F64,
+        "tensor_rows" | "tensor_cols" => WType::I64,
+        _ => return None,
+    })
+}
+
+/// Emit a Tensor / embedding builtin call. Each maps to one heap helper that
+/// CONSUMES its heap arguments (Tensor/String pointers), matching the rc pass's
+/// "Call arguments are consumed" rule, so no separate drop is emitted here.
+fn emit_tensor_builtin(
+    name: &str,
+    args: &[Atom],
+    env: &mut LocalEnv,
+    code: &mut Vec<u8>,
+) -> Result<WType, String> {
+    // Helper: push every argument atom, checking its expected wasm type.
+    let push_args = |env: &mut LocalEnv, code: &mut Vec<u8>, expect: &[WType]| -> Result<(), String> {
+        if args.len() != expect.len() {
+            return Err(format!(
+                "wasm backend: `{}` expects {} args, got {}",
+                name,
+                expect.len(),
+                args.len()
+            ));
+        }
+        for (a, want) in args.iter().zip(expect.iter()) {
+            let got = emit_atom(a, env, code)?;
+            if got != *want {
+                return Err(format!(
+                    "wasm backend: `{}` arg type mismatch (got {:?}, expected {:?})",
+                    name, got, want
+                ));
+            }
+        }
+        Ok(())
+    };
+    let (expect, helper, ret): (Vec<WType>, HeapHelper, WType) = match name {
+        "tensor_zeros" => (
+            vec![WType::I64, WType::I64],
+            HeapHelper::TensorZeros,
+            WType::Tensor,
+        ),
+        "tensor_set" => (
+            vec![WType::Tensor, WType::I64, WType::I64, WType::F64],
+            HeapHelper::TensorSet,
+            WType::Tensor,
+        ),
+        "tensor_get" => (
+            vec![WType::Tensor, WType::I64, WType::I64],
+            HeapHelper::TensorGet,
+            WType::F64,
+        ),
+        "tensor_rows" => (vec![WType::Tensor], HeapHelper::TensorRows, WType::I64),
+        "tensor_cols" => (vec![WType::Tensor], HeapHelper::TensorCols, WType::I64),
+        "matmul" => (
+            vec![WType::Tensor, WType::Tensor],
+            HeapHelper::Matmul,
+            WType::Tensor,
+        ),
+        "transpose" => (vec![WType::Tensor], HeapHelper::Transpose, WType::Tensor),
+        "relu" => (vec![WType::Tensor], HeapHelper::Relu, WType::Tensor),
+        "softmax" => (vec![WType::Tensor], HeapHelper::Softmax, WType::Tensor),
+        "embed_similarity" => (
+            vec![WType::Str, WType::Str],
+            HeapHelper::EmbedSim,
+            WType::F64,
+        ),
+        _ => return Err(format!("wasm backend: unknown tensor builtin `{}`", name)),
+    };
+    push_args(env, code, &expect)?;
+    code.push(0x10); // call helper
+    leb_u(env.heap_index(helper) as u64, code);
+    Ok(ret)
 }
 
 /// Emit a String `==` / `!=`. Both operands are evaluated into fresh i32 temps
@@ -1452,10 +1677,11 @@ fn emit_arm_body(
                 match fty {
                     WType::F64 => f64_load(off, code),
                     WType::I64 => i64_load(off, code),
-                    WType::I32 | WType::Ref | WType::Str => {
+                    WType::I32 | WType::Ref | WType::Str | WType::Tensor => {
                         i64_load(off, code);
                         code.push(0xA7); // i32.wrap_i64
                     }
+                    WType::F32 => unreachable!("F32 is not an Aria field type"),
                 }
                 code.push(0x21); // local.set slot
                 leb_u(slot as u64, code);
@@ -1564,6 +1790,14 @@ fn emit_prim(op: BinOp, lt: WType, rt: WType, code: &mut Vec<u8>) -> Result<WTyp
                         "wasm backend: structural `==`/`!=` on ADTs is outside the 2b subset".into(),
                     )
                 }
+                // Tensor structural `==` would need an elementwise compare;
+                // outside the wasm subset (clean Err, never a panic).
+                WType::Tensor => {
+                    return Err(
+                        "wasm backend: `==`/`!=` on Tensor is outside the wasm subset".into(),
+                    )
+                }
+                WType::F32 => unreachable!("F32 is not an Aria value type"),
             }
             Ok(WType::I32)
         }
@@ -1594,39 +1828,35 @@ fn emit_iexpr(e: &IExpr, env: &mut LocalEnv, code: &mut Vec<u8>) -> Result<WType
         }
         IExpr::Dup(v, body) => {
             // dup is a no-op on unboxed values; ADT cells use `__dup`, Strings
-            // use `__dup_str` (both just bump the rc word at [ptr+0]).
-            match env.var_type(v)? {
-                WType::Ref | WType::Str => {
-                    let h = if env.var_type(v)? == WType::Str {
-                        HeapHelper::DupStr
-                    } else {
-                        HeapHelper::Dup
-                    };
-                    code.push(0x20); // local.get v
-                    leb_u(env.var_index(v)? as u64, code);
-                    code.push(0x10); // call __dup / __dup_str
-                    leb_u(env.heap_index(h) as u64, code);
-                    code.push(0x1A); // drop the dummy i32 result
-                }
-                _ => {}
+            // `__dup_str`, Tensors `__dup_tensor` (all bump the rc at [ptr+0]).
+            let h = match env.var_type(v)? {
+                WType::Ref => Some(HeapHelper::Dup),
+                WType::Str => Some(HeapHelper::DupStr),
+                WType::Tensor => Some(HeapHelper::DupTensor),
+                _ => None,
+            };
+            if let Some(h) = h {
+                code.push(0x20); // local.get v
+                leb_u(env.var_index(v)? as u64, code);
+                code.push(0x10); // call __dup / __dup_str / __dup_tensor
+                leb_u(env.heap_index(h) as u64, code);
+                code.push(0x1A); // drop the dummy i32 result
             }
             emit_iexpr(body, env, code)
         }
         IExpr::Drop(v, body) => {
-            match env.var_type(v)? {
-                WType::Ref | WType::Str => {
-                    let h = if env.var_type(v)? == WType::Str {
-                        HeapHelper::DropStr
-                    } else {
-                        HeapHelper::Drop
-                    };
-                    code.push(0x20); // local.get v
-                    leb_u(env.var_index(v)? as u64, code);
-                    code.push(0x10); // call __drop / __drop_str
-                    leb_u(env.heap_index(h) as u64, code);
-                    code.push(0x1A); // drop the dummy i32 result
-                }
-                _ => {}
+            let h = match env.var_type(v)? {
+                WType::Ref => Some(HeapHelper::Drop),
+                WType::Str => Some(HeapHelper::DropStr),
+                WType::Tensor => Some(HeapHelper::DropTensor),
+                _ => None,
+            };
+            if let Some(h) = h {
+                code.push(0x20); // local.get v
+                leb_u(env.var_index(v)? as u64, code);
+                code.push(0x10); // call __drop / __drop_str / __drop_tensor
+                leb_u(env.heap_index(h) as u64, code);
+                code.push(0x1A); // drop the dummy i32 result
             }
             emit_iexpr(body, env, code)
         }
@@ -1876,7 +2106,13 @@ fn helper_entry(extra_locals: &[WType], mut body: Vec<u8>) -> Vec<u8> {
 /// Emit one heap-runtime helper's code-section entry. `heap_base` is the wasm
 /// function index of `HeapHelper::Alloc`; the helpers call each other through
 /// it. The per-tag Ref-field knowledge in `__drop` is compiled in from `ctors`.
-fn emit_heap_helper(h: HeapHelper, ctors: &CtorTable, heap_base: u32) -> Vec<u8> {
+fn emit_heap_helper(
+    h: HeapHelper,
+    ctors: &CtorTable,
+    heap_base: u32,
+    exp_idx: u32,
+    embed_scratch: u64,
+) -> Vec<u8> {
     const LOCAL_GET: u8 = 0x20;
     const LOCAL_SET: u8 = 0x21;
     const LOCAL_TEE: u8 = 0x22;
@@ -1906,6 +2142,9 @@ fn emit_heap_helper(h: HeapHelper, ctors: &CtorTable, heap_base: u32) -> Vec<u8>
     let alloc_str_idx = heap_base + HeapHelper::AllocStr.offset();
     let streq_idx = heap_base + HeapHelper::StrEq.offset();
     let eq_idx = heap_base + HeapHelper::Eq.offset();
+    let alloc_tensor_idx = heap_base + HeapHelper::AllocTensor.offset();
+    let drop_tensor_idx = heap_base + HeapHelper::DropTensor.offset();
+    let hash_embed_idx = heap_base + HeapHelper::HashEmbed.offset();
 
     let mut body: Vec<u8> = Vec::new();
     match h {
@@ -2784,6 +3023,14 @@ fn emit_heap_helper(h: HeapHelper, ctors: &CtorTable, heap_base: u32) -> Vec<u8>
                             body.push(CALL);
                             leb_u(eq_idx as u64, &mut body);
                         }
+                        // Tensor fields are rejected from ADTs (CtorTable::build),
+                        // so this arm is unreachable; emit a constant-true to keep
+                        // the match exhaustive without affecting any real program.
+                        WType::Tensor => {
+                            body.push(I32_CONST);
+                            leb_s(1, &mut body);
+                        }
+                        WType::F32 => unreachable!("F32 is not an Aria field type"),
                     }
                     body.push(I32_AND); // fold into the accumulator
                 }
@@ -2794,6 +3041,1389 @@ fn emit_heap_helper(h: HeapHelper, ctors: &CtorTable, heap_base: u32) -> Vec<u8>
             body.push(I32_CONST);
             leb_s(0, &mut body);
             helper_entry(&[], body)
+        }
+
+        // ---- Tensor runtime (Phase 2f) ----------------------------------
+        HeapHelper::AllocTensor => {
+            // (rows:i32, cols:i32) -> ptr:i32. Alloc a Tensor object (rc=1,
+            // header set, data UNINITIALIZED). cls = round8(24 + 4*rows*cols)
+            // reduced to a free-list size class, clamped to TENSOR_MAX_CLASS.
+            // Locals: n(2,i32), cls(3,i32), ptr(4,i32).
+            // n = rows * cols
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body);
+            body.push(I32_MUL);
+            body.push(LOCAL_SET);
+            leb_u(2, &mut body); // n
+            // cls = ((TENSOR_HEADER + 4*n + 7) & ~7 - CELL_HEADER) / SLOT
+            body.push(I32_CONST);
+            leb_s(TENSOR_HEADER as i64, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body); // n
+            body.push(I32_CONST);
+            leb_s(4, &mut body);
+            body.push(I32_MUL); // 4*n
+            body.push(I32_ADD); // 24 + 4n
+            body.push(I32_CONST);
+            leb_s(7, &mut body);
+            body.push(I32_ADD);
+            body.push(I32_CONST);
+            leb_s(-8, &mut body);
+            body.push(0x71); // i32.and -> rounded total
+            body.push(I32_CONST);
+            leb_s(CELL_HEADER as i64, &mut body);
+            body.push(I32_SUB);
+            body.push(I32_CONST);
+            leb_s(SLOT as i64, &mut body);
+            body.push(0x6E); // i32.div_u -> size class
+            body.push(LOCAL_TEE);
+            leb_u(3, &mut body); // cls
+            // clamp to TENSOR_MAX_CLASS
+            body.push(I32_CONST);
+            leb_s(TENSOR_MAX_CLASS as i64, &mut body);
+            body.push(0x4B); // i32.gt_u
+            body.push(IF);
+            body.push(BT_VOID);
+            body.push(I32_CONST);
+            leb_s(TENSOR_MAX_CLASS as i64, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(3, &mut body);
+            body.push(END);
+            // ptr = __alloc(cls)
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            body.push(CALL);
+            leb_u(alloc_idx as u64, &mut body);
+            body.push(LOCAL_TEE);
+            leb_u(4, &mut body); // ptr
+            // store rows at [ptr+8]
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(I64_EXTEND_I32_U);
+            i64_store(8, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body); // ptr (addr for cols)
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body);
+            body.push(I64_EXTEND_I32_U);
+            i64_store(16, &mut body);
+            // return ptr
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body);
+            helper_entry(&[WType::I32, WType::I32, WType::I32], body)
+        }
+        HeapHelper::DupTensor => {
+            // (ptr:i32) -> i32. rc++.
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(0, &mut body);
+            body.push(I64_CONST);
+            leb_s(1, &mut body);
+            body.push(I64_ADD);
+            i64_store(0, &mut body);
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            helper_entry(&[], body)
+        }
+        HeapHelper::DropTensor => {
+            // (ptr:i32) -> i32. rc--; at 0, free with the class recomputed from
+            // rows*cols. Locals: rc(1,i64), cls(2,i32).
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(0, &mut body);
+            body.push(I64_CONST);
+            leb_s(1, &mut body);
+            body.push(I64_SUB);
+            body.push(LOCAL_TEE);
+            leb_u(1, &mut body); // rc
+            i64_store(0, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body);
+            body.push(I64_EQZ);
+            body.push(IF);
+            body.push(BT_VOID);
+            // cls from rows*cols (i64 -> i32)
+            body.push(I32_CONST);
+            leb_s(TENSOR_HEADER as i64, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(8, &mut body); // rows
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(16, &mut body); // cols
+            body.push(0x7E); // i64.mul
+            body.push(I32_WRAP_I64); // n (i32)
+            body.push(I32_CONST);
+            leb_s(4, &mut body);
+            body.push(I32_MUL);
+            body.push(I32_ADD); // 24 + 4n
+            body.push(I32_CONST);
+            leb_s(7, &mut body);
+            body.push(I32_ADD);
+            body.push(I32_CONST);
+            leb_s(-8, &mut body);
+            body.push(0x71); // i32.and
+            body.push(I32_CONST);
+            leb_s(CELL_HEADER as i64, &mut body);
+            body.push(I32_SUB);
+            body.push(I32_CONST);
+            leb_s(SLOT as i64, &mut body);
+            body.push(0x6E); // i32.div_u
+            body.push(LOCAL_TEE);
+            leb_u(2, &mut body); // cls
+            body.push(I32_CONST);
+            leb_s(TENSOR_MAX_CLASS as i64, &mut body);
+            body.push(0x4B); // i32.gt_u
+            body.push(IF);
+            body.push(BT_VOID);
+            body.push(I32_CONST);
+            leb_s(TENSOR_MAX_CLASS as i64, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(2, &mut body);
+            body.push(END);
+            // __free(ptr, cls)
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body);
+            body.push(CALL);
+            leb_u(free_idx as u64, &mut body);
+            body.push(DROP);
+            body.push(END); // end if rc==0
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            helper_entry(&[WType::I64, WType::I32], body)
+        }
+        HeapHelper::TensorZeros => {
+            // (rows:i64, cols:i64) -> ptr:i32. Trap (unreachable) on negative
+            // dims or an element count exceeding the interpreter's cap; else
+            // alloc and zero the data. Locals: n(2,i64), ptr(3,i32), i(4,i32).
+            const MAX_TENSOR_ELEMS: i64 = 64 * 1024 * 1024;
+            // if rows < 0 || cols < 0 -> trap
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(I64_CONST);
+            leb_s(0, &mut body);
+            body.push(0x53); // i64.lt_s
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body);
+            body.push(I64_CONST);
+            leb_s(0, &mut body);
+            body.push(0x53); // i64.lt_s
+            body.push(0x72); // i32.or
+            body.push(IF);
+            body.push(BT_VOID);
+            body.push(0x00); // unreachable
+            body.push(END);
+            // n = rows * cols (i64). The interpreter caps n at 64M, well below
+            // i64 overflow for non-negative dims that each fit usize, so a plain
+            // i64.mul then a magnitude check matches its behavior.
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body);
+            body.push(0x7E); // i64.mul
+            body.push(LOCAL_TEE);
+            leb_u(2, &mut body); // n
+            // if n > MAX -> trap (also catches negative wrap from huge dims)
+            body.push(I64_CONST);
+            leb_s(MAX_TENSOR_ELEMS, &mut body);
+            body.push(0x55); // i64.gt_s
+            body.push(IF);
+            body.push(BT_VOID);
+            body.push(0x00); // unreachable
+            body.push(END);
+            // ptr = __alloc_tensor(wrap rows, wrap cols)
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(I32_WRAP_I64);
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body);
+            body.push(I32_WRAP_I64);
+            body.push(CALL);
+            leb_u(alloc_tensor_idx as u64, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(3, &mut body); // ptr
+            // zero the data: i = 0; while i < n { f32.store [ptr+24+4*i] = 0 }
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(4, &mut body); // i
+            body.push(0x03); // loop
+            body.push(BT_VOID);
+            // if i < (i32)n
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body);
+            body.push(I32_WRAP_I64); // (i32)n
+            body.push(0x48); // i32.lt_s
+            body.push(IF);
+            body.push(BT_VOID);
+            // addr = ptr + 24 + 4*i
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body);
+            body.push(I32_CONST);
+            leb_s(4, &mut body);
+            body.push(I32_MUL);
+            body.push(I32_ADD);
+            // value 0.0f32
+            body.push(0x43); // f32.const
+            body.extend_from_slice(&0.0f32.to_le_bytes());
+            f32_store(TENSOR_HEADER, &mut body);
+            // i++
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body);
+            body.push(I32_CONST);
+            leb_s(1, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_SET);
+            leb_u(4, &mut body);
+            body.push(0x0C); // br loop
+            leb_u(1, &mut body);
+            body.push(END); // end if
+            body.push(END); // end loop
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body); // return ptr
+            helper_entry(&[WType::I64, WType::I32, WType::I32], body)
+        }
+        HeapHelper::TensorSet => {
+            // (t:i32, r:i64, c:i64, v:f64) -> ptr:i32. Pure/immutable: CLONE t
+            // (a fresh tensor with the same shape + copied data), then write one
+            // element; trap on an out-of-range index (the interpreter errors).
+            // Consumes t (drops it after copying). Locals: rows(4,i64),
+            // cols(4?)... use: rows(4,i64), cols(5,i64), n(6,i32), out(7,i32),
+            // i(8,i32).
+            // rows = t.rows ; cols = t.cols
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(8, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(4, &mut body); // rows
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(16, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(5, &mut body); // cols
+            // bounds: if r<0 || c<0 || r>=rows || c>=cols -> trap
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body); // r
+            body.push(I64_CONST);
+            leb_s(0, &mut body);
+            body.push(0x53); // r < 0
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body); // c
+            body.push(I64_CONST);
+            leb_s(0, &mut body);
+            body.push(0x53); // c < 0
+            body.push(0x72); // or
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body); // r
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body); // rows
+            body.push(0x59); // r >= rows  (i64.ge_s)
+            body.push(0x72); // or
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body); // c
+            body.push(LOCAL_GET);
+            leb_u(5, &mut body); // cols
+            body.push(0x59); // c >= cols
+            body.push(0x72); // or
+            body.push(IF);
+            body.push(BT_VOID);
+            body.push(0x00); // unreachable
+            body.push(END);
+            // out = __alloc_tensor(rows, cols)
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body);
+            body.push(I32_WRAP_I64);
+            body.push(LOCAL_GET);
+            leb_u(5, &mut body);
+            body.push(I32_WRAP_I64);
+            body.push(CALL);
+            leb_u(alloc_tensor_idx as u64, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(7, &mut body); // out
+            // n = rows*cols (i32)
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(5, &mut body);
+            body.push(0x7E); // i64.mul
+            body.push(I32_WRAP_I64);
+            body.push(LOCAL_SET);
+            leb_u(6, &mut body); // n
+            // copy data: i=0; while i<n { out[24+4i] = t[24+4i] } (raw 4-byte)
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(8, &mut body); // i
+            body.push(0x03); // loop
+            body.push(BT_VOID);
+            body.push(LOCAL_GET);
+            leb_u(8, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(6, &mut body);
+            body.push(0x48); // i32.lt_s
+            body.push(IF);
+            body.push(BT_VOID);
+            // out + 4*i  (addr), then load t's f32 and store
+            body.push(LOCAL_GET);
+            leb_u(7, &mut body); // out
+            body.push(LOCAL_GET);
+            leb_u(8, &mut body);
+            body.push(I32_CONST);
+            leb_s(4, &mut body);
+            body.push(I32_MUL);
+            body.push(I32_ADD);
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body); // t
+            body.push(LOCAL_GET);
+            leb_u(8, &mut body);
+            body.push(I32_CONST);
+            leb_s(4, &mut body);
+            body.push(I32_MUL);
+            body.push(I32_ADD);
+            f32_load(TENSOR_HEADER, &mut body); // t[24+4i]
+            f32_store(TENSOR_HEADER, &mut body); // out[24+4i]
+            body.push(LOCAL_GET);
+            leb_u(8, &mut body);
+            body.push(I32_CONST);
+            leb_s(1, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_SET);
+            leb_u(8, &mut body);
+            body.push(0x0C);
+            leb_u(1, &mut body);
+            body.push(END); // end if
+            body.push(END); // end loop
+            // write the element: out[24 + 4*(r*cols + c)] = (f32)v
+            body.push(LOCAL_GET);
+            leb_u(7, &mut body); // out
+            // offset = 4 * (r*cols + c)
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body); // r
+            body.push(LOCAL_GET);
+            leb_u(5, &mut body); // cols
+            body.push(0x7E); // i64.mul
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body); // c
+            body.push(I64_ADD);
+            body.push(I32_WRAP_I64);
+            body.push(I32_CONST);
+            leb_s(4, &mut body);
+            body.push(I32_MUL);
+            body.push(I32_ADD); // out + 4*idx
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body); // v (f64)
+            body.push(0xB6); // f32.demote_f64 -> (f32)v
+            f32_store(TENSOR_HEADER, &mut body);
+            // drop t (this builtin consumes it)
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(CALL);
+            leb_u(drop_tensor_idx as u64, &mut body);
+            body.push(DROP);
+            // return out
+            body.push(LOCAL_GET);
+            leb_u(7, &mut body);
+            helper_entry(
+                &[WType::I64, WType::I64, WType::I32, WType::I32, WType::I32],
+                body,
+            )
+        }
+        HeapHelper::TensorGet => {
+            // (t:i32, r:i64, c:i64) -> f64. Trap OOB; else load f32 -> f64.
+            // Consumes t (drops it after reading). Locals: rows(3,i64),
+            // cols(4,i64), val(5,f64).
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(8, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(3, &mut body); // rows
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(16, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(4, &mut body); // cols
+            // bounds check (same as set)
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body);
+            body.push(I64_CONST);
+            leb_s(0, &mut body);
+            body.push(0x53);
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body);
+            body.push(I64_CONST);
+            leb_s(0, &mut body);
+            body.push(0x53);
+            body.push(0x72);
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            body.push(0x59);
+            body.push(0x72);
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body);
+            body.push(0x59);
+            body.push(0x72);
+            body.push(IF);
+            body.push(BT_VOID);
+            body.push(0x00); // unreachable
+            body.push(END);
+            // val = (f64) t[24 + 4*(r*cols + c)]
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body); // t
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body); // r
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body); // cols
+            body.push(0x7E); // i64.mul
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body); // c
+            body.push(I64_ADD);
+            body.push(I32_WRAP_I64);
+            body.push(I32_CONST);
+            leb_s(4, &mut body);
+            body.push(I32_MUL);
+            body.push(I32_ADD);
+            f32_load(TENSOR_HEADER, &mut body);
+            body.push(0xBB); // f64.promote_f32
+            body.push(LOCAL_SET);
+            leb_u(5, &mut body); // val
+            // drop t
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(CALL);
+            leb_u(drop_tensor_idx as u64, &mut body);
+            body.push(DROP);
+            body.push(LOCAL_GET);
+            leb_u(5, &mut body); // return val
+            helper_entry(&[WType::I64, WType::I64, WType::F64], body)
+        }
+        HeapHelper::TensorRows | HeapHelper::TensorCols => {
+            // (t:i32) -> i64. Load the header word, then consume (drop) t.
+            // Local: out(1,i64).
+            let off = if h == HeapHelper::TensorRows { 8 } else { 16 };
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(off, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(1, &mut body); // out
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(CALL);
+            leb_u(drop_tensor_idx as u64, &mut body);
+            body.push(DROP);
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body);
+            helper_entry(&[WType::I64], body)
+        }
+        HeapHelper::Matmul => {
+            // (a:i32, b:i32) -> ptr:i32. (m,k) x (k,n) -> (m,n). Trap on shape
+            // mismatch (a.cols != b.rows). Accumulate in f32 to match the
+            // interpreter's f32 kernel. Consumes a and b. Locals:
+            // m(2,i32), k(3,i32), n(4,i32), out(5,i32), i(6,i32), j(7,i32),
+            // p(8,i32), acc(9,f32).
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(8, &mut body);
+            body.push(I32_WRAP_I64);
+            body.push(LOCAL_SET);
+            leb_u(2, &mut body); // m = a.rows
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(16, &mut body);
+            body.push(I32_WRAP_I64);
+            body.push(LOCAL_SET);
+            leb_u(3, &mut body); // k = a.cols
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body);
+            i64_load(16, &mut body);
+            body.push(I32_WRAP_I64);
+            body.push(LOCAL_SET);
+            leb_u(4, &mut body); // n = b.cols
+            // shape check: a.cols (k) != b.rows -> trap
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body); // k
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body);
+            i64_load(8, &mut body);
+            body.push(I32_WRAP_I64); // b.rows
+            body.push(I32_NE);
+            body.push(IF);
+            body.push(BT_VOID);
+            body.push(0x00); // unreachable
+            body.push(END);
+            // out = __alloc_tensor(m, n)
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body);
+            body.push(CALL);
+            leb_u(alloc_tensor_idx as u64, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(5, &mut body); // out
+            // for i in 0..m
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(6, &mut body); // i
+            body.push(0x03); // loop i
+            body.push(BT_VOID);
+            body.push(LOCAL_GET);
+            leb_u(6, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body); // m
+            body.push(0x48); // i32.lt_s
+            body.push(IF);
+            body.push(BT_VOID);
+            // for j in 0..n
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(7, &mut body); // j
+            body.push(0x03); // loop j
+            body.push(BT_VOID);
+            body.push(LOCAL_GET);
+            leb_u(7, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body); // n
+            body.push(0x48);
+            body.push(IF);
+            body.push(BT_VOID);
+            // acc = 0.0f32
+            body.push(0x43);
+            body.extend_from_slice(&0.0f32.to_le_bytes());
+            body.push(LOCAL_SET);
+            leb_u(9, &mut body); // acc
+            // for p in 0..k
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(8, &mut body); // p
+            body.push(0x03); // loop p
+            body.push(BT_VOID);
+            body.push(LOCAL_GET);
+            leb_u(8, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body); // k
+            body.push(0x48);
+            body.push(IF);
+            body.push(BT_VOID);
+            // acc += a[i*k+p] * b[p*n+j]
+            body.push(LOCAL_GET);
+            leb_u(9, &mut body); // acc
+            // a element: a + 4*(i*k + p)
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body); // a
+            body.push(LOCAL_GET);
+            leb_u(6, &mut body); // i
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body); // k
+            body.push(I32_MUL);
+            body.push(LOCAL_GET);
+            leb_u(8, &mut body); // p
+            body.push(I32_ADD);
+            body.push(I32_CONST);
+            leb_s(4, &mut body);
+            body.push(I32_MUL);
+            body.push(I32_ADD);
+            f32_load(TENSOR_HEADER, &mut body); // a[i*k+p]
+            // b element: b + 4*(p*n + j)
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body); // b
+            body.push(LOCAL_GET);
+            leb_u(8, &mut body); // p
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body); // n
+            body.push(I32_MUL);
+            body.push(LOCAL_GET);
+            leb_u(7, &mut body); // j
+            body.push(I32_ADD);
+            body.push(I32_CONST);
+            leb_s(4, &mut body);
+            body.push(I32_MUL);
+            body.push(I32_ADD);
+            f32_load(TENSOR_HEADER, &mut body); // b[p*n+j]
+            body.push(0x94); // f32.mul
+            body.push(0x92); // f32.add (acc + a*b)
+            body.push(LOCAL_SET);
+            leb_u(9, &mut body); // acc
+            // p++
+            body.push(LOCAL_GET);
+            leb_u(8, &mut body);
+            body.push(I32_CONST);
+            leb_s(1, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_SET);
+            leb_u(8, &mut body);
+            body.push(0x0C);
+            leb_u(1, &mut body); // continue loop p
+            body.push(END); // end if p<k
+            body.push(END); // end loop p
+            // out[i*n+j] = acc
+            body.push(LOCAL_GET);
+            leb_u(5, &mut body); // out
+            body.push(LOCAL_GET);
+            leb_u(6, &mut body); // i
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body); // n
+            body.push(I32_MUL);
+            body.push(LOCAL_GET);
+            leb_u(7, &mut body); // j
+            body.push(I32_ADD);
+            body.push(I32_CONST);
+            leb_s(4, &mut body);
+            body.push(I32_MUL);
+            body.push(I32_ADD);
+            body.push(LOCAL_GET);
+            leb_u(9, &mut body); // acc
+            f32_store(TENSOR_HEADER, &mut body);
+            // j++
+            body.push(LOCAL_GET);
+            leb_u(7, &mut body);
+            body.push(I32_CONST);
+            leb_s(1, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_SET);
+            leb_u(7, &mut body);
+            body.push(0x0C);
+            leb_u(1, &mut body); // continue loop j
+            body.push(END); // end if j<n
+            body.push(END); // end loop j
+            // i++
+            body.push(LOCAL_GET);
+            leb_u(6, &mut body);
+            body.push(I32_CONST);
+            leb_s(1, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_SET);
+            leb_u(6, &mut body);
+            body.push(0x0C);
+            leb_u(1, &mut body); // continue loop i
+            body.push(END); // end if i<m
+            body.push(END); // end loop i
+            // drop a, drop b
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(CALL);
+            leb_u(drop_tensor_idx as u64, &mut body);
+            body.push(DROP);
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body);
+            body.push(CALL);
+            leb_u(drop_tensor_idx as u64, &mut body);
+            body.push(DROP);
+            body.push(LOCAL_GET);
+            leb_u(5, &mut body); // return out
+            helper_entry(
+                &[
+                    WType::I32, // m (2)
+                    WType::I32, // k (3)
+                    WType::I32, // n (4)
+                    WType::I32, // out (5)
+                    WType::I32, // i (6)
+                    WType::I32, // j (7)
+                    WType::I32, // p (8)
+                    WType::F32, // acc (9)
+                ],
+                body,
+            )
+        }
+        HeapHelper::Transpose => {
+            // (t:i32) -> ptr:i32. out(n,m); out[j*m+i] = t[i*n+j]. Consumes t.
+            // Locals: m(1,i32), n(2,i32), out(3,i32), i(4,i32), j(5,i32).
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(8, &mut body);
+            body.push(I32_WRAP_I64);
+            body.push(LOCAL_SET);
+            leb_u(1, &mut body); // m
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(16, &mut body);
+            body.push(I32_WRAP_I64);
+            body.push(LOCAL_SET);
+            leb_u(2, &mut body); // n
+            // out = __alloc_tensor(n, m)
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body);
+            body.push(CALL);
+            leb_u(alloc_tensor_idx as u64, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(3, &mut body); // out
+            // for i in 0..m
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(4, &mut body);
+            body.push(0x03);
+            body.push(BT_VOID);
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body); // m
+            body.push(0x48);
+            body.push(IF);
+            body.push(BT_VOID);
+            // for j in 0..n
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(5, &mut body);
+            body.push(0x03);
+            body.push(BT_VOID);
+            body.push(LOCAL_GET);
+            leb_u(5, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body); // n
+            body.push(0x48);
+            body.push(IF);
+            body.push(BT_VOID);
+            // out[j*m+i] = t[i*n+j]
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body); // out
+            body.push(LOCAL_GET);
+            leb_u(5, &mut body); // j
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body); // m
+            body.push(I32_MUL);
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body); // i
+            body.push(I32_ADD);
+            body.push(I32_CONST);
+            leb_s(4, &mut body);
+            body.push(I32_MUL);
+            body.push(I32_ADD);
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body); // t
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body); // i
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body); // n
+            body.push(I32_MUL);
+            body.push(LOCAL_GET);
+            leb_u(5, &mut body); // j
+            body.push(I32_ADD);
+            body.push(I32_CONST);
+            leb_s(4, &mut body);
+            body.push(I32_MUL);
+            body.push(I32_ADD);
+            f32_load(TENSOR_HEADER, &mut body);
+            f32_store(TENSOR_HEADER, &mut body);
+            // j++
+            body.push(LOCAL_GET);
+            leb_u(5, &mut body);
+            body.push(I32_CONST);
+            leb_s(1, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_SET);
+            leb_u(5, &mut body);
+            body.push(0x0C);
+            leb_u(1, &mut body);
+            body.push(END);
+            body.push(END); // end loop j
+            // i++
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body);
+            body.push(I32_CONST);
+            leb_s(1, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_SET);
+            leb_u(4, &mut body);
+            body.push(0x0C);
+            leb_u(1, &mut body);
+            body.push(END);
+            body.push(END); // end loop i
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(CALL);
+            leb_u(drop_tensor_idx as u64, &mut body);
+            body.push(DROP);
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            helper_entry(
+                &[WType::I32, WType::I32, WType::I32, WType::I32, WType::I32],
+                body,
+            )
+        }
+        HeapHelper::Relu => {
+            // (t:i32) -> ptr:i32. out[i] = max(t[i], 0) per the interpreter's
+            // `if x > 0 { x } else { 0 }`. Consumes t. Locals: n(1,i32),
+            // out(2,i32), i(3,i32), x(4,f32).
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(8, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(16, &mut body);
+            body.push(0x7E); // i64.mul (rows*cols)
+            body.push(I32_WRAP_I64);
+            body.push(LOCAL_SET);
+            leb_u(1, &mut body); // n
+            // out = __alloc_tensor(t.rows, t.cols)
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(8, &mut body);
+            body.push(I32_WRAP_I64);
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(16, &mut body);
+            body.push(I32_WRAP_I64);
+            body.push(CALL);
+            leb_u(alloc_tensor_idx as u64, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(2, &mut body); // out
+            // i = 0; while i < n
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(3, &mut body);
+            body.push(0x03);
+            body.push(BT_VOID);
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body);
+            body.push(0x48);
+            body.push(IF);
+            body.push(BT_VOID);
+            // x = t[24+4i]
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            body.push(I32_CONST);
+            leb_s(4, &mut body);
+            body.push(I32_MUL);
+            body.push(I32_ADD);
+            f32_load(TENSOR_HEADER, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(4, &mut body); // x
+            // out[24+4i] = (x > 0) ? x : 0
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body); // out
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            body.push(I32_CONST);
+            leb_s(4, &mut body);
+            body.push(I32_MUL);
+            body.push(I32_ADD);
+            // value via if (x > 0.0)
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body); // x
+            body.push(0x43);
+            body.extend_from_slice(&0.0f32.to_le_bytes());
+            body.push(0x5E); // f32.gt
+            body.push(IF);
+            body.push(0x7D); // blocktype = f32
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body); // x
+            body.push(ELSE);
+            body.push(0x43);
+            body.extend_from_slice(&0.0f32.to_le_bytes());
+            body.push(END);
+            f32_store(TENSOR_HEADER, &mut body);
+            // i++
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            body.push(I32_CONST);
+            leb_s(1, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_SET);
+            leb_u(3, &mut body);
+            body.push(0x0C);
+            leb_u(1, &mut body);
+            body.push(END);
+            body.push(END); // end loop
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(CALL);
+            leb_u(drop_tensor_idx as u64, &mut body);
+            body.push(DROP);
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body);
+            helper_entry(&[WType::I32, WType::I32, WType::I32, WType::F32], body)
+        }
+        HeapHelper::Softmax => {
+            // (t:i32) -> ptr:i32. Row-wise, numerically stable, matching
+            // `softmax_rows`: per row compute max; e = exp(x-max) via env.exp on
+            // the f64-promoted (x-max), demoted back to f32 (mirroring the f32
+            // kernel's per-element rounding); accumulate sum; then multiply each
+            // by 1/sum (or 0 when sum<=0). Consumes t. Locals:
+            //   m(1,i32) n(2,i32) out(3,i32) i(4,i32) j(5,i32) mx(6,f32)
+            //   sum(7,f32) e(8,f32) base(9,i32) addr(10,i32)
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(8, &mut body);
+            body.push(I32_WRAP_I64);
+            body.push(LOCAL_SET);
+            leb_u(1, &mut body); // m
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(16, &mut body);
+            body.push(I32_WRAP_I64);
+            body.push(LOCAL_SET);
+            leb_u(2, &mut body); // n
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body);
+            body.push(CALL);
+            leb_u(alloc_tensor_idx as u64, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(3, &mut body); // out
+            // for i in 0..m
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(4, &mut body);
+            body.push(0x03);
+            body.push(BT_VOID);
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body);
+            body.push(0x48);
+            body.push(IF);
+            body.push(BT_VOID);
+            // base = i*n
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body);
+            body.push(I32_MUL);
+            body.push(LOCAL_SET);
+            leb_u(9, &mut body);
+            // mx = -inf
+            body.push(0x43);
+            body.extend_from_slice(&f32::NEG_INFINITY.to_le_bytes());
+            body.push(LOCAL_SET);
+            leb_u(6, &mut body);
+            // for j: mx = f32.max(mx, t[base+j])
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(5, &mut body);
+            body.push(0x03);
+            body.push(BT_VOID);
+            body.push(LOCAL_GET);
+            leb_u(5, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body);
+            body.push(0x48);
+            body.push(IF);
+            body.push(BT_VOID);
+            body.push(LOCAL_GET);
+            leb_u(6, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(9, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(5, &mut body);
+            body.push(I32_ADD);
+            body.push(I32_CONST);
+            leb_s(4, &mut body);
+            body.push(I32_MUL);
+            body.push(I32_ADD);
+            f32_load(TENSOR_HEADER, &mut body);
+            body.push(0x97); // f32.max
+            body.push(LOCAL_SET);
+            leb_u(6, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(5, &mut body);
+            body.push(I32_CONST);
+            leb_s(1, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_SET);
+            leb_u(5, &mut body);
+            body.push(0x0C);
+            leb_u(1, &mut body);
+            body.push(END);
+            body.push(END); // end max loop
+            // sum = 0
+            body.push(0x43);
+            body.extend_from_slice(&0.0f32.to_le_bytes());
+            body.push(LOCAL_SET);
+            leb_u(7, &mut body);
+            // for j: e = demote(exp(promote(t[base+j]-mx))); out[base+j]=e; sum+=e
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(5, &mut body);
+            body.push(0x03);
+            body.push(BT_VOID);
+            body.push(LOCAL_GET);
+            leb_u(5, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body);
+            body.push(0x48);
+            body.push(IF);
+            body.push(BT_VOID);
+            // e = demote(exp(promote( t[base+j] - mx )))
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(9, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(5, &mut body);
+            body.push(I32_ADD);
+            body.push(I32_CONST);
+            leb_s(4, &mut body);
+            body.push(I32_MUL);
+            body.push(I32_ADD);
+            f32_load(TENSOR_HEADER, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(6, &mut body); // mx
+            body.push(0x93); // f32.sub
+            body.push(0xBB); // f64.promote_f32
+            body.push(CALL);
+            leb_u(exp_idx as u64, &mut body);
+            body.push(0xB6); // f32.demote_f64
+            body.push(LOCAL_SET);
+            leb_u(8, &mut body); // e
+            // out[base+j] = e
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(9, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(5, &mut body);
+            body.push(I32_ADD);
+            body.push(I32_CONST);
+            leb_s(4, &mut body);
+            body.push(I32_MUL);
+            body.push(I32_ADD);
+            body.push(LOCAL_GET);
+            leb_u(8, &mut body);
+            f32_store(TENSOR_HEADER, &mut body);
+            // sum += e
+            body.push(LOCAL_GET);
+            leb_u(7, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(8, &mut body);
+            body.push(0x92);
+            body.push(LOCAL_SET);
+            leb_u(7, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(5, &mut body);
+            body.push(I32_CONST);
+            leb_s(1, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_SET);
+            leb_u(5, &mut body);
+            body.push(0x0C);
+            leb_u(1, &mut body);
+            body.push(END);
+            body.push(END); // end exp loop
+            // inv = (sum > 0) ? 1/sum : 0   (store into local 6 = mx, now free)
+            body.push(LOCAL_GET);
+            leb_u(7, &mut body);
+            body.push(0x43);
+            body.extend_from_slice(&0.0f32.to_le_bytes());
+            body.push(0x5E); // f32.gt
+            body.push(IF);
+            body.push(0x7D);
+            body.push(0x43);
+            body.extend_from_slice(&1.0f32.to_le_bytes());
+            body.push(LOCAL_GET);
+            leb_u(7, &mut body);
+            body.push(0x95); // f32.div
+            body.push(ELSE);
+            body.push(0x43);
+            body.extend_from_slice(&0.0f32.to_le_bytes());
+            body.push(END);
+            body.push(LOCAL_SET);
+            leb_u(6, &mut body); // inv
+            // for j: out[base+j] *= inv
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(5, &mut body);
+            body.push(0x03);
+            body.push(BT_VOID);
+            body.push(LOCAL_GET);
+            leb_u(5, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body);
+            body.push(0x48);
+            body.push(IF);
+            body.push(BT_VOID);
+            // addr = out + 4*(base+j)
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(9, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(5, &mut body);
+            body.push(I32_ADD);
+            body.push(I32_CONST);
+            leb_s(4, &mut body);
+            body.push(I32_MUL);
+            body.push(I32_ADD);
+            body.push(LOCAL_SET);
+            leb_u(10, &mut body); // addr
+            body.push(LOCAL_GET);
+            leb_u(10, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(10, &mut body);
+            f32_load(TENSOR_HEADER, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(6, &mut body); // inv
+            body.push(0x94); // f32.mul
+            f32_store(TENSOR_HEADER, &mut body);
+            // j++
+            body.push(LOCAL_GET);
+            leb_u(5, &mut body);
+            body.push(I32_CONST);
+            leb_s(1, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_SET);
+            leb_u(5, &mut body);
+            body.push(0x0C);
+            leb_u(1, &mut body);
+            body.push(END);
+            body.push(END); // end scale loop
+            // i++
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body);
+            body.push(I32_CONST);
+            leb_s(1, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_SET);
+            leb_u(4, &mut body);
+            body.push(0x0C);
+            leb_u(1, &mut body);
+            body.push(END);
+            body.push(END); // end row loop
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(CALL);
+            leb_u(drop_tensor_idx as u64, &mut body);
+            body.push(DROP);
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            helper_entry(
+                &[
+                    WType::I32, // m
+                    WType::I32, // n
+                    WType::I32, // out
+                    WType::I32, // i
+                    WType::I32, // j
+                    WType::F32, // mx / inv
+                    WType::F32, // sum
+                    WType::F32, // e
+                    WType::I32, // base
+                    WType::I32, // addr
+                ],
+                body,
+            )
+        }
+        HeapHelper::EmbedSim => {
+            // (a:i32, b:i32) -> f64. cosine(hash_embed(a,64), hash_embed(b,64)).
+            // Compute both embeddings into the fixed EMBED_SCRATCH region (two
+            // dim-64 f32 vectors), then cosine. Consumes a and b. Locals:
+            // dot(2,f32), na(3,f32), nb(4,f32), i(5,i32), va(6,f32), vb(7,f32),
+            // denom(8,f32).
+            let va_addr = embed_scratch;
+            let vb_addr = embed_scratch + 64 * 4;
+            // hash_embed(a, va_addr) ; hash_embed(b, vb_addr)
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(I32_CONST);
+            leb_s(va_addr as i64, &mut body);
+            body.push(CALL);
+            leb_u(hash_embed_idx as u64, &mut body);
+            body.push(DROP);
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body);
+            body.push(I32_CONST);
+            leb_s(vb_addr as i64, &mut body);
+            body.push(CALL);
+            leb_u(hash_embed_idx as u64, &mut body);
+            body.push(DROP);
+            // dot=na=nb=0
+            for l in [2u32, 3, 4] {
+                body.push(0x43);
+                body.extend_from_slice(&0.0f32.to_le_bytes());
+                body.push(LOCAL_SET);
+                leb_u(l as u64, &mut body);
+            }
+            // i = 0; while i < 64
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(5, &mut body);
+            body.push(0x03);
+            body.push(BT_VOID);
+            body.push(LOCAL_GET);
+            leb_u(5, &mut body);
+            body.push(I32_CONST);
+            leb_s(64, &mut body);
+            body.push(0x48);
+            body.push(IF);
+            body.push(BT_VOID);
+            // va = va_addr[i] ; vb = vb_addr[i]
+            body.push(LOCAL_GET);
+            leb_u(5, &mut body);
+            body.push(I32_CONST);
+            leb_s(4, &mut body);
+            body.push(I32_MUL);
+            body.push(I32_CONST);
+            leb_s(va_addr as i64, &mut body);
+            body.push(I32_ADD);
+            f32_load(0, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(6, &mut body); // va
+            body.push(LOCAL_GET);
+            leb_u(5, &mut body);
+            body.push(I32_CONST);
+            leb_s(4, &mut body);
+            body.push(I32_MUL);
+            body.push(I32_CONST);
+            leb_s(vb_addr as i64, &mut body);
+            body.push(I32_ADD);
+            f32_load(0, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(7, &mut body); // vb
+            // dot += va*vb
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(6, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(7, &mut body);
+            body.push(0x94); // f32.mul
+            body.push(0x92); // f32.add
+            body.push(LOCAL_SET);
+            leb_u(2, &mut body);
+            // na += va*va
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(6, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(6, &mut body);
+            body.push(0x94);
+            body.push(0x92);
+            body.push(LOCAL_SET);
+            leb_u(3, &mut body);
+            // nb += vb*vb
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(7, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(7, &mut body);
+            body.push(0x94);
+            body.push(0x92);
+            body.push(LOCAL_SET);
+            leb_u(4, &mut body);
+            // i++
+            body.push(LOCAL_GET);
+            leb_u(5, &mut body);
+            body.push(I32_CONST);
+            leb_s(1, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_SET);
+            leb_u(5, &mut body);
+            body.push(0x0C);
+            leb_u(1, &mut body);
+            body.push(END);
+            body.push(END); // end loop
+            // denom = sqrt(na) * sqrt(nb)
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            body.push(0x91); // f32.sqrt
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body);
+            body.push(0x91); // f32.sqrt
+            body.push(0x94); // f32.mul
+            body.push(LOCAL_SET);
+            leb_u(8, &mut body); // denom
+            // drop a, drop b (consumes the Strings)
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(CALL);
+            leb_u(drop_str_idx as u64, &mut body);
+            body.push(DROP);
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body);
+            body.push(CALL);
+            leb_u(drop_str_idx as u64, &mut body);
+            body.push(DROP);
+            // result = (denom == 0) ? 0.0 : dot/denom ; promoted to f64
+            body.push(LOCAL_GET);
+            leb_u(8, &mut body);
+            body.push(0x43);
+            body.extend_from_slice(&0.0f32.to_le_bytes());
+            body.push(0x5B); // f32.eq
+            body.push(IF);
+            body.push(0x7C); // f64 result
+            body.push(0x44); // f64.const 0.0
+            body.extend_from_slice(&0.0f64.to_le_bytes());
+            body.push(ELSE);
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body); // dot
+            body.push(LOCAL_GET);
+            leb_u(8, &mut body); // denom
+            body.push(0x95); // f32.div
+            body.push(0xBB); // f64.promote_f32
+            body.push(END);
+            helper_entry(
+                &[
+                    WType::F32,
+                    WType::F32,
+                    WType::F32,
+                    WType::I32,
+                    WType::F32,
+                    WType::F32,
+                    WType::F32,
+                ],
+                body,
+            )
+        }
+        HeapHelper::HashEmbed => {
+            // (s:i32, vec_addr:i32) -> i32(dummy). Build a dim-64 f32 embedding
+            // at [vec_addr..vec_addr+256], matching `rag::hash_embed(text, 64)`:
+            //   zero the 64 buckets; for each whitespace-delimited token,
+            //   lowercase (ASCII) each byte, FNV-1a hash the token, bucket =
+            //   h % 64, sign = (h>>63)&1 ? -1 : +1, v[bucket] += sign; then
+            //   L2-normalize. NOTE: rag uses `str::to_lowercase` (Unicode);
+            //   we replicate ASCII lowercasing, which matches for ASCII inputs
+            //   (the differential tests + demo use ASCII).
+            // Locals: len(2,i32), i(3,i32), hash(4,i64), tokstart(5,i32),
+            //   byte(6,i32), bucket(4?)... use: norm(7,f32), j(8,i32),
+            //   sign(9,f32), bytep(10,i32).
+            emit_hash_embed_body(&mut body);
+            helper_entry(
+                &[
+                    WType::I32, // len (2)
+                    WType::I32, // i (3)
+                    WType::I64, // hash (4)
+                    WType::I32, // in_token (5)
+                    WType::I32, // byte (6)
+                    WType::F32, // norm (7)
+                    WType::I32, // bucket (8)
+                    WType::F32, // sign (9)
+                ],
+                body,
+            )
         }
     }
 }
@@ -2909,6 +4539,373 @@ fn emit_byte_copy_loop_offset(
     body.push(0x0B); // end loop
 }
 
+/// Emit the body of the `__hash_embed(s:i32, vec_addr:i32) -> i32` helper,
+/// matching `crate::rag::hash_embed(text, 64)` for ASCII input. Params: s(0),
+/// vec_addr(1). Locals: len(2,i32), i(3,i32), hash(4,i64), in_token(5,i32),
+/// byte(6,i32), norm(7,f32), bucket(8,i32), sign(9,f32).
+///
+/// We stream FNV-1a over each whitespace-delimited, ASCII-lowercased token (no
+/// buffering): on a token boundary we finalize `hash` into a bucket/sign and
+/// accumulate; at end-of-string we finalize a trailing token. Then L2-normalize.
+fn emit_hash_embed_body(body: &mut Vec<u8>) {
+    const LOCAL_GET: u8 = 0x20;
+    const LOCAL_SET: u8 = 0x21;
+    const I32_CONST: u8 = 0x41;
+    const I64_CONST: u8 = 0x42;
+    const I32_ADD: u8 = 0x6A;
+    const I32_MUL: u8 = 0x6C;
+    const IF: u8 = 0x04;
+    const ELSE: u8 = 0x05;
+    const END: u8 = 0x0B;
+    const BT_VOID: u8 = 0x40;
+    const FNV_OFFSET: i64 = 0xcbf2_9ce4_8422_2325u64 as i64;
+    const FNV_PRIME: i64 = 0x0000_0100_0000_01b3;
+
+    // Append the "finalize current token" sequence: bucket = hash % 64;
+    // sign = (hash < 0) ? -1 : +1; vec[bucket] += sign; in_token = 0.
+    let finalize = |body: &mut Vec<u8>| {
+        // bucket = (i32) (hash % 64)   (unsigned remainder)
+        body.push(LOCAL_GET);
+        leb_u(4, body); // hash
+        body.push(I64_CONST);
+        leb_s(64, body);
+        body.push(0x82); // i64.rem_u
+        body.push(0xA7); // i32.wrap_i64
+        body.push(LOCAL_SET);
+        leb_u(8, body); // bucket
+        // sign = (hash < 0) ? -1.0 : 1.0
+        body.push(LOCAL_GET);
+        leb_u(4, body); // hash
+        body.push(I64_CONST);
+        leb_s(0, body);
+        body.push(0x53); // i64.lt_s  (top bit set)
+        body.push(IF);
+        body.push(0x7D); // f32 result
+        body.push(0x43);
+        body.extend_from_slice(&(-1.0f32).to_le_bytes());
+        body.push(ELSE);
+        body.push(0x43);
+        body.extend_from_slice(&1.0f32.to_le_bytes());
+        body.push(END);
+        body.push(LOCAL_SET);
+        leb_u(9, body); // sign
+        // addr = vec_addr + 4*bucket ; vec[bucket] += sign
+        body.push(LOCAL_GET);
+        leb_u(1, body);
+        body.push(LOCAL_GET);
+        leb_u(8, body);
+        body.push(I32_CONST);
+        leb_s(4, body);
+        body.push(I32_MUL);
+        body.push(I32_ADD); // store address
+        body.push(LOCAL_GET);
+        leb_u(1, body);
+        body.push(LOCAL_GET);
+        leb_u(8, body);
+        body.push(I32_CONST);
+        leb_s(4, body);
+        body.push(I32_MUL);
+        body.push(I32_ADD);
+        f32_load(0, body);
+        body.push(LOCAL_GET);
+        leb_u(9, body); // sign
+        body.push(0x92); // f32.add
+        f32_store(0, body);
+        // in_token = 0
+        body.push(I32_CONST);
+        leb_s(0, body);
+        body.push(LOCAL_SET);
+        leb_u(5, body);
+    };
+
+    // 1. Zero the 64 buckets.
+    body.push(I32_CONST);
+    leb_s(0, body);
+    body.push(LOCAL_SET);
+    leb_u(3, body); // i
+    body.push(0x03);
+    body.push(BT_VOID);
+    body.push(LOCAL_GET);
+    leb_u(3, body);
+    body.push(I32_CONST);
+    leb_s(64, body);
+    body.push(0x48);
+    body.push(IF);
+    body.push(BT_VOID);
+    body.push(LOCAL_GET);
+    leb_u(1, body);
+    body.push(LOCAL_GET);
+    leb_u(3, body);
+    body.push(I32_CONST);
+    leb_s(4, body);
+    body.push(I32_MUL);
+    body.push(I32_ADD);
+    body.push(0x43);
+    body.extend_from_slice(&0.0f32.to_le_bytes());
+    f32_store(0, body);
+    body.push(LOCAL_GET);
+    leb_u(3, body);
+    body.push(I32_CONST);
+    leb_s(1, body);
+    body.push(I32_ADD);
+    body.push(LOCAL_SET);
+    leb_u(3, body);
+    body.push(0x0C);
+    leb_u(1, body);
+    body.push(END);
+    body.push(END);
+
+    // 2. len = s.len ; in_token = 0
+    body.push(LOCAL_GET);
+    leb_u(0, body);
+    i64_load(8, body);
+    body.push(0xA7); // i32.wrap_i64
+    body.push(LOCAL_SET);
+    leb_u(2, body); // len
+    body.push(I32_CONST);
+    leb_s(0, body);
+    body.push(LOCAL_SET);
+    leb_u(5, body); // in_token
+
+    // 3. scan
+    body.push(I32_CONST);
+    leb_s(0, body);
+    body.push(LOCAL_SET);
+    leb_u(3, body); // i
+    body.push(0x03);
+    body.push(BT_VOID);
+    body.push(LOCAL_GET);
+    leb_u(3, body);
+    body.push(LOCAL_GET);
+    leb_u(2, body);
+    body.push(0x48);
+    body.push(IF);
+    body.push(BT_VOID);
+    // byte = s[16 + i]
+    body.push(LOCAL_GET);
+    leb_u(0, body);
+    body.push(LOCAL_GET);
+    leb_u(3, body);
+    body.push(I32_ADD);
+    i32_load8_u(STR_HEADER, body);
+    body.push(LOCAL_SET);
+    leb_u(6, body); // byte
+    // is_ws = (byte==0x20) || (0x09<=byte<=0x0d)
+    body.push(LOCAL_GET);
+    leb_u(6, body);
+    body.push(I32_CONST);
+    leb_s(0x20, body);
+    body.push(0x46); // i32.eq
+    body.push(LOCAL_GET);
+    leb_u(6, body);
+    body.push(I32_CONST);
+    leb_s(0x09, body);
+    body.push(0x4E); // i32.ge_s
+    body.push(LOCAL_GET);
+    leb_u(6, body);
+    body.push(I32_CONST);
+    leb_s(0x0d, body);
+    body.push(0x4C); // i32.le_s
+    body.push(0x71); // and
+    body.push(0x72); // or
+    body.push(IF);
+    body.push(BT_VOID);
+    // whitespace: if in_token finalize
+    body.push(LOCAL_GET);
+    leb_u(5, body);
+    body.push(IF);
+    body.push(BT_VOID);
+    finalize(body);
+    body.push(END);
+    body.push(ELSE);
+    // non-whitespace: start token if needed
+    body.push(LOCAL_GET);
+    leb_u(5, body);
+    body.push(0x45); // i32.eqz
+    body.push(IF);
+    body.push(BT_VOID);
+    body.push(I64_CONST);
+    leb_s(FNV_OFFSET, body);
+    body.push(LOCAL_SET);
+    leb_u(4, body); // hash
+    body.push(I32_CONST);
+    leb_s(1, body);
+    body.push(LOCAL_SET);
+    leb_u(5, body); // in_token = 1
+    body.push(END);
+    // lowercase ASCII
+    body.push(LOCAL_GET);
+    leb_u(6, body);
+    body.push(I32_CONST);
+    leb_s('A' as i64, body);
+    body.push(0x4E); // ge_s
+    body.push(LOCAL_GET);
+    leb_u(6, body);
+    body.push(I32_CONST);
+    leb_s('Z' as i64, body);
+    body.push(0x4C); // le_s
+    body.push(0x71); // and
+    body.push(IF);
+    body.push(BT_VOID);
+    body.push(LOCAL_GET);
+    leb_u(6, body);
+    body.push(I32_CONST);
+    leb_s(32, body);
+    body.push(I32_ADD);
+    body.push(LOCAL_SET);
+    leb_u(6, body);
+    body.push(END);
+    // hash = (hash ^ lc) * FNV_PRIME
+    body.push(LOCAL_GET);
+    leb_u(4, body);
+    body.push(LOCAL_GET);
+    leb_u(6, body);
+    body.push(0xAD); // i64.extend_i32_u
+    body.push(0x85); // i64.xor
+    body.push(I64_CONST);
+    leb_s(FNV_PRIME, body);
+    body.push(0x7E); // i64.mul
+    body.push(LOCAL_SET);
+    leb_u(4, body);
+    body.push(END); // end if-ws/else
+    // i++
+    body.push(LOCAL_GET);
+    leb_u(3, body);
+    body.push(I32_CONST);
+    leb_s(1, body);
+    body.push(I32_ADD);
+    body.push(LOCAL_SET);
+    leb_u(3, body);
+    body.push(0x0C);
+    leb_u(1, body);
+    body.push(END);
+    body.push(END); // end scan loop
+
+    // 4. trailing token
+    body.push(LOCAL_GET);
+    leb_u(5, body);
+    body.push(IF);
+    body.push(BT_VOID);
+    finalize(body);
+    body.push(END);
+
+    // 5. L2 normalize. sum = sum vec[i]^2
+    body.push(0x43);
+    body.extend_from_slice(&0.0f32.to_le_bytes());
+    body.push(LOCAL_SET);
+    leb_u(7, body); // norm (sum)
+    body.push(I32_CONST);
+    leb_s(0, body);
+    body.push(LOCAL_SET);
+    leb_u(3, body);
+    body.push(0x03);
+    body.push(BT_VOID);
+    body.push(LOCAL_GET);
+    leb_u(3, body);
+    body.push(I32_CONST);
+    leb_s(64, body);
+    body.push(0x48);
+    body.push(IF);
+    body.push(BT_VOID);
+    body.push(LOCAL_GET);
+    leb_u(7, body);
+    body.push(LOCAL_GET);
+    leb_u(1, body);
+    body.push(LOCAL_GET);
+    leb_u(3, body);
+    body.push(I32_CONST);
+    leb_s(4, body);
+    body.push(I32_MUL);
+    body.push(I32_ADD);
+    f32_load(0, body);
+    body.push(LOCAL_GET);
+    leb_u(1, body);
+    body.push(LOCAL_GET);
+    leb_u(3, body);
+    body.push(I32_CONST);
+    leb_s(4, body);
+    body.push(I32_MUL);
+    body.push(I32_ADD);
+    f32_load(0, body);
+    body.push(0x94); // f32.mul
+    body.push(0x92); // f32.add
+    body.push(LOCAL_SET);
+    leb_u(7, body);
+    body.push(LOCAL_GET);
+    leb_u(3, body);
+    body.push(I32_CONST);
+    leb_s(1, body);
+    body.push(I32_ADD);
+    body.push(LOCAL_SET);
+    leb_u(3, body);
+    body.push(0x0C);
+    leb_u(1, body);
+    body.push(END);
+    body.push(END);
+    // norm = sqrt(sum)
+    body.push(LOCAL_GET);
+    leb_u(7, body);
+    body.push(0x91); // f32.sqrt
+    body.push(LOCAL_SET);
+    leb_u(7, body);
+    // if norm > 0 divide
+    body.push(LOCAL_GET);
+    leb_u(7, body);
+    body.push(0x43);
+    body.extend_from_slice(&0.0f32.to_le_bytes());
+    body.push(0x5E); // f32.gt
+    body.push(IF);
+    body.push(BT_VOID);
+    body.push(I32_CONST);
+    leb_s(0, body);
+    body.push(LOCAL_SET);
+    leb_u(3, body);
+    body.push(0x03);
+    body.push(BT_VOID);
+    body.push(LOCAL_GET);
+    leb_u(3, body);
+    body.push(I32_CONST);
+    leb_s(64, body);
+    body.push(0x48);
+    body.push(IF);
+    body.push(BT_VOID);
+    body.push(LOCAL_GET);
+    leb_u(1, body);
+    body.push(LOCAL_GET);
+    leb_u(3, body);
+    body.push(I32_CONST);
+    leb_s(4, body);
+    body.push(I32_MUL);
+    body.push(I32_ADD);
+    body.push(LOCAL_SET);
+    leb_u(8, body); // addr (reuse bucket local)
+    body.push(LOCAL_GET);
+    leb_u(8, body);
+    body.push(LOCAL_GET);
+    leb_u(8, body);
+    f32_load(0, body);
+    body.push(LOCAL_GET);
+    leb_u(7, body);
+    body.push(0x95); // f32.div
+    f32_store(0, body);
+    body.push(LOCAL_GET);
+    leb_u(3, body);
+    body.push(I32_CONST);
+    leb_s(1, body);
+    body.push(I32_ADD);
+    body.push(LOCAL_SET);
+    leb_u(3, body);
+    body.push(0x0C);
+    leb_u(1, body);
+    body.push(END);
+    body.push(END);
+    body.push(END); // end if norm>0
+
+    // dummy return 0
+    body.push(I32_CONST);
+    leb_s(0, body);
+}
+
 /// Constructor infos sorted by tag (deterministic codegen for `__drop`).
 fn ctor_infos_sorted(ctors: &CtorTable) -> Vec<CtorInfo> {
     let mut v: Vec<CtorInfo> = ctors.by_name.values().cloned().collect();
@@ -2988,15 +4985,17 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
 
     // 1. Collect function signatures from the typed AST, in declaration order,
     //    assigning deterministic wasm function indices.
-    // We import four host functions: `env.print_str` (index 0),
-    // `env.print_float` (index 1), `env.print_int` (index 2), and
-    // `env.print_bool` (index 3). Every DEFINED function index is offset by
-    // N_IMPORTS.
-    const N_IMPORTS: u32 = 4;
+    // We import five host functions: `env.print_str` (index 0),
+    // `env.print_float` (index 1), `env.print_int` (index 2),
+    // `env.print_bool` (index 3), and `env.exp` (index 4, a libm-faithful
+    // `exp(f64)->f64` used by Tensor softmax). Every DEFINED function index is
+    // offset by N_IMPORTS.
+    const N_IMPORTS: u32 = 5;
     const PRINT_STR_IDX: u32 = 0;
     const PRINT_FLOAT_IDX: u32 = 1;
     const PRINT_INT_IDX: u32 = 2;
     const PRINT_BOOL_IDX: u32 = 3;
+    const EXP_IDX: u32 = 4;
 
     let mut sigs: HashMap<String, FnSig> = HashMap::new();
     let mut order: Vec<String> = Vec::new();
@@ -3069,11 +5068,19 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
     // String literals live BELOW the heap so their addresses never alias a cell.
     // The free-list array must cover every size class an allocation can request:
     // ADT arities 0..=max_arity AND String size classes 0..=STR_MAX_CLASS.
-    let n_freelist_slots = (ctors.max_arity as u64).max(STR_MAX_CLASS) + 1;
-    let ro_base = {
+    let n_freelist_slots = (ctors.max_arity as u64)
+        .max(STR_MAX_CLASS)
+        .max(TENSOR_MAX_CLASS)
+        + 1;
+    // A fixed scratch region (after the free-list array, before the read-only
+    // literal pool) used by `embed_similarity`: two dim-64 f32 vectors = 512
+    // bytes; reserve 1024 to be safe. Its base is `EMBED_SCRATCH`.
+    let embed_scratch = {
         let raw = FREELIST_BASE + 4 * n_freelist_slots;
         (raw + 7) & !7
     };
+    const EMBED_SCRATCH_BYTES: u64 = 1024;
+    let ro_base = embed_scratch + EMBED_SCRATCH_BYTES;
     // Assign each literal a data-segment address; `str_lits` maps bytes -> addr.
     let mut str_lits: HashMap<Vec<u8>, u64> = HashMap::new();
     let mut lit_addr = ro_base;
@@ -3127,6 +5134,7 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
             print_float_idx: PRINT_FLOAT_IDX,
             print_int_idx: PRINT_INT_IDX,
             print_bool_idx: PRINT_BOOL_IDX,
+            exp_idx: EXP_IDX,
         };
 
         // Emit the body instructions; the result is left on the stack.
@@ -3172,7 +5180,7 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
     //     `HeapHelper::ALL` order, so indices line up with `heap_base + offset`.
     for h in HeapHelper::ALL {
         type_section_funcs.push(h.sig());
-        let entry = emit_heap_helper(h, &ctors, heap_base);
+        let entry = emit_heap_helper(h, &ctors, heap_base, EXP_IDX, embed_scratch);
         let mut sized = Vec::new();
         vec_bytes(&entry, &mut sized);
         code_entries.push(sized);
@@ -3212,7 +5220,13 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
         leb_u(1, &mut content); // 1 param
         content.push(WType::I32.byte());
         leb_u(0, &mut content); // zero results
-        // types 4..: the defined functions.
+        // type 4: env.exp(f64) -> f64
+        content.push(0x60); // func type tag
+        leb_u(1, &mut content); // 1 param
+        content.push(WType::F64.byte());
+        leb_u(1, &mut content); // one result
+        content.push(WType::F64.byte());
+        // types 5..: the defined functions.
         for (params, ret) in &type_section_funcs {
             content.push(0x60); // func type tag
             leb_u(params.len() as u64, &mut content);
@@ -3226,11 +5240,11 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
     }
 
     // Import section (id 2): import `env.print_str` (type 0),
-    // `env.print_float` (type 1), `env.print_int` (type 2), and
-    // `env.print_bool` (type 3).
+    // `env.print_float` (type 1), `env.print_int` (type 2),
+    // `env.print_bool` (type 3), and `env.exp` (type 4).
     {
         let mut content = Vec::new();
-        leb_u(N_IMPORTS as u64, &mut content); // four imports
+        leb_u(N_IMPORTS as u64, &mut content); // five imports
         let m = b"env";
         // env.print_str : type 0
         leb_u(m.len() as u64, &mut content);
@@ -3264,6 +5278,14 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
         content.extend_from_slice(nb);
         content.push(0x00); // import kind = func
         leb_u(3, &mut content); // type index 3
+        // env.exp : type 4
+        leb_u(m.len() as u64, &mut content);
+        content.extend_from_slice(m);
+        let ne = b"exp";
+        leb_u(ne.len() as u64, &mut content);
+        content.extend_from_slice(ne);
+        content.push(0x00); // import kind = func
+        leb_u(4, &mut content); // type index 4
         section(2, &content, &mut out);
     }
 
@@ -3395,7 +5417,7 @@ mod tests {
         let script = format!(
             "const fs=require('fs');\
              const dec=new TextDecoder();\
-             const imp={{env:{{print_str:(p,n)=>{{}},print_float:(x)=>{{}},print_int:(n)=>{{}},print_bool:(b)=>{{}}}}}};\
+             const imp={{env:{{print_str:(p,n)=>{{}},print_float:(x)=>{{}},print_int:(n)=>{{}},print_bool:(b)=>{{}},exp:Math.exp}}}};\
              try{{const b=fs.readFileSync({:?});\
              WebAssembly.instantiate(b,imp).then(r=>{{\
              try{{const ex=r.instance.exports;const v=ex.main();\
@@ -3588,7 +5610,7 @@ mod tests {
         // BigUint64Array view, so we compare bit patterns (NaN-safe, exact).
         let script = format!(
             "const fs=require('fs');\
-             const imp={{env:{{print_str:(p,n)=>{{}},print_float:(x)=>{{}},print_int:(n)=>{{}},print_bool:(b)=>{{}}}}}};\
+             const imp={{env:{{print_str:(p,n)=>{{}},print_float:(x)=>{{}},print_int:(n)=>{{}},print_bool:(b)=>{{}},exp:Math.exp}}}};\
              const b=fs.readFileSync({:?});\
              WebAssembly.instantiate(b,imp).then(r=>{{\
              const ex=r.instance.exports;const v=ex.main();\
@@ -3689,6 +5711,102 @@ mod tests {
              type L = | Nil | Cons(P, L)\n\
              fn cnt(xs: L) -> Int = match xs { Nil => 0, Cons(_, r) => 1 + cnt(r), }\n\
              fn main() -> Int = cnt(Cons(P(1.0, 2.0), Cons(P(3.0, 4.0), Nil)))",
+        );
+    }
+
+    /// Approximate float differential for Tensor ops whose value can round
+    /// slightly differently between the interpreter's `f32::exp` and the wasm
+    /// backend's `Math.exp` host import (softmax) or accumulated f32 rounding.
+    /// Compares as f64 within a small absolute tolerance, and still asserts the
+    /// program is garbage-free (`__live == 0`).
+    fn differential_float_approx(src: &str, tol: f64) {
+        let interp = interp_result(src).expect("interpreter should succeed");
+        let expected: f64 = interp.parse().expect("interpreter float parses");
+        let bytes = compile_src(src).expect("compile should succeed");
+        if !node_available() {
+            return;
+        }
+        let (wasm_bits, live) = run_wasm_f64_bits(&bytes).expect("running wasm");
+        let got = f64::from_bits(wasm_bits);
+        assert!(
+            (got - expected).abs() <= tol,
+            "wasm float {} not within {} of interpreter {} for:\n{}",
+            got,
+            tol,
+            expected,
+            src
+        );
+        assert_eq!(live, 0, "tensor program leaked {} live cell(s) in:\n{}", live, src);
+    }
+
+    #[test]
+    fn tensor_zeros_set_get_matches_interpreter() {
+        // tensor_zeros / tensor_set / tensor_get round-trip a single element.
+        differential_float("fn main() -> Float = tensor_get(tensor_set(tensor_zeros(2, 2), 1, 1, 4.25), 1, 1)");
+        // An untouched element stays 0.
+        differential_float("fn main() -> Float = tensor_get(tensor_zeros(3, 4), 2, 3)");
+        // tensor_rows / tensor_cols reduce to Int (compared exactly).
+        differential("fn main() -> Int = tensor_rows(tensor_zeros(5, 7)) + tensor_cols(tensor_zeros(5, 7))");
+    }
+
+    #[test]
+    fn tensor_matmul_identity_matches_interpreter() {
+        // identity(2x2) * M, read element (0,1) == 3.0 (the prompt's example).
+        differential_float(
+            "fn main() -> Float = tensor_get(matmul(tensor_set(tensor_set(tensor_zeros(2,2),0,0,1.0),1,1,1.0), tensor_set(tensor_zeros(2,2),0,1,3.0)), 0, 1)",
+        );
+        // A non-trivial 2x2 * 2x2 product element.
+        differential_float(
+            "fn main() -> Float = {\n\
+               let a = tensor_set(tensor_set(tensor_set(tensor_set(tensor_zeros(2,2),0,0,1.0),0,1,2.0),1,0,3.0),1,1,4.0);\n\
+               let b = tensor_set(tensor_set(tensor_set(tensor_set(tensor_zeros(2,2),0,0,5.0),0,1,6.0),1,0,7.0),1,1,8.0);\n\
+               tensor_get(matmul(a, b), 1, 1)\n\
+             }",
+        );
+    }
+
+    #[test]
+    fn tensor_relu_transpose_matches_interpreter() {
+        // relu zeroes a negative, transpose moves it; read the moved element.
+        differential_float(
+            "fn main() -> Float = {\n\
+               let a = tensor_set(tensor_set(tensor_zeros(2,2),0,0,-2.0),0,1,5.0);\n\
+               let t = transpose(relu(a));\n\
+               tensor_get(t, 1, 0)\n\
+             }",
+        );
+        // relu of a negative element is exactly 0.0.
+        differential_float(
+            "fn main() -> Float = tensor_get(relu(tensor_set(tensor_zeros(1,1),0,0,-9.0)), 0, 0)",
+        );
+    }
+
+    #[test]
+    fn tensor_softmax_matches_interpreter() {
+        // Row-wise softmax; the largest input gets the largest probability.
+        // exp via the host import may round in the last ulp vs the interpreter's
+        // f32::exp, so compare within a small tolerance (still garbage-free).
+        differential_float_approx(
+            "fn main() -> Float = {\n\
+               let a = tensor_set(tensor_set(tensor_zeros(1,3),0,0,1.0),0,2,3.0);\n\
+               tensor_get(softmax(a), 0, 2)\n\
+             }",
+            1e-5,
+        );
+    }
+
+    #[test]
+    fn embed_similarity_matches_interpreter() {
+        // Identical strings -> cosine ~1.0; both backends agree (approx, since
+        // FNV/normalization is f32 and division may round slightly).
+        differential_float_approx(
+            "fn main() -> Float = embed_similarity(\"cosine similarity over vectors\", \"cosine similarity over vectors\")",
+            1e-5,
+        );
+        // Unrelated strings -> a much smaller similarity; agreement within tol.
+        differential_float_approx(
+            "fn main() -> Float = embed_similarity(\"cosine similarity over vectors\", \"the weather is cold and rainy today\")",
+            1e-5,
         );
     }
 
@@ -3848,7 +5966,8 @@ mod tests {
              const imp={{env:{{print_str:(p,n)=>{{}},\
              print_float:(x)=>{{process.stdout.write(String(x));process.stdout.write('\\n');}},\
              print_int:(n)=>{{process.stdout.write(String(n));process.stdout.write('\\n');}},\
-             print_bool:(b)=>{{process.stdout.write(b?'true':'false');process.stdout.write('\\n');}}}}}};\
+             print_bool:(b)=>{{process.stdout.write(b?'true':'false');process.stdout.write('\\n');}},\
+             exp:Math.exp}}}};\
              const b=fs.readFileSync({:?});\
              WebAssembly.instantiate(b,imp).then(r=>{{r.instance.exports.main();}})\
              .catch(e=>process.stdout.write('TRAP'));",
@@ -3876,7 +5995,7 @@ mod tests {
         let script = format!(
             "const fs=require('fs');\
              const dec=new TextDecoder();\
-             const imp={{env:{{print_str:(p,n)=>{{}},print_float:(x)=>{{}},print_int:(n)=>{{}},print_bool:(b)=>{{}}}}}};\
+             const imp={{env:{{print_str:(p,n)=>{{}},print_float:(x)=>{{}},print_int:(n)=>{{}},print_bool:(b)=>{{}},exp:Math.exp}}}};\
              const b=fs.readFileSync({:?});\
              WebAssembly.instantiate(b,imp).then(r=>{{\
              const ex=r.instance.exports;const v=ex.main();\
@@ -4035,7 +6154,7 @@ mod tests {
         std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
         let script = format!(
             "const fs=require('fs');\
-             const imp={{env:{{print_str:(p,n)=>{{}},print_float:(x)=>{{}},print_int:(n)=>{{}},print_bool:(b)=>{{}}}}}};\
+             const imp={{env:{{print_str:(p,n)=>{{}},print_float:(x)=>{{}},print_int:(n)=>{{}},print_bool:(b)=>{{}},exp:Math.exp}}}};\
              const b=fs.readFileSync({:?});\
              WebAssembly.instantiate(b,imp).then(r=>{{\
              const m=String(r.instance.exports.main());\
@@ -4291,7 +6410,7 @@ mod tests {
         std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
         let script = format!(
             "const fs=require('fs');\
-             const imp={{env:{{print_str:(p,n)=>{{}},print_float:(x)=>{{}},print_int:(n)=>{{}},print_bool:(b)=>{{}}}}}};\
+             const imp={{env:{{print_str:(p,n)=>{{}},print_float:(x)=>{{}},print_int:(n)=>{{}},print_bool:(b)=>{{}},exp:Math.exp}}}};\
              const b=fs.readFileSync({:?});\
              WebAssembly.instantiate(b,imp).then(r=>{{\
              const m=String(r.instance.exports.main());\

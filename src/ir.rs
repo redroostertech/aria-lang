@@ -96,6 +96,26 @@ const IR_BUILTINS: &[&str] = &[
     "int_to_str",
 ];
 
+/// Builtins the IR interpreter does NOT evaluate, but which the WASM backend
+/// *does* compile (Phase 2f: tensor ops + `embed_similarity`). Lowering lets
+/// these through to a `Bind::Call` so the wasm emitter can handle them; the IR
+/// tree-walking interpreter never runs them (the tree-walking `interp::Interp`
+/// is the reference oracle for these instead). The codec builtins
+/// (`compressed_size`, `neural_bits_per_byte`) are intentionally absent — they
+/// remain rejected at lowering (deferred).
+const WASM_ONLY_BUILTINS: &[&str] = &[
+    "tensor_zeros",
+    "tensor_set",
+    "tensor_get",
+    "tensor_rows",
+    "tensor_cols",
+    "matmul",
+    "transpose",
+    "softmax",
+    "relu",
+    "embed_similarity",
+];
+
 // ---- lowering (typed AST -> ANF IR) -------------------------------------
 
 struct Lowerer {
@@ -168,9 +188,12 @@ impl Lowerer {
                 // Builtins the IR doesn't implement (tensors/RAG/compression) are
                 // outside the IR subset — reject at lowering with a clear message
                 // rather than failing confusingly at run time.
-                if crate::builtins::lookup(name).is_some() && !IR_BUILTINS.contains(&name.as_str()) {
+                if crate::builtins::lookup(name).is_some()
+                    && !IR_BUILTINS.contains(&name.as_str())
+                    && !WASM_ONLY_BUILTINS.contains(&name.as_str())
+                {
                     return Err(LowerError(format!(
-                        "builtin `{}` is outside the IR subset (tensors/RAG not supported)",
+                        "builtin `{}` is outside the IR subset (compression codecs not supported)",
                         name
                     )));
                 }
@@ -906,9 +929,29 @@ mod tests {
     }
 
     #[test]
-    fn tensor_builtin_rejected_at_lowering() {
-        let prog = parser::parse(lexer::lex("fn main() -> Int = { let t = tensor_zeros(2, 2); 0 }").unwrap()).unwrap();
-        assert!(lower_program(&prog).is_err(), "tensor builtins must be rejected by IR lowering");
+    fn tensor_builtin_lowers_for_wasm() {
+        // Phase 2f: tensor builtins now lower (the wasm backend compiles them).
+        let prog = parser::parse(
+            lexer::lex("fn main() -> Float = tensor_get(tensor_zeros(2, 2), 0, 0)").unwrap(),
+        )
+        .unwrap();
+        assert!(
+            lower_program(&prog).is_ok(),
+            "tensor builtins must lower for the wasm backend"
+        );
+    }
+
+    #[test]
+    fn codec_builtin_rejected_at_lowering() {
+        // The rANS/predictor codec builtins remain outside the IR subset.
+        let prog = parser::parse(
+            lexer::lex("fn main() -> Int = compressed_size(\"hello\")").unwrap(),
+        )
+        .unwrap();
+        assert!(
+            lower_program(&prog).is_err(),
+            "codec builtins must be rejected by IR lowering"
+        );
     }
 
     // ---- regression tests for the adversarial-review findings ------------
