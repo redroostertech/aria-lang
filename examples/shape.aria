@@ -1,0 +1,24 @@
+-- Compile-time tensor shape checking (M5). Aria tracks the statically-known
+-- shape of each tensor through `tensor_zeros`/`matmul`/`transpose`/`softmax`,
+-- so a dimension mismatch is a COMPILE error, not a 3am runtime crash. This
+-- program type-checks; flipping one dimension below would be rejected before a
+-- single number is computed.
+--
+-- A scaled-dot-product attention block, with the dimensions flowing straight
+-- into the tensor ops so they are checked at compile time:
+--   Q : [4, 8]
+--   K : [4, 8]  ->  transpose(K) : [8, 4]
+--   matmul(Q, K^T)  : [4, 4]   (inner dims 8 == 8 ✓)
+--   softmax(...)    : [4, 4]
+fn main() -> Float = {
+  let q = tensor_zeros(4, 8);
+  let k = tensor_zeros(4, 8);
+  let scores = softmax(matmul(q, transpose(k)));
+  -- A uniform softmax over 4 columns gives 0.25 in every cell.
+  tensor_get(scores, 0, 0)
+}
+
+-- Try it: change `k` to `tensor_zeros(4, 7)` and `aria check examples/shape.aria`
+-- reports, with no program ever run:
+--   shape error: matmul inner dimensions do not match:
+--     lhs [4, 8] has inner dim 8 but rhs [7, 4] has inner dim 7

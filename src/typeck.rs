@@ -408,6 +408,15 @@ pub fn check(program: &Program) -> Result<(), Vec<String>> {
         }
     }
 
+    // Compile-time tensor shape checking. Run only on an otherwise well-typed
+    // program, so shape inference sees consistent types and its messages are not
+    // buried under unrelated type errors. Best-effort and false-positive-free:
+    // it rejects a program only when statically-known tensor dimensions provably
+    // do not line up (see `shape::check_program`).
+    if errors.is_empty() {
+        errors.extend(crate::shape::check_program(program));
+    }
+
     if errors.is_empty() {
         Ok(())
     } else {
@@ -2316,6 +2325,24 @@ mod tests {
             errs.iter().any(|e| e.contains("requires its type parameter")
                 && e.contains("impl `D`")
                 && e.contains("Hue")),
+            "got: {:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn tensor_shape_mismatch_surfaces_through_typeck() {
+        // The shape checker is wired into `check`, so a provable matmul
+        // dimension mismatch is reported as a (type-check-time) error.
+        let src = "fn main() -> Float = {\n\
+            let a = tensor_zeros(32, 64);\n\
+            let b = tensor_zeros(128, 10);\n\
+            tensor_get(matmul(a, b), 0, 0)\n\
+        }\n";
+        let errs = check_src(src).unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains("shape error")
+                && e.contains("inner dimensions do not match")),
             "got: {:?}",
             errs
         );

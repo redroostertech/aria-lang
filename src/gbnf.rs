@@ -620,7 +620,7 @@ mod tests {
     #[test]
     fn accepts_real_examples() {
         let gram = g();
-        for name in ["intro", "list", "generic", "hof", "pure", "mem_bench", "array", "record", "trait", "bytes", "map", "set"] {
+        for name in ["intro", "list", "generic", "hof", "pure", "mem_bench", "array", "record", "trait", "bytes", "map", "set", "shape"] {
             let path = format!(
                 "{}/examples/{}.aria",
                 env!("CARGO_MANIFEST_DIR"),
