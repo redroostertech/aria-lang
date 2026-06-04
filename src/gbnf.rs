@@ -26,11 +26,24 @@ pub fn grammar() -> String {
         // ---- program / items -------------------------------------------
         // A program is a sequence of items surrounded by optional whitespace.
         "root ::= ws item ( ws item )* ws | ws",
-        "item ::= fn-decl | type-decl",
+        "item ::= fn-decl | type-decl | interface-decl | impl-decl",
 
-        // fn-decl: optional `pure`, `fn`, name, optional type params, params,
-        // `->` return type, `=`, body expression.
-        "fn-decl ::= ( \"pure\" ws )? \"fn\" ws lower-ident ws type-params? ws \"(\" ws params? ws \")\" ws \"->\" ws type ws \"=\" ws expr",
+        // fn-decl: optional `pure`, `fn`, name, optional (bounded) type params,
+        // params, `->` return type, `=`, body expression.
+        "fn-decl ::= ( \"pure\" ws )? \"fn\" ws lower-ident ws bound-params? ws \"(\" ws params? ws \")\" ws \"->\" ws type ws \"=\" ws expr",
+
+        // interface-decl: `interface Name[T] { fn m(self: T, ..) -> R, .. }`.
+        // Methods are signatures only (no body), comma-separated, trailing OK.
+        "interface-decl ::= \"interface\" ws upper-ident ws type-params ws \"{\" ws method-sig ( ws \",\"? ws method-sig )* ( ws \",\" )? ws \"}\"",
+        "method-sig ::= \"fn\" ws lower-ident ws \"(\" ws params? ws \")\" ws \"->\" ws type",
+
+        // impl-decl: `impl Trait for Head { fn m(self: Head, ..) -> R = body, .. }`.
+        "impl-decl ::= \"impl\" ws upper-ident ws \"for\" ws upper-ident ws \"{\" ws fn-decl ( ws \",\"? ws fn-decl )* ( ws \",\" )? ws \"}\"",
+
+        // Bounded type params: `[T, U: Trait, ..]` — a bound is `: Trait` on a
+        // parameter (the trait the impl-resolved methods come from).
+        "bound-params ::= \"[\" ws bound-param ( ws \",\" ws bound-param )* ws \"]\"",
+        "bound-param ::= ident ( ws \":\" ws upper-ident )?",
 
         // type-decl: `type Name[params] = | Ctor(..) | ...` with REQUIRED
         // leading pipe before the first variant.
@@ -582,6 +595,12 @@ mod tests {
         assert!(gram.accepts("pure fn add(a: Int, b: Int) -> Int = a + b\n"));
         assert!(gram.accepts("type Bool2 =\n  | T\n  | F\n"));
         assert!(gram.accepts("fn id[T](x: T) -> T = x\n"));
+        // Traits: an interface, an impl, and a bounded generic function.
+        assert!(gram.accepts("interface Show[T] { fn show(self: T) -> Int }\n"));
+        assert!(gram.accepts(
+            "impl Show for Point { fn show(self: Point) -> Int = 1 }\n"
+        ));
+        assert!(gram.accepts("fn all[T: Show](x: T) -> Int = show(x)\n"));
         assert!(gram.accepts("fn f() -> Int = if true { 1 } else { 2 }\n"));
         assert!(gram.accepts(
             "fn f(x: Int) -> Int = match x { 0 => 1, _ => x, }\n"
@@ -601,7 +620,7 @@ mod tests {
     #[test]
     fn accepts_real_examples() {
         let gram = g();
-        for name in ["intro", "list", "generic", "hof", "pure", "mem_bench", "array", "record"] {
+        for name in ["intro", "list", "generic", "hof", "pure", "mem_bench", "array", "record", "trait"] {
             let path = format!(
                 "{}/examples/{}.aria",
                 env!("CARGO_MANIFEST_DIR"),

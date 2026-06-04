@@ -1,0 +1,51 @@
+-- Traits / interfaces (M3): an `interface` declares method signatures; an
+-- `impl` provides them for one concrete type. Dispatch is STATIC (resolved by
+-- monomorphization in the compiled backends, by the runtime constructor in the
+-- interpreter). A method CALL is an ordinary free-function call `describe(x)` —
+-- `.` stays record-field-only.
+
+interface Describe[T] {
+  fn code(self: T) -> Int
+}
+
+-- An ADT implementing the interface.
+type Shape = | Circle | Square | Triangle
+
+impl Describe for Shape {
+  fn code(self: Shape) -> Int = match self {
+    Circle => 1,
+    Square => 2,
+    Triangle => 3,
+  }
+}
+
+-- A record type implementing the same interface.
+type Point = { x: Int, y: Int }
+
+impl Describe for Point {
+  fn code(self: Point) -> Int = self.x + self.y
+}
+
+-- A generic function with a `[T: Describe]` bound calls the trait method on its
+-- bounded type parameter; the concrete impl is chosen per instantiation.
+fn twice[T: Describe](v: T) -> Int = code(v) + code(v)
+
+fn main() -> Int = {
+  let s = Triangle;
+  print_int(code(s));                 -- 3   (Shape impl)
+  let p = Point { x: 10, y: 7 };
+  print_int(code(p));                 -- 17  (Point record impl)
+  print_int(twice(Square));           -- 4   (generic over Shape)
+  print_int(twice(Point { x: 1, y: 2 })); -- 6 (generic over Point)
+  0
+}
+
+-- Limitations (by design in this version):
+--   * Impl heads must be CONCRETE types. `impl Describe for Box` where
+--     `type Box[T]` is generic is not supported yet (no blanket/parametric
+--     impls); instantiate the element type into a concrete head instead.
+--   * A trait method's first parameter is the receiver and must be typed as the
+--     interface's type parameter (here `T`); the call is the free function
+--     `code(x)`, never `x.code()` (`.` stays record-field access only).
+--   * Trait methods returning `Unit` run under `aria run` but, like any
+--     `Unit`-returning function, are rejected by the native/wasm backends.

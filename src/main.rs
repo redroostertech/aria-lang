@@ -36,6 +36,7 @@ mod rans;
 mod shape;
 mod tensor;
 mod tensor_ext;
+mod traits;
 mod transformer;
 mod typeck;
 mod wasm;

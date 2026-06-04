@@ -96,6 +96,10 @@ struct Mono<'a> {
     /// `(original_name, concrete_args)`, so inference can unify a concrete
     /// argument type (already mangled) against a declared generic type.
     demangle: HashMap<String, (String, Vec<Ty>)>,
+    /// Reconstructed trait/impl structure: a trait-method (dispatcher) call at a
+    /// concrete receiver type resolves directly to the mangled impl function
+    /// (static dispatch), so dispatchers are never emitted to the backends.
+    traits: crate::traits::TraitIndex,
 }
 
 impl<'a> Mono<'a> {
@@ -136,6 +140,7 @@ impl<'a> Mono<'a> {
             fn_seen: std::collections::HashSet::new(),
             type_seen: std::collections::HashSet::new(),
             demangle: HashMap::new(),
+            traits: crate::traits::index(program),
         }
     }
 
@@ -174,6 +179,7 @@ impl<'a> Mono<'a> {
                             name: f.name.clone(),
                             pure: f.pure,
                             type_params: Vec::new(),
+                            bounds: Vec::new(),
                             params: f.params.clone(),
                             ret: f.ret.clone(),
                             body,
@@ -422,6 +428,7 @@ impl<'a> Mono<'a> {
             name: mangled.clone(),
             pure: info.decl.pure,
             type_params: Vec::new(),
+            bounds: Vec::new(),
             params,
             ret,
             body,
@@ -718,6 +725,68 @@ impl<'a> Mono<'a> {
         }
     }
 
+    /// Statically resolve a trait-method (dispatcher) call to the concrete impl
+    /// function for the receiver's runtime type. The receiver's rewritten type is
+    /// a concrete (possibly mangled) `Named(H, [])`; the impl function is named
+    /// `m$Trait$Head` where `Head` is the ORIGINAL (unmangled) head type. The impl
+    /// function is concrete (no type params), so we specialize it at no type args.
+    fn rewrite_trait_call(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Ty>,
+        tymap: &HashMap<String, Ty>,
+    ) -> Result<(Expr, Ty), String> {
+        let mi = self
+            .traits
+            .methods
+            .get(name)
+            .cloned()
+            .expect("caller checked this is a trait method");
+        if args.is_empty() {
+            return Err(format!(
+                "monomorphize: trait method `{}` has no receiver argument",
+                name
+            ));
+        }
+        // Rewrite the receiver to learn its concrete type.
+        let (rrecv, recv_ty) = self.rewrite_expr(&args[0], env, tymap, None)?;
+        let head_mangled = match &recv_ty {
+            Ty::Named(h, _) => h.clone(),
+            other => {
+                return Err(format!(
+                    "monomorphize: trait method `{}` called on non-ADT receiver of type {}",
+                    name,
+                    crate::typeck::show(other)
+                ))
+            }
+        };
+        // Recover the original (source) head-type name from the mangled name.
+        let head_orig = self
+            .demangle
+            .get(&head_mangled)
+            .map(|(orig, _)| orig.clone())
+            .unwrap_or(head_mangled);
+        let impl_fn = crate::traits::impl_method_name(name, &mi.trait_name, &head_orig);
+        let info = self.fns.get(&impl_fn).cloned().ok_or_else(|| {
+            format!(
+                "monomorphize: no impl of `{}` for `{}` (resolving call to `{}`)",
+                mi.trait_name, head_orig, name
+            )
+        })?;
+        // The impl method is concrete; rewrite each remaining argument against the
+        // impl's (already-concrete) parameter types.
+        let mut rargs = vec![rrecv];
+        for (p, a) in info.decl.params.iter().zip(args.iter()).skip(1) {
+            let pexp = self.mangle_concrete(&p.ty);
+            let (ra, _at) = self.rewrite_expr(a, env, tymap, Some(&pexp))?;
+            rargs.push(ra);
+        }
+        let target = self.specialize_fn(&impl_fn, &[])?;
+        let rt = self.mangle_concrete(&info.decl.ret);
+        Ok((Expr::Call(target, rargs), rt))
+    }
+
     fn rewrite_expr(
         &mut self,
         e: &Expr,
@@ -889,6 +958,13 @@ impl<'a> Mono<'a> {
                         ),
                         (*ret).clone(),
                     ));
+                }
+                // Trait-method (dispatcher) call: resolve STATICALLY to the impl
+                // method for the receiver's concrete type. The dispatcher itself
+                // is never specialized/emitted — the backends only ever see the
+                // mangled impl function `m$Trait$Head`.
+                if self.traits.is_method(name) {
+                    return self.rewrite_trait_call(name, args, env, tymap);
                 }
                 // `array_lit` is the variadic desugaring of an array literal. It
                 // is not in the signature table, so type it directly: the result

@@ -1015,3 +1015,97 @@ fn native_matches_interpreter_fuzz() {
         checked, skipped
     );
 }
+
+// ---------------------------------------------------------------------------
+// 8) Traits / interfaces (M3): differential interp vs. native vs. wasm.
+//    Static dispatch through monomorphization must agree with the interpreter's
+//    runtime-constructor dispatch, for a trait over an ADT, over a record, and
+//    through a bounded generic function.
+// ---------------------------------------------------------------------------
+
+/// Trait programs whose `main` RETURNS the value produced through trait
+/// dispatch (so the compiled runners' "last stdout line" comparison is exact).
+/// Each pairs the source with its expected `main` result.
+fn trait_diff_programs() -> Vec<(String, &'static str)> {
+    vec![
+        // Trait over an ADT and a record; direct + bounded-generic dispatch.
+        (
+            r#"
+            interface Describe[T] { fn code(self: T) -> Int }
+            type Shape = | Circle | Square | Triangle
+            impl Describe for Shape { fn code(self: Shape) -> Int = match self { Circle => 1, Square => 2, Triangle => 3, } }
+            type Point = { x: Int, y: Int }
+            impl Describe for Point { fn code(self: Point) -> Int = self.x + self.y }
+            fn twice[T: Describe](v: T) -> Int = code(v) + code(v)
+            fn main() -> Int = code(Triangle) + code(Point { x: 10, y: 7 }) + twice(Square) + twice(Point { x: 1, y: 2 })
+            "#
+            .to_string(),
+            // 3 + 17 + 4 + 6 = 30
+            "30",
+        ),
+        // Trait over a generic ADT instantiated at a concrete type, plus a
+        // multi-method interface.
+        (
+            r#"
+            interface Sz[T] { fn sz(self: T) -> Int, fn dbl(self: T) -> Int }
+            type Box = | Empty | Full(Int)
+            impl Sz for Box { fn sz(self: Box) -> Int = match self { Empty => 0, Full(n) => n, }, fn dbl(self: Box) -> Int = sz(self) * 2 }
+            fn main() -> Int = sz(Full(21)) + dbl(Full(4))
+            "#
+            .to_string(),
+            // 21 + 8 = 29
+            "29",
+        ),
+    ]
+}
+
+#[test]
+fn traits_interp_matches_compiled() {
+    let progs = trait_diff_programs();
+    let cc = cc_available();
+    let node = node_available();
+    let mut native_checked = 0u64;
+    let mut wasm_checked = 0u64;
+
+    for (src, expected) in &progs {
+        // Oracle: tree-walking interpreter. `main` returns an Int value.
+        let interp = ast_run(src).unwrap_or_else(|e| panic!("interp failed: {}\n{}", e, src));
+        assert_eq!(
+            &interp, expected,
+            "interpreter result mismatch\n{}\n got={} want={}",
+            src, interp, expected
+        );
+
+        let prog = parser::parse(lexer::lex(src).expect("lex")).expect("parse");
+        assert!(typeck::check(&prog).is_ok(), "type error\n{}", src);
+
+        // Native (C) backend.
+        if cc {
+            let c_src = crate::c_backend::compile(&prog)
+                .unwrap_or_else(|e| panic!("c_backend failed: {}\n{}", e, src));
+            let (nat, live) = run_native_live(&c_src)
+                .unwrap_or_else(|e| panic!("native runner failed: {}\n{}", e, src));
+            assert_eq!(nat, *expected, "native != expected\n{}\n native={}", src, nat);
+            assert_eq!(live, 0, "native leaked {} cell(s)\n{}", live, src);
+            native_checked += 1;
+        }
+
+        // WASM backend.
+        if node {
+            let bytes = wasm::compile(&prog)
+                .unwrap_or_else(|e| panic!("wasm compile failed: {}\n{}", e, src));
+            let (w, live) = run_wasm_live(&bytes)
+                .unwrap_or_else(|e| panic!("wasm runner failed: {}\n{}", e, src));
+            assert_eq!(w, *expected, "wasm != expected\n{}\n wasm={}", src, w);
+            assert_eq!(live, 0, "wasm leaked {} cell(s)\n{}", live, src);
+            wasm_checked += 1;
+        }
+    }
+
+    eprintln!(
+        "traits_interp_matches_compiled: {} programs ({} native, {} wasm)",
+        progs.len(),
+        native_checked,
+        wasm_checked
+    );
+}

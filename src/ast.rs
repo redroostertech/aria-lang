@@ -136,6 +136,12 @@ pub struct FnDecl {
     pub pure: bool,
     /// Declared generic type parameters, e.g. `[T, U]`.
     pub type_params: Vec<String>,
+    /// Trait bounds on the type parameters, e.g. `[T: Show]` gives `("T", "Show")`.
+    /// A bound declares that any concrete `T` substituted at a call site must have
+    /// an `impl` of the named trait; inside the body, a trait method of that trait
+    /// may be called on a value of type `T` (deferred until monomorphization picks
+    /// the concrete impl). Empty for ordinary (unbounded) functions.
+    pub bounds: Vec<(String, String)>,
     pub params: Vec<Param>,
     pub ret: Ty,
     pub body: Expr,
@@ -164,6 +170,41 @@ pub struct TypeDecl {
 pub enum Item {
     Fn(FnDecl),
     Type(TypeDecl),
+}
+
+/// A single method signature inside an `interface` declaration, e.g.
+/// `fn show(self: T) -> String`. The first parameter's type is the trait's
+/// `Self` type variable (named after the interface's type parameter), so when an
+/// `impl` provides the method for a concrete type the signature is checked with
+/// `Self` := that type.
+#[derive(Debug, Clone)]
+pub struct MethodSig {
+    pub name: String,
+    pub params: Vec<Param>,
+    pub ret: Ty,
+}
+
+/// An `interface Show[T] { fn show(self: T) -> String, .. }` — a trait /
+/// typeclass. `self_param` is the name of the type variable (`T`) standing for
+/// the implementing type; it appears as `Ty::Var(self_param)` in the method
+/// signatures. Interfaces never reach the backends: the parser lowers them (and
+/// their impls) to ordinary `Item::Fn` dispatchers + mangled impl functions.
+#[derive(Debug, Clone)]
+pub struct InterfaceDecl {
+    pub name: String,
+    pub self_param: String,
+    pub methods: Vec<MethodSig>,
+}
+
+/// An `impl Show for Point { fn show(self: Point) -> String = .. }` — a concrete
+/// implementation of an interface for one head type. `methods` are full function
+/// declarations; lowering mangles each to `show$Show$Point` and synthesizes a
+/// dispatcher that routes by the runtime constructor.
+#[derive(Debug, Clone)]
+pub struct ImplDecl {
+    pub trait_name: String,
+    pub head_type: String,
+    pub methods: Vec<FnDecl>,
 }
 
 #[derive(Debug, Clone)]

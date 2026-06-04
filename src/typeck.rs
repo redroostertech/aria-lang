@@ -55,6 +55,17 @@ pub fn show(t: &Ty) -> String {
 
 type Scope = Vec<HashMap<String, Ty>>;
 
+/// Split a mangled impl-method name `method$Trait$Head` into its parts (the `$`
+/// separator cannot occur in a user identifier). `None` otherwise.
+fn split_impl(name: &str) -> Option<(&str, &str, &str)> {
+    let parts: Vec<&str> = name.split('$').collect();
+    if parts.len() == 3 && !parts.iter().any(|p| p.is_empty()) {
+        Some((parts[0], parts[1], parts[2]))
+    } else {
+        None
+    }
+}
+
 /// A type variable is a solvable unification variable iff its name starts with
 /// `?` (produced by `fresh`). Declared generic parameters keep their source
 /// name (e.g. `T`) and are therefore rigid — `unify` never binds them.
@@ -76,6 +87,10 @@ struct CtorSig {
 #[derive(Clone)]
 struct FnSig {
     type_params: Vec<String>,
+    /// Trait bounds on the type parameters (`param -> trait`). At a call site,
+    /// the concrete type a bounded parameter resolves to must have an `impl` of
+    /// the named trait. Empty for builtins and unbounded functions.
+    bounds: Vec<(String, String)>,
     params: Vec<Ty>,
     ret: Ty,
 }
@@ -84,6 +99,12 @@ struct Checker {
     fns: HashMap<String, FnSig>,
     ctors: HashMap<String, CtorSig>,
     types: HashMap<String, (Vec<String>, Vec<String>)>, // type -> (params, variant ctor names)
+    /// Reconstructed trait/impl structure (traits lowered to plain fns).
+    traits: crate::traits::TraitIndex,
+    /// Trait bounds of the function currently being checked: `param -> trait`.
+    /// A trait-method call on a value of a bounded rigid param is allowed and
+    /// deferred to monomorphization; on an unbounded param it is an error.
+    cur_bounds: RefCell<HashMap<String, String>>,
     // Union-find / substitution for unification variables, plus a fresh counter.
     subst: RefCell<HashMap<String, Ty>>,
     counter: RefCell<u64>,
@@ -148,6 +169,7 @@ pub fn check(program: &Program) -> Result<(), Vec<String>> {
                         f.name.clone(),
                         FnSig {
                             type_params: f.type_params.clone(),
+                            bounds: f.bounds.clone(),
                             params,
                             ret: f.ret.clone(),
                         },
@@ -259,10 +281,57 @@ pub fn check(program: &Program) -> Result<(), Vec<String>> {
         }
     }
 
+    let traits = crate::traits::index(program);
+
+    // Pass 2.5: validate impl methods against their trait signatures. Each impl
+    // method `m$Trait$Head` must match the trait's declared `m` (the dispatcher)
+    // with `Self` := the head type. The reconstructed `MethodInfo` carries the
+    // dispatcher (= trait) signature; we substitute `Self := Head` and compare.
+    for (name, sig) in &fns {
+        if let Some((m, tr, head)) = split_impl(name) {
+            // The dispatcher for this method holds the trait signature.
+            let mi = match traits.methods.get(m) {
+                Some(mi) if mi.trait_name == tr => mi,
+                // No dispatcher (e.g. trait with no other impls reachable): the
+                // lowering still emits one whenever an impl exists, so this only
+                // fires for a genuinely malformed program; skip quietly.
+                _ => continue,
+            };
+            let head_ty = Ty::Named(head.to_string(), Vec::new());
+            let map: HashMap<String, Ty> =
+                std::iter::once((mi.self_param.clone(), head_ty)).collect();
+            if sig.params.len() != mi.params.len() {
+                errors.push(format!(
+                    "impl `{}` for `{}`: method `{}` takes {} parameter(s) but the interface declares {}",
+                    tr, head, m, sig.params.len(), mi.params.len()
+                ));
+                continue;
+            }
+            for (i, (ip, tp)) in sig.params.iter().zip(mi.params.iter()).enumerate() {
+                let want = Checker::apply_map(tp, &map);
+                if &want != ip {
+                    errors.push(format!(
+                        "impl `{}` for `{}`: method `{}` parameter {} has type {} but the interface requires {}",
+                        tr, head, m, i, show(ip), show(&want)
+                    ));
+                }
+            }
+            let want_ret = Checker::apply_map(&mi.ret, &map);
+            if want_ret != sig.ret {
+                errors.push(format!(
+                    "impl `{}` for `{}`: method `{}` returns {} but the interface requires {}",
+                    tr, head, m, show(&sig.ret), show(&want_ret)
+                ));
+            }
+        }
+    }
+
     let checker = Checker {
         fns,
         ctors,
         types,
+        traits,
+        cur_bounds: RefCell::new(HashMap::new()),
         subst: RefCell::new(HashMap::new()),
         counter: RefCell::new(0),
         lam_vars: RefCell::new(Vec::new()),
@@ -273,7 +342,20 @@ pub fn check(program: &Program) -> Result<(), Vec<String>> {
     // body cannot leak into another.
     for item in &program.items {
         if let Item::Fn(f) = item {
+            // A trait-method DISPATCHER (synthesized by lowering) routes a rigid
+            // `Self` receiver by its runtime constructor — `match self { Point(..)
+            // => .. }` deliberately matches a `Self`-typed scrutinee against a
+            // concrete ctor, which ordinary checking would reject. Its arms are
+            // generated mechanically from already-validated impls (Pass 2.5), so
+            // skip body-checking it.
+            if checker.traits.is_method(&f.name)
+                && f.bounds.iter().any(|(p, _)| f.type_params.contains(p))
+            {
+                continue;
+            }
             checker.subst.borrow_mut().clear();
+            *checker.cur_bounds.borrow_mut() =
+                f.bounds.iter().cloned().collect();
             let mut scope: Scope = vec![HashMap::new()];
             for p in &f.params {
                 scope[0].insert(p.name.clone(), p.ty.clone());
@@ -359,16 +441,20 @@ pub fn annotate_lambda_params(program: &mut Program) {
                 let params = f.params.iter().map(|p| p.ty.clone()).collect();
                 fns.entry(f.name.clone()).or_insert(FnSig {
                     type_params: f.type_params.clone(),
+                    bounds: f.bounds.clone(),
                     params,
                     ret: f.ret.clone(),
                 });
             }
         }
     }
+    let traits = crate::traits::index(program);
     let checker = Checker {
         fns,
         ctors,
         types,
+        traits,
+        cur_bounds: RefCell::new(HashMap::new()),
         subst: RefCell::new(HashMap::new()),
         counter: RefCell::new(0),
         lam_vars: RefCell::new(Vec::new()),
@@ -378,7 +464,15 @@ pub fn annotate_lambda_params(program: &mut Program) {
     let mut resolved: HashMap<String, Ty> = HashMap::new();
     for item in &program.items {
         if let Item::Fn(f) = item {
+            // Skip dispatchers (their `match self { Ctor(..) => .. }` body is not
+            // ordinarily well-typed; see Pass 3 in `check`).
+            if checker.traits.is_method(&f.name)
+                && f.bounds.iter().any(|(p, _)| f.type_params.contains(p))
+            {
+                continue;
+            }
             checker.subst.borrow_mut().clear();
+            *checker.cur_bounds.borrow_mut() = f.bounds.iter().cloned().collect();
             checker.lam_vars.borrow_mut().clear();
             let mut scope: Scope = vec![HashMap::new()];
             for p in &f.params {
@@ -930,6 +1024,15 @@ impl Checker {
                 if let Some(local) = Checker::lookup_var(scope, name) {
                     return self.synth_apply(&local, args, scope, &format!("`{}`", name));
                 }
+                // Trait-method call (`show(p)`): the callee is a dispatcher. Type
+                // it against the trait method signature, substituting `Self` with
+                // the receiver's type — concrete (requiring an impl) or a bounded
+                // rigid param (deferred to monomorphization). This keeps `Self`
+                // rigid: parametricity is preserved and an unbounded `T` is
+                // rejected.
+                if let Some(mi) = self.traits.methods.get(name).cloned() {
+                    return self.synth_trait_method(name, &mi, args, scope);
+                }
                 // `array_lit` is a variadic internal builtin (the desugaring of an
                 // array literal `[e0, .., en]`). It is NOT in the signature table,
                 // so handle it before the `builtin_sig`/`self.fns` lookup: every
@@ -950,15 +1053,15 @@ impl Checker {
                     }
                     return Ok(Ty::Named("Array".to_string(), vec![elem]));
                 }
-                let (params, ret, type_params) =
+                let (params, ret, type_params, bounds) =
                     if let Some((p, r)) = builtin_sig(name) {
                         // A builtin whose signature mentions type variables
                         // (e.g. `array_get: (Array[T], Int) -> T`) is generic:
                         // collect those vars so they instantiate fresh per call.
                         let tps = builtin_type_params(&p, &r);
-                        (p, r, tps)
+                        (p, r, tps, Vec::new())
                     } else if let Some(sig) = self.fns.get(name).cloned() {
-                        (sig.params, sig.ret, sig.type_params)
+                        (sig.params, sig.ret, sig.type_params, sig.bounds)
                     } else {
                         return Err(format!("unknown function `{}`", name));
                     };
@@ -991,6 +1094,40 @@ impl Checker {
                         self.check(arg, &expected, scope).map_err(|e| {
                             format!("function `{}` argument {}: {}", name, i, e)
                         })?;
+                    }
+                }
+                // A `[T: Trait]`-bounded function may only be instantiated at a
+                // type that has an `impl` of that trait — the obligation the bound
+                // promises. Now that the arguments have pinned the type
+                // parameters, check each bound against what `T` resolved to. A
+                // concrete type must have an impl; a still-rigid type parameter
+                // must itself carry the same bound in the enclosing function
+                // (the obligation propagates); a still-unresolved fresh variable
+                // (a phantom/unused parameter) is left to monomorphization.
+                for (param, trait_name) in &bounds {
+                    let Some(tv) = map.get(param) else { continue };
+                    match self.resolve(tv) {
+                        Ty::Named(h, _) => {
+                            if !self.traits.has_impl(trait_name, &h) {
+                                return Err(format!(
+                                    "`{}` requires its type parameter `{}` to impl `{}`, but `{}` does not",
+                                    name, param, trait_name, h
+                                ));
+                            }
+                        }
+                        Ty::Var(t) if !is_fresh(&t) => {
+                            let ok = matches!(
+                                self.cur_bounds.borrow().get(&t),
+                                Some(b) if b == trait_name
+                            );
+                            if !ok {
+                                return Err(format!(
+                                    "`{}` requires its type parameter `{}` to impl `{}`, but `{}` is not bounded by `{}`",
+                                    name, param, trait_name, t, trait_name
+                                ));
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 Ok(Self::apply_map(&ret, &map))
@@ -1141,6 +1278,72 @@ impl Checker {
         }
         let t = self.synth(e, scope)?;
         self.unify(&t, &exp)
+    }
+
+    /// Type a trait-method call `m(self, ..)` against the trait method signature
+    /// `mi`, resolving `Self` from the receiver's type. `Self` is either a
+    /// concrete head type with a required `impl`, or a rigid type parameter the
+    /// enclosing function bounds by this trait (deferred to monomorphization).
+    fn synth_trait_method(
+        &self,
+        name: &str,
+        mi: &crate::traits::MethodInfo,
+        args: &[Expr],
+        scope: &mut Scope,
+    ) -> Result<Ty, String> {
+        if args.len() != mi.params.len() {
+            return Err(format!(
+                "trait method `{}` expects {} argument(s), got {}",
+                name,
+                mi.params.len(),
+                args.len()
+            ));
+        }
+        // Resolve `Self` from the receiver (first) argument.
+        let recv_ty = self.resolve(&self.synth(&args[0], scope)?);
+        let self_ty: Ty = match &recv_ty {
+            Ty::Named(h, _) => {
+                if !self.traits.has_impl(&mi.trait_name, h) {
+                    return Err(format!(
+                        "no impl of `{}` for `{}` (required by call to `{}`)",
+                        mi.trait_name, h, name
+                    ));
+                }
+                recv_ty.clone()
+            }
+            Ty::Var(t) if !is_fresh(t) => {
+                // A rigid type parameter: it must be bounded by this trait in the
+                // enclosing function, e.g. `fn f[T: Show](..)`. Otherwise calling
+                // a trait method on an unconstrained `T` is unsound.
+                match self.cur_bounds.borrow().get(t) {
+                    Some(bound) if bound == &mi.trait_name => recv_ty.clone(),
+                    _ => {
+                        return Err(format!(
+                            "type parameter `{}` is not bounded by `{}`; add `[{}: {}]` to call `{}` on it",
+                            t, mi.trait_name, t, mi.trait_name, name
+                        ))
+                    }
+                }
+            }
+            other => {
+                return Err(format!(
+                    "trait method `{}` of `{}` cannot be called on a value of type {}",
+                    name,
+                    mi.trait_name,
+                    show(other)
+                ))
+            }
+        };
+        let map: HashMap<String, Ty> =
+            std::iter::once((mi.self_param.clone(), self_ty)).collect();
+        // Check each remaining argument against its (Self-substituted) param.
+        for (i, (arg, pt)) in args.iter().zip(mi.params.iter()).enumerate().skip(1) {
+            let at = self.synth(arg, scope)?;
+            let expected = Self::apply_map(pt, &map);
+            self.unify(&expected, &at)
+                .map_err(|e| format!("trait method `{}` argument {}: {}", name, i, e))?;
+        }
+        Ok(Self::apply_map(&mi.ret, &map))
     }
 
     fn synth_apply(
@@ -1772,6 +1975,159 @@ mod tests {
         let src = "fn main() -> Int = (\\(x: Int) -> x + 1)(true)";
         let errs = check_src(src).unwrap_err();
         assert!(!errs.is_empty(), "expected a type error");
+    }
+
+    // ---- traits / interfaces --------------------------------------------
+
+    #[test]
+    fn trait_impl_and_bounded_call_check() {
+        // An interface, two impls (an ADT + a record), and a bounded generic
+        // function calling the trait method all type-check.
+        let src = r#"
+            interface Describe[T] { fn code(self: T) -> Int }
+            type Shape = | Circle | Square
+            impl Describe for Shape { fn code(self: Shape) -> Int = match self { Circle => 1, Square => 2, } }
+            type Point = { x: Int, y: Int }
+            impl Describe for Point { fn code(self: Point) -> Int = self.x + self.y }
+            fn twice[T: Describe](v: T) -> Int = code(v) + code(v)
+            fn main() -> Int = { print_int(code(Circle)); print_int(twice(Point { x: 1, y: 2 })); 0 }
+        "#;
+        assert!(check_src(src).is_ok(), "got: {:?}", check_src(src));
+    }
+
+    #[test]
+    fn trait_missing_impl_method_caught() {
+        let src = r#"
+            interface Describe[T] { fn code(self: T) -> Int }
+            type Shape = | Circle
+            impl Describe for Shape { }
+            fn main() -> Int = 0
+        "#;
+        // Lowering rejects this at parse time with a clean message.
+        let err = lexer::lex(src).and_then(parser::parse).unwrap_err();
+        assert!(err.contains("missing method") && err.contains("code"), "got: {}", err);
+    }
+
+    #[test]
+    fn trait_duplicate_impl_caught() {
+        let src = r#"
+            interface Describe[T] { fn code(self: T) -> Int }
+            type Shape = | Circle
+            impl Describe for Shape { fn code(self: Shape) -> Int = 1 }
+            impl Describe for Shape { fn code(self: Shape) -> Int = 2 }
+            fn main() -> Int = 0
+        "#;
+        let err = lexer::lex(src).and_then(parser::parse).unwrap_err();
+        assert!(err.contains("duplicate impl"), "got: {}", err);
+    }
+
+    #[test]
+    fn trait_call_on_type_without_impl_caught() {
+        let src = r#"
+            interface Describe[T] { fn code(self: T) -> Int }
+            type Shape = | Circle
+            type Color = | Red
+            impl Describe for Shape { fn code(self: Shape) -> Int = 1 }
+            fn main() -> Int = { print_int(code(Red)); 0 }
+        "#;
+        let errs = check_src(src).unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains("no impl of `Describe` for `Color`")),
+            "got: {:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn trait_method_on_unbounded_param_caught() {
+        let src = r#"
+            interface Describe[T] { fn code(self: T) -> Int }
+            type Shape = | Circle
+            impl Describe for Shape { fn code(self: Shape) -> Int = 1 }
+            fn bad[T](v: T) -> Int = code(v)
+            fn main() -> Int = 0
+        "#;
+        let errs = check_src(src).unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains("not bounded by `Describe`")),
+            "got: {:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn trait_impl_signature_mismatch_caught() {
+        // An impl method whose return type does not match the interface.
+        let src = r#"
+            interface Describe[T] { fn code(self: T) -> Int }
+            type Shape = | Circle
+            impl Describe for Shape { fn code(self: Shape) -> Bool = true }
+            fn main() -> Int = 0
+        "#;
+        let errs = check_src(src).unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains("interface requires") || e.contains("return")),
+            "got: {:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn trait_interface_receiver_must_be_self_typed() {
+        // An interface method whose receiver isn't typed as the trait's type
+        // parameter would dispatch on the wrong value and let an incoherent impl
+        // (`fn show(self: Int)` for an ADT) slip through. Rejected at lowering.
+        let src = r#"
+            interface Show[T] { fn show(self: Int) -> Int }
+            type Color = | Red | Green
+            impl Show for Color { fn show(self: Int) -> Int = self + 1 }
+            fn main() -> Int = show(Red)
+        "#;
+        let err = lexer::lex(src).and_then(parser::parse).unwrap_err();
+        assert!(
+            err.contains("first parameter must be the receiver typed `T`"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn trait_bound_on_undeclared_interface_caught() {
+        // A `[T: Trait]` bound naming a trait that was never declared is a typo,
+        // not a silently-ignored no-op.
+        let src = r#"
+            fn foo[T: Bogus](v: T) -> T = v
+            fn main() -> Int = { foo(5); 0 }
+        "#;
+        let err = lexer::lex(src).and_then(parser::parse).unwrap_err();
+        assert!(
+            err.contains("undeclared interface `Bogus`"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn trait_bounded_call_with_unimpld_type_caught() {
+        // Passing a concrete type with no `impl` of the bound to a `[T: Trait]`
+        // function is caught at the CALL site (not deferred to monomorphization /
+        // the interpreter, where the two backends would diverge).
+        let src = r#"
+            interface D[T] { fn d(self: T) -> Int }
+            type Color = | Red | Green
+            impl D for Color { fn d(self: Color) -> Int = 1 }
+            type Hue = | Warm | Cool
+            fn use_d[T: D](x: T) -> Int = d(x)
+            fn main() -> Int = use_d(Warm)
+        "#;
+        let errs = check_src(src).unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains("requires its type parameter")
+                && e.contains("impl `D`")
+                && e.contains("Hue")),
+            "got: {:?}",
+            errs
+        );
     }
 
     #[test]

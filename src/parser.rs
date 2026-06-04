@@ -112,8 +112,14 @@ impl Parser {
 
     pub fn parse_program(&mut self) -> Result<Program, String> {
         let mut items = Vec::new();
+        let mut interfaces: Vec<InterfaceDecl> = Vec::new();
+        let mut impls: Vec<ImplDecl> = Vec::new();
         while *self.peek() != Tok::Eof {
-            items.push(self.parse_item()?);
+            match self.peek() {
+                Tok::Interface => interfaces.push(self.parse_interface()?),
+                Tok::Impl => impls.push(self.parse_impl()?),
+                _ => items.push(self.parse_item()?),
+            }
         }
         // Prepend a synthetic tuple ADT for each arity ACTUALLY used (`(a, b)`
         // desugars to `$Tuple2(a, b)`). Tuples reuse the entire ADT pipeline —
@@ -124,6 +130,12 @@ impl Parser {
         arities.sort_unstable();
         let mut all: Vec<Item> = arities.into_iter().map(synthetic_tuple_type).collect();
         all.extend(items);
+        // Lower interfaces + impls to ordinary `Item::Fn`s (mangled impl methods
+        // + per-method dispatchers) so no downstream stage ever sees a new `Item`
+        // variant. This is the keystone of the trait design: STATIC dispatch via
+        // monomorphization in the compiled backends, runtime constructor dispatch
+        // in the interpreter — both routed through the same lowered functions.
+        crate::traits::lower(&mut all, &interfaces, &impls)?;
         Ok(Program { items: all })
     }
 
@@ -132,11 +144,101 @@ impl Parser {
             Tok::Fn | Tok::Pure => Ok(Item::Fn(self.parse_fn()?)),
             Tok::Type => Ok(Item::Type(self.parse_type_decl()?)),
             other => Err(format!(
-                "line {}: expected `fn`, `pure`, or `type`, found {:?}",
+                "line {}: expected `fn`, `pure`, `type`, `interface`, or `impl`, found {:?}",
                 self.line(),
                 other
             )),
         }
+    }
+
+    /// Parse `interface Name[T] { fn m(self: T, ..) -> R, .. }`. The single type
+    /// parameter is `Self` (the implementing type). Each method is a SIGNATURE
+    /// only (no body); methods are separated by `,` or newlines and the list may
+    /// have a trailing comma.
+    fn parse_interface(&mut self) -> Result<InterfaceDecl, String> {
+        self.expect(&Tok::Interface)?;
+        let name = self.expect_ident()?;
+        let params = self.parse_type_params()?;
+        if params.len() != 1 {
+            return Err(format!(
+                "line {}: interface `{}` must declare exactly one type parameter (the implementing type), e.g. `interface {}[T]`",
+                self.line(),
+                name,
+                name
+            ));
+        }
+        let self_param = params.into_iter().next().unwrap();
+        let tps = vec![self_param.clone()];
+        self.expect(&Tok::LBrace)?;
+        let mut methods = Vec::new();
+        while *self.peek() != Tok::RBrace {
+            self.expect(&Tok::Fn)?;
+            let mname = self.expect_ident()?;
+            self.expect(&Tok::LParen)?;
+            let mut mparams = Vec::new();
+            if *self.peek() != Tok::RParen {
+                loop {
+                    let pname = self.expect_ident()?;
+                    self.expect(&Tok::Colon)?;
+                    let ty = self.parse_type(&tps)?;
+                    mparams.push(Param { name: pname, ty });
+                    if *self.peek() == Tok::Comma {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+            }
+            self.expect(&Tok::RParen)?;
+            self.expect(&Tok::Arrow)?;
+            let ret = self.parse_type(&tps)?;
+            methods.push(MethodSig { name: mname, params: mparams, ret });
+            if *self.peek() == Tok::Comma {
+                self.advance();
+            }
+        }
+        self.expect(&Tok::RBrace)?;
+        if methods.is_empty() {
+            return Err(format!(
+                "line {}: interface `{}` must declare at least one method",
+                self.line(),
+                name
+            ));
+        }
+        Ok(InterfaceDecl { name, self_param, methods })
+    }
+
+    /// Parse `impl Trait for Head { fn m(self: Head, ..) -> R = body, .. }`.
+    /// The head type is a concrete named type (no generic impl heads); each
+    /// method is a full function declaration whose body is provided.
+    fn parse_impl(&mut self) -> Result<ImplDecl, String> {
+        self.expect(&Tok::Impl)?;
+        let trait_name = self.expect_ident()?;
+        // `for` is spelled as an identifier (no dedicated keyword needed).
+        match self.peek().clone() {
+            Tok::Ident(s) if s == "for" => {
+                self.advance();
+            }
+            other => {
+                return Err(format!(
+                    "line {}: expected `for` in `impl {} for ..`, found {:?}",
+                    self.line(),
+                    trait_name,
+                    other
+                ))
+            }
+        }
+        let head_type = self.expect_ident()?;
+        self.expect(&Tok::LBrace)?;
+        let mut methods = Vec::new();
+        while *self.peek() != Tok::RBrace {
+            methods.push(self.parse_fn()?);
+            if *self.peek() == Tok::Comma {
+                self.advance();
+            }
+        }
+        self.expect(&Tok::RBrace)?;
+        Ok(ImplDecl { trait_name, head_type, methods })
     }
 
     fn parse_fn(&mut self) -> Result<FnDecl, String> {
@@ -150,7 +252,7 @@ impl Parser {
         };
         self.expect(&Tok::Fn)?;
         let name = self.expect_ident()?;
-        let type_params = self.parse_type_params()?;
+        let (type_params, bounds) = self.parse_type_params_bounded()?;
         self.expect(&Tok::LParen)?;
         let mut params = Vec::new();
         if *self.peek() != Tok::RParen {
@@ -178,10 +280,43 @@ impl Parser {
             name,
             pure,
             type_params,
+            bounds,
             params,
             ret,
             body,
         })
+    }
+
+    // Parse an optional `[T, U: Trait, ...]` type-parameter list, returning the
+    // parameter names and any `param: Trait` bounds. Bounds are how a generic
+    // function declares it may call a trait's methods on that parameter (static
+    // dispatch resolved at monomorphization). A parameter may carry at most one
+    // bound here (the surface syntax `T: Show`); multiple traits are not yet
+    // supported.
+    fn parse_type_params_bounded(&mut self) -> Result<(Vec<String>, Vec<(String, String)>), String> {
+        let mut params = Vec::new();
+        let mut bounds = Vec::new();
+        if *self.peek() == Tok::LBracket {
+            self.advance();
+            if *self.peek() != Tok::RBracket {
+                loop {
+                    let p = self.expect_ident()?;
+                    if *self.peek() == Tok::Colon {
+                        self.advance();
+                        let tr = self.expect_ident()?;
+                        bounds.push((p.clone(), tr));
+                    }
+                    params.push(p);
+                    if *self.peek() == Tok::Comma {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+            }
+            self.expect(&Tok::RBracket)?;
+        }
+        Ok((params, bounds))
     }
 
     // Parse an optional `[T, U, ...]` type-parameter list on a declaration.
