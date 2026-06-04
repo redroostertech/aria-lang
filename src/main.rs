@@ -10,6 +10,7 @@
 //!   aria wasm-run <file.aria>       compile to wasm and run it via Node
 //!   aria native <file.aria> <out>   transpile to C and build a native exe via cc
 //!   aria native-run <file.aria>     transpile to C, build, run, print the result
+//!   aria gbnf  [<file.out>]         emit a GBNF grammar for Aria's syntax
 
 // Many runtime modules expose library-style APIs not all wired into the CLI yet.
 #![allow(dead_code)]
@@ -18,6 +19,7 @@ mod arith;
 mod ast;
 mod builtins;
 mod c_backend;
+mod gbnf;
 mod interp;
 mod ir;
 mod lexer;
@@ -43,7 +45,7 @@ use std::process::ExitCode;
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: aria <run|check|ast|pack|unpack|npack|nunpack|bench|demo|mem|wasm|wasm-run|native|native-run> [args...]");
+        eprintln!("usage: aria <run|check|ast|pack|unpack|npack|nunpack|bench|demo|mem|wasm|wasm-run|native|native-run|gbnf> [args...]");
         return ExitCode::from(2);
     }
 
@@ -63,6 +65,7 @@ fn main() -> ExitCode {
         "wasm-run" => run_wasm_run(&args),
         "native" => run_native_compile(&args),
         "native-run" => run_native_run(&args),
+        "gbnf" => run_gbnf(&args),
         other => {
             eprintln!("unknown command `{}`", other);
             ExitCode::from(2)
@@ -373,6 +376,24 @@ fn run_native_run(args: &[String]) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// `aria gbnf [<file.out>]`: emit a GBNF grammar describing Aria's concrete
+/// syntax. With no path the grammar is printed to stdout; with a path it is
+/// written there. The grammar is real GBNF (usable by llama.cpp) so an LLM
+/// constrained-decoding against it cannot emit an Aria syntax error.
+fn run_gbnf(args: &[String]) -> ExitCode {
+    let g = gbnf::grammar();
+    if let Some(out) = args.get(2) {
+        if let Err(e) = std::fs::write(out, &g) {
+            eprintln!("error: cannot write {}: {}", out, e);
+            return ExitCode::FAILURE;
+        }
+        eprintln!("wrote {} ({} bytes)", out, g.len());
+    } else {
+        print!("{}", g);
+    }
+    ExitCode::SUCCESS
 }
 
 fn run_demo(which: Option<&str>) -> ExitCode {
