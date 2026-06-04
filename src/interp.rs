@@ -20,6 +20,10 @@ pub enum Value {
     /// reuse that the compiled backends perform is an optimization that cannot
     /// change observable results, so the oracle need not model it.
     Array(Vec<Value>),
+    /// A flat, growable byte buffer (`Bytes`). A byte is an Int 0..255. Distinct
+    /// from `Str` (own type tag) so `==`/display never conflate the two even when
+    /// they hold identical bytes.
+    Bytes(Vec<u8>),
     /// An opaque AI-runtime tensor handle, built and queried via builtins.
     Tensor(crate::tensor::Tensor),
     /// A first-class function value. A lambda captures the environment in which
@@ -57,6 +61,7 @@ impl Value {
                 let inner: Vec<String> = xs.iter().map(|v| v.display()).collect();
                 format!("[{}]", inner.join(", "))
             }
+            Value::Bytes(bs) => render_bytes(bs),
             Value::Closure(c) => {
                 format!("<closure/{}>", c.params.len())
             }
@@ -70,6 +75,15 @@ impl Value {
             }
         }
     }
+}
+
+/// The ONE canonical textual rendering of a `Bytes` value, emitted byte-for-byte
+/// identically by every backend (interp / IR / native / wasm): the literal
+/// `Bytes[`, then each byte as lowercase two-digit hex separated by single
+/// spaces, then `]`. Empty is `Bytes[]`.
+pub fn render_bytes(bs: &[u8]) -> String {
+    let inner: Vec<String> = bs.iter().map(|b| format!("{:02x}", b)).collect();
+    format!("Bytes[{}]", inner.join(" "))
 }
 
 type Scope = Vec<HashMap<String, Value>>;
@@ -669,6 +683,10 @@ fn values_equal(a: &Value, b: &Value) -> bool {
         (Value::Array(x), Value::Array(y)) => {
             x.len() == y.len() && x.iter().zip(y).all(|(a, b)| values_equal(a, b))
         }
+        // Bytes compare by content. The (Bytes, Str) and (Str, Bytes) pairs fall
+        // through to `false` below: a Bytes never equals a Str (distinct tags),
+        // and the type checker rejects such a comparison up front anyway.
+        (Value::Bytes(x), Value::Bytes(y)) => x == y,
         // Tensors compare structurally (shape + contents). Without this arm,
         // `t == t` fell through to `false`, silently disagreeing with the type
         // checker which accepts `==` on Tensor.
@@ -937,6 +955,74 @@ fn builtin(name: &str, args: &[Value]) -> Result<Option<Value>, String> {
         // values in order; empty args -> empty array. Not in `signatures()`
         // (it is variadic), so it bypasses the drift table/test.
         "array_lit" => Ok(Some(Value::Array(args.to_vec()))),
+
+        // ---- Bytes ---------------------------------------------------------
+        // A flat byte buffer. `set`/`push` are functional (the oracle copies; the
+        // compiled backends reuse in place when unique). Out-of-range index on
+        // get/set is a runtime error. A byte value outside 0..255 on set/push is
+        // REJECTED with a runtime error (the policy is identical in every
+        // backend). `to_str` errors on invalid UTF-8.
+        "bytes_new" => match args {
+            [] => Ok(Some(Value::Bytes(Vec::new()))),
+            _ => Err("bytes_new expects no arguments".into()),
+        },
+        "bytes_len" => match args {
+            [Value::Bytes(bs)] => Ok(Some(Value::Int(bs.len() as i64))),
+            _ => Err("bytes_len expects (Bytes)".into()),
+        },
+        "bytes_get" => match args {
+            [Value::Bytes(bs), Value::Int(i)] => {
+                if *i < 0 || *i as usize >= bs.len() {
+                    return Err(format!(
+                        "bytes_get index {} out of range for bytes of length {}",
+                        i,
+                        bs.len()
+                    ));
+                }
+                Ok(Some(Value::Int(bs[*i as usize] as i64)))
+            }
+            _ => Err("bytes_get expects (Bytes, Int)".into()),
+        },
+        "bytes_set" => match args {
+            [Value::Bytes(bs), Value::Int(i), Value::Int(v)] => {
+                if *i < 0 || *i as usize >= bs.len() {
+                    return Err(format!(
+                        "bytes_set index {} out of range for bytes of length {}",
+                        i,
+                        bs.len()
+                    ));
+                }
+                if *v < 0 || *v > 255 {
+                    return Err(format!("bytes_set byte value {} out of range 0..255", v));
+                }
+                let mut out = bs.clone();
+                out[*i as usize] = *v as u8;
+                Ok(Some(Value::Bytes(out)))
+            }
+            _ => Err("bytes_set expects (Bytes, Int, Int)".into()),
+        },
+        "bytes_push" => match args {
+            [Value::Bytes(bs), Value::Int(v)] => {
+                if *v < 0 || *v > 255 {
+                    return Err(format!("bytes_push byte value {} out of range 0..255", v));
+                }
+                let mut out = bs.clone();
+                out.push(*v as u8);
+                Ok(Some(Value::Bytes(out)))
+            }
+            _ => Err("bytes_push expects (Bytes, Int)".into()),
+        },
+        "bytes_from_str" => match args {
+            [Value::Str(s)] => Ok(Some(Value::Bytes(s.as_bytes().to_vec()))),
+            _ => Err("bytes_from_str expects (Str)".into()),
+        },
+        "bytes_to_str" => match args {
+            [Value::Bytes(bs)] => match std::str::from_utf8(bs) {
+                Ok(s) => Ok(Some(Value::Str(s.to_string()))),
+                Err(_) => Err("bytes_to_str: invalid UTF-8".into()),
+            },
+            _ => Err("bytes_to_str expects (Bytes)".into()),
+        },
         _ => Ok(None),
     }
 }
@@ -1029,6 +1115,7 @@ mod tests {
             Str => Value::Str(String::new()),
             Unit => Value::Unit,
             Named(n, _) if n == "Tensor" => Value::Tensor(crate::tensor::Tensor::zeros(&[1, 1])),
+            Named(n, _) if n == "Bytes" => Value::Bytes(vec![0]),
             Named(n, args) if n == "Array" => {
                 // A one-element array of the (concrete) element type, so generic
                 // array builtins have something to index/return.
@@ -1050,6 +1137,7 @@ mod tests {
             Value::Str(_) => Str,
             Value::Unit => Unit,
             Value::Tensor(_) => Named("Tensor".into(), vec![]),
+            Value::Bytes(_) => Named("Bytes".into(), vec![]),
             Value::Array(xs) => Named(
                 "Array".into(),
                 vec![xs.first().map(value_ty).unwrap_or(Var("T".into()))],
@@ -1246,6 +1334,77 @@ mod tests {
             }
         "#);
         assert!(matches!(diff, Value::Bool(false)));
+    }
+
+    // Lex -> parse -> typeck -> interp, returning `main`'s runtime error message.
+    fn run_err(src: &str) -> String {
+        let toks = lexer::lex(src).expect("lex");
+        let prog = parser::parse(toks).expect("parse");
+        typeck::check(&prog).expect("typeck");
+        let interp = Interp::new(&prog).expect("interp::new");
+        interp.run_main().expect_err("expected a runtime error")
+    }
+
+    #[test]
+    fn bytes_build_get_set_push_and_roundtrip() {
+        // from_str -> push -> set (in place) -> len/get -> to_str round-trip.
+        let v = run(r#"
+            fn main() -> Int = {
+                let b = bytes_from_str("Hi");
+                let b2 = bytes_push(b, 33);
+                let b3 = bytes_set(b2, 0, 104);
+                bytes_len(b3) + bytes_get(b3, 2)
+            }
+        "#);
+        // len 3 + byte at index 2 ('!') = 33  -> 36
+        assert!(matches!(v, Value::Int(36)), "got {}", v.display());
+
+        let s = run(r#"fn main() -> String = bytes_to_str(bytes_from_str("hello"))"#);
+        assert_eq!(s.display(), "hello");
+    }
+
+    #[test]
+    fn bytes_canonical_display_and_equality() {
+        // The canonical rendering: `Bytes[00 ab ff]` (lowercase hex, empty `[]`).
+        let v = run(r#"
+            fn main() -> Bytes = {
+                let b = bytes_push(bytes_push(bytes_push(bytes_new(), 0), 171), 255);
+                b
+            }
+        "#);
+        assert_eq!(v.display(), "Bytes[00 ab ff]");
+        assert_eq!(run("fn main() -> Bytes = bytes_new()").display(), "Bytes[]");
+
+        // `==` compares contents; a Bytes never equals a Str with the same bytes
+        // (distinct type tag — the type checker also rejects that comparison).
+        let eq = run(r#"fn main() -> Bool = bytes_from_str("ok") == bytes_from_str("ok")"#);
+        assert!(matches!(eq, Value::Bool(true)));
+        let ne = run(r#"fn main() -> Bool = bytes_from_str("ok") == bytes_from_str("no")"#);
+        assert!(matches!(ne, Value::Bool(false)));
+        // Distinct tags: a Bytes and a Str with identical bytes are NOT equal.
+        assert!(!values_equal(
+            &Value::Bytes(b"hi".to_vec()),
+            &Value::Str("hi".to_string())
+        ));
+    }
+
+    #[test]
+    fn bytes_error_cases_are_clean_runtime_errors() {
+        // Index out of range on get / set.
+        assert!(run_err("fn main() -> Int = bytes_get(bytes_from_str(\"ab\"), 5)")
+            .contains("out of range"));
+        assert!(run_err("fn main() -> Bytes = bytes_set(bytes_from_str(\"ab\"), 9, 1)")
+            .contains("out of range"));
+        // Byte value outside 0..255 on set / push is rejected.
+        assert!(run_err("fn main() -> Bytes = bytes_push(bytes_new(), 300)")
+            .contains("out of range 0..255"));
+        assert!(run_err("fn main() -> Bytes = bytes_set(bytes_from_str(\"a\"), 0, -1)")
+            .contains("out of range 0..255"));
+        // Invalid UTF-8 in to_str.
+        assert!(
+            run_err("fn main() -> String = bytes_to_str(bytes_push(bytes_new(), 255))")
+                .contains("invalid UTF-8")
+        );
     }
 
     #[test]

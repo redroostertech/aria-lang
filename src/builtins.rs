@@ -14,8 +14,9 @@ use crate::ast::Ty;
 use std::sync::OnceLock;
 
 /// Built-in (opaque) type names that need no user `type` declaration.
-/// `Array` is generic (`Array[T]`); `Tensor` is a nullary opaque handle.
-pub const BUILTIN_TYPES: &[&str] = &["Tensor", "Array"];
+/// `Array` is generic (`Array[T]`); `Tensor` and `Bytes` are nullary opaque
+/// handles. `Bytes` is a flat, growable byte buffer (a byte = Int 0..255).
+pub const BUILTIN_TYPES: &[&str] = &["Tensor", "Array", "Bytes"];
 
 /// Cached signature table, built once on first access. The table is on a hot
 /// path (`lookup`/`names` are called per call-expression during lowering and
@@ -46,6 +47,8 @@ fn build_signatures() -> Vec<(&'static str, Vec<Ty>, Ty)> {
     // which instantiates the var fresh per call site (see typeck `Expr::Call`).
     let elem = || Var("T".to_string());
     let array = || Named("Array".to_string(), vec![elem()]);
+    // The nullary opaque byte-buffer handle, shared across the bytes builtins.
+    let bytes = || Named("Bytes".to_string(), vec![]);
     vec![
         ("print_int", vec![Int], Unit),
         ("print_float", vec![Float], Unit),
@@ -72,6 +75,16 @@ fn build_signatures() -> Vec<(&'static str, Vec<Ty>, Ty)> {
         ("array_get", vec![array(), Int], elem()),
         ("array_set", vec![array(), Int, elem()], array()),
         ("array_push", vec![array(), elem()], array()),
+        // ---- Bytes (flat byte buffer, FBIP in-place reuse like Array) -------
+        // A byte is an Int 0..255. `set`/`push` of an out-of-range Int trap at
+        // run time (range policy applied identically across all backends).
+        ("bytes_new", vec![], bytes()),
+        ("bytes_len", vec![bytes()], Int),
+        ("bytes_get", vec![bytes(), Int], Int),
+        ("bytes_set", vec![bytes(), Int, Int], bytes()),
+        ("bytes_push", vec![bytes(), Int], bytes()),
+        ("bytes_from_str", vec![Str], bytes()),
+        ("bytes_to_str", vec![bytes()], Str),
     ]
 }
 

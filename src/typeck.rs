@@ -1807,6 +1807,55 @@ mod tests {
         assert!(check_src(src).is_ok());
     }
 
+    // ---- Bytes builtin type & signatures --------------------------------
+
+    #[test]
+    fn bytes_is_a_builtin_type_with_correct_signatures() {
+        use crate::ast::Ty::*;
+        use crate::builtins;
+        // `Bytes` is a declared builtin (opaque) type name (nullary).
+        assert!(builtins::BUILTIN_TYPES.contains(&"Bytes"));
+        let bytes = Named("Bytes".to_string(), vec![]);
+        // Each bytes builtin has the expected (params, ret) signature.
+        let cases: &[(&str, Vec<Ty>, Ty)] = &[
+            ("bytes_new", vec![], bytes.clone()),
+            ("bytes_len", vec![bytes.clone()], Int),
+            ("bytes_get", vec![bytes.clone(), Int], Int),
+            ("bytes_set", vec![bytes.clone(), Int, Int], bytes.clone()),
+            ("bytes_push", vec![bytes.clone(), Int], bytes.clone()),
+            ("bytes_from_str", vec![Str], bytes.clone()),
+            ("bytes_to_str", vec![bytes.clone()], Str),
+        ];
+        for (name, params, ret) in cases {
+            let (p, r) = builtins::lookup(name)
+                .unwrap_or_else(|| panic!("builtin `{}` missing from signature table", name));
+            assert_eq!(&p, params, "param mismatch for `{}`", name);
+            assert_eq!(&r, ret, "return mismatch for `{}`", name);
+        }
+    }
+
+    #[test]
+    fn bytes_program_type_checks_and_bytes_neq_str_is_rejected() {
+        // A representative Bytes program type-checks.
+        let ok = r#"
+            fn main() -> Int = {
+                let b = bytes_set(bytes_push(bytes_from_str("hi"), 33), 0, 104);
+                bytes_len(b) + bytes_get(b, 0)
+            }
+        "#;
+        assert!(check_src(ok).is_ok(), "got: {:?}", check_src(ok));
+
+        // `Bytes` and `Str` are distinct types, so comparing them is a type error
+        // (the runtime distinct-tag invariant is also enforced at the type level).
+        let bad = r#"fn main() -> Bool = bytes_from_str("x") == "x""#;
+        let errs = check_src(bad).unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains("cannot compare")),
+            "expected a `cannot compare` error, got: {:?}",
+            errs
+        );
+    }
+
     // ---- effect system (purity) -----------------------------------------
 
     #[test]

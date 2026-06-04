@@ -97,7 +97,9 @@ impl ElemKind {
             CType::Int | CType::Bool => ElemKind::Int,
             CType::Float => ElemKind::Float,
             CType::Str => ElemKind::Str,
-            CType::Ref | CType::Array(_) => ElemKind::Ref,
+            // A Bytes buffer is a heap pointer, so an array element of Bytes is a
+            // boxed heap ref (recursive drop), like a nested Array/ADT.
+            CType::Ref | CType::Bytes | CType::Array(_) => ElemKind::Ref,
         }
     }
 }
@@ -110,6 +112,7 @@ enum CType {
     Float,           // double
     Ref,             // void* — heap ADT cell
     Str,             // void* — heap String object
+    Bytes,           // void* — heap AriaBytes buffer (flat byte buffer)
     Array(ElemKind), // void* — heap AriaArray of the given element kind
 }
 
@@ -119,7 +122,7 @@ impl CType {
         match self {
             CType::Int | CType::Bool => "int64_t",
             CType::Float => "double",
-            CType::Ref | CType::Str | CType::Array(_) => "void*",
+            CType::Ref | CType::Str | CType::Bytes | CType::Array(_) => "void*",
         }
     }
 
@@ -135,6 +138,7 @@ impl CType {
                 let elem = CType::from_ty(&args[0])?;
                 Ok(CType::Array(ElemKind::from_ctype(elem)))
             }
+            Ty::Named(n, _) if n == "Bytes" => Ok(CType::Bytes),
             Ty::Named(_, args) if args.is_empty() => Ok(CType::Ref),
             // A closure value is a heap cell (tag = lambda id, fields = captures).
             Ty::Fn(_, _) => Ok(CType::Ref),
@@ -542,9 +546,12 @@ fn iexpr_type(e: &IExpr, env: &Env) -> Result<CType, String> {
 /// `None` if `name` is not a supported builtin.
 fn builtin_ret(name: &str) -> Option<CType> {
     match name {
-        "concat" | "int_to_str" => Some(CType::Str),
+        "concat" | "int_to_str" | "bytes_to_str" => Some(CType::Str),
         // print_* are logically Unit; we model them as Int 0 (never used).
         "print_int" | "print_bool" | "print_float" | "print_str" => Some(CType::Int),
+        // Bytes builtins (non-generic; no element-kind suffix).
+        "bytes_new" | "bytes_set" | "bytes_push" | "bytes_from_str" => Some(CType::Bytes),
+        "bytes_len" | "bytes_get" => Some(CType::Int),
         _ => None,
     }
 }
@@ -603,6 +610,9 @@ fn emit_iexpr(
                 CType::Array(_) => {
                     let _ = writeln!(out, "{}aria_array_dup({});", ind, cvar(v));
                 }
+                CType::Bytes => {
+                    let _ = writeln!(out, "{}aria_bytes_dup({});", ind, cvar(v));
+                }
                 _ => {}
             }
             emit_iexpr(body, result, result_ty, env, ind, out)
@@ -617,6 +627,9 @@ fn emit_iexpr(
                 }
                 CType::Array(_) => {
                     let _ = writeln!(out, "{}aria_array_drop({});", ind, cvar(v));
+                }
+                CType::Bytes => {
+                    let _ = writeln!(out, "{}aria_bytes_drop({});", ind, cvar(v));
                 }
                 _ => {}
             }
@@ -735,7 +748,7 @@ fn emit_make_closure(
             CType::Float => {
                 let _ = writeln!(out, "{}aria_field({}, {}) = aria_f2i({});", ind, dst, i, ex);
             }
-            CType::Ref | CType::Str | CType::Array(_) => {
+            CType::Ref | CType::Str | CType::Bytes | CType::Array(_) => {
                 let _ = writeln!(out, "{}aria_field({}, {}) = (int64_t)(uintptr_t)({});", ind, dst, i, ex);
             }
         }
@@ -866,6 +879,15 @@ fn emit_prim(
                 let _ = writeln!(
                     out,
                     "{}{} = {}aria_eq_consume({}, {});",
+                    ind, dst, cmp, lx, rx
+                );
+                return Ok(());
+            }
+            if lt == CType::Bytes && rt == CType::Bytes {
+                let cmp = if op == BinOp::Eq { "" } else { "!" };
+                let _ = writeln!(
+                    out,
+                    "{}{} = {}aria_byteseq_consume({}, {});",
                     ind, dst, cmp, lx, rx
                 );
                 return Ok(());
@@ -1035,6 +1057,75 @@ fn emit_builtin(
             let _ = writeln!(out, "{}{} = 0;", ind, dst);
             Ok(())
         }
+        // ---- Bytes builtins (each helper consumes its Bytes argument(s)) ----
+        "bytes_new" => {
+            if !args.is_empty() {
+                return Err("c backend: bytes_new expects no arguments".into());
+            }
+            let _ = writeln!(out, "{}{} = aria_bytes_new();", ind, dst);
+            Ok(())
+        }
+        "bytes_len" => {
+            if args.len() != 1 || atom_type(&args[0], env)? != CType::Bytes {
+                return Err("c backend: bytes_len expects one Bytes".into());
+            }
+            let (_, b) = emit_atom(&args[0], env, out)?;
+            let _ = writeln!(out, "{}{} = aria_bytes_len({});", ind, dst, b);
+            Ok(())
+        }
+        "bytes_get" => {
+            if args.len() != 2 || atom_type(&args[0], env)? != CType::Bytes {
+                return Err("c backend: bytes_get expects (Bytes, Int)".into());
+            }
+            let (_, b) = emit_atom(&args[0], env, out)?;
+            let (it, idx) = emit_atom(&args[1], env, out)?;
+            if it != CType::Int {
+                return Err("c backend: bytes_get index must be Int".into());
+            }
+            let _ = writeln!(out, "{}{} = aria_bytes_get({}, {});", ind, dst, b, idx);
+            Ok(())
+        }
+        "bytes_set" => {
+            if args.len() != 3 || atom_type(&args[0], env)? != CType::Bytes {
+                return Err("c backend: bytes_set expects (Bytes, Int, Int)".into());
+            }
+            let (_, b) = emit_atom(&args[0], env, out)?;
+            let (it, idx) = emit_atom(&args[1], env, out)?;
+            let (vt, v) = emit_atom(&args[2], env, out)?;
+            if it != CType::Int || vt != CType::Int {
+                return Err("c backend: bytes_set index/value must be Int".into());
+            }
+            let _ = writeln!(out, "{}{} = aria_bytes_set({}, {}, {});", ind, dst, b, idx, v);
+            Ok(())
+        }
+        "bytes_push" => {
+            if args.len() != 2 || atom_type(&args[0], env)? != CType::Bytes {
+                return Err("c backend: bytes_push expects (Bytes, Int)".into());
+            }
+            let (_, b) = emit_atom(&args[0], env, out)?;
+            let (vt, v) = emit_atom(&args[1], env, out)?;
+            if vt != CType::Int {
+                return Err("c backend: bytes_push value must be Int".into());
+            }
+            let _ = writeln!(out, "{}{} = aria_bytes_push({}, {});", ind, dst, b, v);
+            Ok(())
+        }
+        "bytes_from_str" => {
+            if args.len() != 1 || atom_type(&args[0], env)? != CType::Str {
+                return Err("c backend: bytes_from_str expects one String".into());
+            }
+            let (_, s) = emit_atom(&args[0], env, out)?;
+            let _ = writeln!(out, "{}{} = aria_bytes_from_str({});", ind, dst, s);
+            Ok(())
+        }
+        "bytes_to_str" => {
+            if args.len() != 1 || atom_type(&args[0], env)? != CType::Bytes {
+                return Err("c backend: bytes_to_str expects one Bytes".into());
+            }
+            let (_, b) = emit_atom(&args[0], env, out)?;
+            let _ = writeln!(out, "{}{} = aria_bytes_to_str({});", ind, dst, b);
+            Ok(())
+        }
         _ => Err(format!("c backend: unsupported builtin `{}`", name)),
     }
 }
@@ -1050,7 +1141,7 @@ fn encode_elem_slot(kind: ElemKind, t: CType, ex: &str) -> Result<String, String
         ElemKind::Int => matches!(t, CType::Int | CType::Bool),
         ElemKind::Float => t == CType::Float,
         ElemKind::Str => t == CType::Str,
-        ElemKind::Ref => matches!(t, CType::Ref | CType::Str | CType::Array(_)),
+        ElemKind::Ref => matches!(t, CType::Ref | CType::Str | CType::Bytes | CType::Array(_)),
     };
     if !ok {
         return Err(format!(
@@ -1208,7 +1299,7 @@ fn emit_store_fields(
             CType::Float => {
                 let _ = writeln!(out, "{}aria_field({}, {}) = aria_f2i({});", ind, cellptr, i, ex);
             }
-            CType::Ref | CType::Str | CType::Array(_) => {
+            CType::Ref | CType::Str | CType::Bytes | CType::Array(_) => {
                 let _ = writeln!(out, "{}aria_field({}, {}) = (int64_t)(uintptr_t)({});", ind, cellptr, i, ex);
             }
         }
@@ -1317,7 +1408,7 @@ fn emit_arm_body(
                         format!("aria_field({}, {})", sv, idx)
                     }
                     CType::Float => format!("aria_i2f(aria_field({}, {}))", sv, idx),
-                    CType::Ref | CType::Str | CType::Array(_) => {
+                    CType::Ref | CType::Str | CType::Bytes | CType::Array(_) => {
                         format!("(void*)(uintptr_t)aria_field({}, {})", sv, idx)
                     }
                 };
@@ -1615,6 +1706,150 @@ static void* aria_array_push(void* p, int64_t x, int64_t kind) {
     return (void*)n;
 }
 
+/* ---- Bytes: a flat, growable, reference-counted byte buffer ----
+   Layout: { rc; len; cap; unsigned char bytes[] }. A byte is an Int 0..255.
+   Modeled on the String object plus a `cap` for growth. FBIP: set/push mutate
+   in place when rc==1, else copy-on-write. Range policy: bytes_set/bytes_push
+   with a value outside 0..255 trap (identical across all backends). */
+typedef struct { int64_t rc; int64_t len; int64_t cap; unsigned char bytes[]; } AriaBytes;
+
+static void* aria_bytes_alloc(int64_t cap) {
+    AriaBytes* b = (AriaBytes*)malloc(sizeof(AriaBytes) + (size_t)cap);
+    if (!b) aria_trap();
+    b->rc = 1; b->len = 0; b->cap = cap;
+    aria_live++;
+    return (void*)b;
+}
+static void* aria_bytes_new(void) { return aria_bytes_alloc(0); }
+static inline void aria_bytes_dup(void* p) { ((AriaBytes*)p)->rc++; }
+static void aria_bytes_drop(void* p) {
+    AriaBytes* b = (AriaBytes*)p;
+    if (--b->rc == 0) { aria_live--; free(b); }
+}
+static int64_t aria_bytes_len(void* p) {
+    int64_t n = ((AriaBytes*)p)->len;
+    aria_bytes_drop(p);  /* bytes_len consumes its argument */
+    return n;
+}
+static int64_t aria_bytes_get(void* p, int64_t i) {
+    AriaBytes* b = (AriaBytes*)p;
+    if (i < 0 || i >= b->len) aria_trap();
+    int64_t v = (int64_t)b->bytes[i];
+    aria_bytes_drop(p);  /* bytes_get consumes its argument */
+    return v;
+}
+static AriaBytes* aria_bytes_clone(AriaBytes* b) {
+    int64_t cap = b->len > 0 ? b->len : 1;
+    AriaBytes* n = (AriaBytes*)aria_bytes_alloc(cap);
+    n->len = b->len;
+    memcpy(n->bytes, b->bytes, (size_t)b->len);
+    return n;
+}
+static void* aria_bytes_set(void* p, int64_t i, int64_t v) {
+    AriaBytes* b = (AriaBytes*)p;
+    if (i < 0 || i >= b->len) aria_trap();
+    if (v < 0 || v > 255) aria_trap();
+    if (b->rc == 1) {
+        b->bytes[i] = (unsigned char)v;
+        aria_reuses++;
+        return p;
+    }
+    AriaBytes* n = aria_bytes_clone(b);
+    n->bytes[i] = (unsigned char)v;
+    aria_bytes_drop(p);
+    return (void*)n;
+}
+static AriaBytes* aria_bytes_grow(AriaBytes* b) {
+    if (b->len < b->cap) return b;
+    int64_t ncap = b->cap > 0 ? b->cap * 2 : 4;
+    AriaBytes* g = (AriaBytes*)realloc(b, sizeof(AriaBytes) + (size_t)ncap);
+    if (!g) aria_trap();
+    g->cap = ncap;
+    return g;
+}
+static void* aria_bytes_push(void* p, int64_t v) {
+    AriaBytes* b = (AriaBytes*)p;
+    if (v < 0 || v > 255) aria_trap();
+    if (b->rc == 1) {
+        b = aria_bytes_grow(b);
+        b->bytes[b->len++] = (unsigned char)v;
+        aria_reuses++;
+        return (void*)b;
+    }
+    AriaBytes* n = aria_bytes_clone(b);
+    n = aria_bytes_grow(n);
+    n->bytes[n->len++] = (unsigned char)v;
+    aria_bytes_drop(p);
+    return (void*)n;
+}
+static void* aria_bytes_from_str(void* p) {
+    AriaStr* s = (AriaStr*)p;
+    AriaBytes* b = (AriaBytes*)aria_bytes_alloc(s->len > 0 ? s->len : 0);
+    b->len = s->len;
+    memcpy(b->bytes, s->bytes, (size_t)s->len);
+    aria_str_drop(p);  /* the Str argument is consumed */
+    return (void*)b;
+}
+/* Minimal UTF-8 validation: trap on an ill-formed sequence (matches the
+   interpreter's clean error on invalid UTF-8). */
+static int aria_utf8_valid(const unsigned char* s, int64_t n) {
+    int64_t i = 0;
+    while (i < n) {
+        unsigned char c = s[i];
+        int64_t need;            /* number of continuation bytes that follow c */
+        unsigned char lo = 0x80, hi = 0xBF;  /* allowed range of the 1st cont. */
+        if (c < 0x80) { i++; continue; }
+        else if (c >= 0xC2 && c <= 0xDF) need = 1;
+        else if (c == 0xE0) { need = 2; lo = 0xA0; }
+        else if (c >= 0xE1 && c <= 0xEC) need = 2;
+        else if (c == 0xED) { need = 2; hi = 0x9F; }
+        else if (c >= 0xEE && c <= 0xEF) need = 2;
+        else if (c == 0xF0) { need = 3; lo = 0x90; }
+        else if (c >= 0xF1 && c <= 0xF3) need = 3;
+        else if (c == 0xF4) { need = 3; hi = 0x8F; }
+        else return 0;
+        if (i + need >= n) return 0;   /* truncated multibyte sequence */
+        for (int64_t k = 1; k <= need; k++) {
+            unsigned char cc = s[i + k];
+            unsigned char l = (k == 1) ? lo : 0x80;
+            unsigned char h = (k == 1) ? hi : 0xBF;
+            if (cc < l || cc > h) return 0;
+        }
+        i += need + 1;
+    }
+    return 1;
+}
+static void* aria_bytes_to_str(void* p) {
+    AriaBytes* b = (AriaBytes*)p;
+    if (!aria_utf8_valid(b->bytes, b->len)) aria_trap();
+    AriaStr* s = (AriaStr*)aria_str_alloc(b->len);
+    memcpy(s->bytes, b->bytes, (size_t)b->len);
+    aria_bytes_drop(p);  /* the Bytes argument is consumed */
+    return (void*)s;
+}
+/* Structural Bytes equality (content). Consumes neither operand here; the
+   `_consume` wrapper releases both for the ==/!= operators. */
+static int64_t aria_byteseq(void* a, void* b) {
+    AriaBytes* x = (AriaBytes*)a; AriaBytes* y = (AriaBytes*)b;
+    if (x->len != y->len) return 0;
+    return memcmp(x->bytes, y->bytes, (size_t)x->len) == 0;
+}
+static int64_t aria_byteseq_consume(void* a, void* b) {
+    int64_t r = aria_byteseq(a, b);
+    aria_bytes_drop(a); aria_bytes_drop(b);
+    return r;
+}
+/* Print the canonical `Bytes[..]` rendering (does NOT consume the buffer). */
+static void aria_print_bytes_value(void* p) {
+    AriaBytes* b = (AriaBytes*)p;
+    fputs("Bytes[", stdout);
+    for (int64_t i = 0; i < b->len; i++) {
+        if (i > 0) fputc(' ', stdout);
+        printf("%02x", (unsigned)b->bytes[i]);
+    }
+    fputs("]\n", stdout);
+}
+
 /* ---- structural equality (per-tag, emitted below) ---- */
 static int64_t aria_eq(void* a, void* b);
 
@@ -1744,9 +1979,9 @@ pub fn compile(program: &Program) -> Result<String, String> {
         if !m.params.is_empty() {
             return Err("c backend: `main` must take no parameters".into());
         }
-        // main may return Int, Float, Bool, or String; the runner prints it.
-        if !matches!(m.ret, CType::Int | CType::Float | CType::Bool | CType::Str) {
-            return Err("c backend: `main` must return Int, Bool, Float, or String".into());
+        // main may return Int, Float, Bool, String, or Bytes; the runner prints it.
+        if !matches!(m.ret, CType::Int | CType::Float | CType::Bool | CType::Str | CType::Bytes) {
+            return Err("c backend: `main` must return Int, Bool, Float, String, or Bytes".into());
         }
     }
 
@@ -1938,6 +2173,13 @@ pub fn compile(program: &Program) -> Result<String, String> {
             let _ = writeln!(src, "    fputc('\\n', stdout);");
             let _ = writeln!(src, "    aria_str_drop(r);");
         }
+        CType::Bytes => {
+            // Print the canonical `Bytes[..]` rendering (byte-for-byte identical to
+            // the interpreter/IR/wasm), then consume the buffer.
+            let _ = writeln!(src, "    void* r = {}();", cfn("main"));
+            let _ = writeln!(src, "    aria_print_bytes_value(r);");
+            let _ = writeln!(src, "    aria_bytes_drop(r);");
+        }
         _ => unreachable!(),
     }
     let _ = writeln!(src, "    fprintf(stderr, \"aria_live=%lld aria_reuses=%lld\\n\", (long long)aria_live, (long long)aria_reuses);");
@@ -1973,6 +2215,10 @@ fn emit_eq_helper(ctors: &CtorTable, out: &mut String) {
                     // Array fields compare by pointer identity (structural array
                     // equality is outside the subset).
                     let _ = writeln!(out, "        eq = eq && (aria_field(a, {}) == aria_field(b, {}));", i, i);
+                }
+                CType::Bytes => {
+                    // Bytes fields compare structurally (content), like Strings.
+                    let _ = writeln!(out, "        eq = eq && aria_byteseq((void*)(uintptr_t)aria_field(a, {}), (void*)(uintptr_t)aria_field(b, {}));", i, i);
                 }
             }
         }
@@ -2025,7 +2271,7 @@ fn emit_lambda(
         let load = match ct {
             CType::Int | CType::Bool => format!("(int64_t)aria_field(__aria_clo, {})", i),
             CType::Float => format!("aria_i2f(aria_field(__aria_clo, {}))", i),
-            CType::Ref | CType::Str | CType::Array(_) => format!("(void*)(uintptr_t)aria_field(__aria_clo, {})", i),
+            CType::Ref | CType::Str | CType::Bytes | CType::Array(_) => format!("(void*)(uintptr_t)aria_field(__aria_clo, {})", i),
         };
         let _ = writeln!(out, "    {} {} = {};", ct.decl(), cvar(cn), load);
         match ct {
@@ -2037,6 +2283,9 @@ fn emit_lambda(
             }
             CType::Array(_) => {
                 let _ = writeln!(out, "    aria_array_dup({});", cvar(cn));
+            }
+            CType::Bytes => {
+                let _ = writeln!(out, "    aria_bytes_dup({});", cvar(cn));
             }
             _ => {}
         }
@@ -2076,7 +2325,7 @@ fn emit_drop_children_helper(
             .field_types
             .iter()
             .enumerate()
-            .filter(|(_, t)| matches!(t, CType::Ref | CType::Str | CType::Array(_)))
+            .filter(|(_, t)| matches!(t, CType::Ref | CType::Str | CType::Bytes | CType::Array(_)))
             .map(|(i, t)| (i, *t))
             .collect();
         if managed.is_empty() {
@@ -2098,7 +2347,7 @@ fn emit_drop_children_helper(
         let managed: Vec<(usize, CType)> = cap_cts
             .iter()
             .enumerate()
-            .filter(|(_, t)| matches!(t, CType::Ref | CType::Str | CType::Array(_)))
+            .filter(|(_, t)| matches!(t, CType::Ref | CType::Str | CType::Bytes | CType::Array(_)))
             .map(|(i, t)| (i, *t))
             .collect();
         if managed.is_empty() {
@@ -2128,6 +2377,9 @@ fn emit_drop_managed_field(t: CType, i: usize, out: &mut String) {
         }
         CType::Array(_) => {
             let _ = writeln!(out, "        aria_array_drop((void*)(uintptr_t)aria_field(p, {}));", i);
+        }
+        CType::Bytes => {
+            let _ = writeln!(out, "        aria_bytes_drop((void*)(uintptr_t)aria_field(p, {}));", i);
         }
         _ => {}
     }

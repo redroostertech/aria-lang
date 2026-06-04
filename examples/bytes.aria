@@ -1,0 +1,20 @@
+-- Bytes: a first-class, flat byte buffer (a byte is an Int 0..255).
+-- `set`/`push` return a new Bytes but reuse the buffer in place when it is
+-- uniquely owned (FBIP) — mutable speed with immutable semantics, exactly like
+-- Array. `from_str`/`to_str` round-trip a String through its UTF-8 bytes.
+-- Identical output via `aria run`, `aria native-run`, and `aria wasm-run`.
+
+fn sumb(b: Bytes, i: Int, acc: Int) -> Int =
+  if i == bytes_len(b) { acc } else { sumb(b, i + 1, acc + bytes_get(b, i)) }
+
+fn main() -> Int = {
+  let b   = bytes_from_str("Hi");   -- bytes 72 ('H'), 105 ('i')
+  let b2  = bytes_push(b, 33);      -- append '!' -> "Hi!"
+  let b3  = bytes_set(b2, 0, 104);  -- 'H' -> 'h'  -> "hi!"  (FBIP in place)
+  print_int(bytes_len(b3));         -- 3
+  print_int(bytes_get(b3, 2));      -- 33  ('!')
+  print_str(bytes_to_str(b3));      -- hi!  (round-trip back to a String)
+  print_bool(bytes_from_str("ok") == bytes_from_str("ok"));  -- true
+  print_bool(bytes_from_str("ok") == bytes_from_str("no"));  -- false
+  sumb(b3, 0, 0)                    -- 104 + 105 + 33 = 242
+}

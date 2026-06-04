@@ -1109,3 +1109,119 @@ fn traits_interp_matches_compiled() {
         wasm_checked
     );
 }
+
+// ---------------------------------------------------------------------------
+// 8) Bytes differential: interp (oracle) vs native (cc-gated) vs wasm
+//    (node-gated). Exercises bytes_new/len/get/set/push/from_str/to_str + `==`,
+//    requiring identical results AND a garbage-free heap (live == 0) on both
+//    compiled backends. Each `main` returns an Int (the harness compares the
+//    final value); the Bytes builtins run mid-program, so all are exercised.
+// ---------------------------------------------------------------------------
+
+/// Hand-written Bytes programs and their expected Int results.
+fn bytes_diff_programs() -> Vec<(String, &'static str)> {
+    vec![
+        // from_str + len + get + a sum over the buffer.
+        (
+            "fn sumb(b: Bytes, i: Int, acc: Int) -> Int =\n\
+               if i == bytes_len(b) { acc } else { sumb(b, i + 1, acc + bytes_get(b, i)) }\n\
+             fn main() -> Int = sumb(bytes_from_str(\"ABC\"), 0, 0)\n"
+                .to_string(),
+            // 65 + 66 + 67
+            "198",
+        ),
+        // push grows the buffer; set overwrites in place (FBIP on a unique buffer).
+        (
+            "fn main() -> Int = {\n\
+               let b = bytes_push(bytes_push(bytes_new(), 10), 20);\n\
+               let b2 = bytes_set(b, 0, 100);\n\
+               bytes_get(b2, 0) + bytes_get(b2, 1) + bytes_len(b2)\n\
+             }\n"
+                .to_string(),
+            // 100 + 20 + 2
+            "122",
+        ),
+        // round-trip from_str -> to_str -> from_str, then length.
+        (
+            "fn main() -> Int = bytes_len(bytes_from_str(concat(\"he\", \"llo\")))\n"
+                .to_string(),
+            "5",
+        ),
+        // structural `==`: equal contents -> 1, different -> 0 (distinct buffers).
+        (
+            "fn main() -> Int = {\n\
+               let a = if bytes_from_str(\"xy\") == bytes_from_str(\"xy\") { 1 } else { 0 };\n\
+               let c = if bytes_from_str(\"xy\") == bytes_from_str(\"zz\") { 10 } else { 0 };\n\
+               a + c\n\
+             }\n"
+                .to_string(),
+            // equal -> 1, unequal -> 0
+            "1",
+        ),
+        // a shared buffer forces copy-on-write on set (still garbage-free).
+        (
+            "fn pair(b: Bytes) -> Int = bytes_get(bytes_set(b, 0, 1), 0) + bytes_get(b, 0)\n\
+             fn main() -> Int = pair(bytes_push(bytes_new(), 9))\n"
+                .to_string(),
+            // set(copy)->1 at idx0, original idx0 still 9
+            "10",
+        ),
+    ]
+}
+
+#[test]
+fn bytes_interp_matches_compiled() {
+    let progs = bytes_diff_programs();
+    let cc = cc_available();
+    let node = node_available();
+    let mut native_checked = 0u64;
+    let mut wasm_checked = 0u64;
+
+    for (src, expected) in &progs {
+        // Oracle: tree-walking interpreter.
+        let interp = ast_run(src).unwrap_or_else(|e| panic!("interp failed: {}\n{}", e, src));
+        assert_eq!(
+            &interp, expected,
+            "interpreter result mismatch\n{}\n got={} want={}",
+            src, interp, expected
+        );
+
+        // IR + RC pipeline must agree AND be garbage-free (no live cells).
+        let (ir_res, ir_live) =
+            ir_run_rc(src).unwrap_or_else(|e| panic!("ir failed: {}\n{}", e, src));
+        assert_eq!(&ir_res, expected, "ir != expected\n{}\n ir={}", src, ir_res);
+        assert_eq!(ir_live, 0, "ir leaked {} cell(s)\n{}", ir_live, src);
+
+        let prog = parser::parse(lexer::lex(src).expect("lex")).expect("parse");
+        assert!(typeck::check(&prog).is_ok(), "type error\n{}", src);
+
+        // Native (C) backend: identical result + garbage-free.
+        if cc {
+            let c_src = crate::c_backend::compile(&prog)
+                .unwrap_or_else(|e| panic!("c_backend failed: {}\n{}", e, src));
+            let (nat, live) = run_native_live(&c_src)
+                .unwrap_or_else(|e| panic!("native runner failed: {}\n{}", e, src));
+            assert_eq!(nat, *expected, "native != expected\n{}\n native={}", src, nat);
+            assert_eq!(live, 0, "native leaked {} cell(s)\n{}", live, src);
+            native_checked += 1;
+        }
+
+        // WASM backend: identical result + garbage-free.
+        if node {
+            let bytes = wasm::compile(&prog)
+                .unwrap_or_else(|e| panic!("wasm compile failed: {}\n{}", e, src));
+            let (w, live) = run_wasm_live(&bytes)
+                .unwrap_or_else(|e| panic!("wasm runner failed: {}\n{}", e, src));
+            assert_eq!(w, *expected, "wasm != expected\n{}\n wasm={}", src, w);
+            assert_eq!(live, 0, "wasm leaked {} cell(s)\n{}", live, src);
+            wasm_checked += 1;
+        }
+    }
+
+    eprintln!(
+        "bytes_interp_matches_compiled: {} programs ({} native, {} wasm)",
+        progs.len(),
+        native_checked,
+        wasm_checked
+    );
+}

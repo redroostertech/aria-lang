@@ -152,11 +152,25 @@ const IR_BUILTINS: &[&str] = &[
     "array_get",
     "array_set",
     "array_push",
+    // Bytes: a flat byte buffer, modeled as a heap cell whose fields are the
+    // bytes (one `IValue::Int` each), with the same RC + FBIP in-place reuse as
+    // arrays. Handled directly by the IR interpreter (see `bytes_builtin`).
+    "bytes_new",
+    "bytes_len",
+    "bytes_get",
+    "bytes_set",
+    "bytes_push",
+    "bytes_from_str",
+    "bytes_to_str",
 ];
 
 /// Heap-cell constructor tag for a functional array. Starts with `$` so it can
 /// never collide with a user constructor (those are uppercase identifiers).
 const ARRAY_TAG: &str = "$Array";
+
+/// Heap-cell constructor tag for a `Bytes` buffer. Like `ARRAY_TAG`, starts with
+/// `$` so it can never collide with a user constructor.
+const BYTES_TAG: &str = "$Bytes";
 
 /// Builtins the IR interpreter does NOT evaluate, but which the WASM backend
 /// *does* compile (Phase 2f: tensor ops + `embed_similarity`). Lowering lets
@@ -911,6 +925,10 @@ enum CellKind {
     Data,
     /// A functional array; `ctor` is `ARRAY_TAG`, `fields` are its elements.
     Array,
+    /// A `Bytes` buffer; `ctor` is `BYTES_TAG`, `fields` are its bytes (each an
+    /// `IValue::Int` 0..255). Same RC/FBIP shape as `Array`, but renders/compares
+    /// as a distinct type.
+    Bytes,
 }
 
 #[derive(Debug, Clone)]
@@ -1014,6 +1032,18 @@ impl IrInterp {
                         // (and `[]` for the empty array).
                         let inner: Vec<String> = c.fields.iter().map(|f| self.render(f)).collect();
                         format!("[{}]", inner.join(", "))
+                    }
+                    CellKind::Bytes => {
+                        // Match interp::render_bytes exactly: `Bytes[00 01 ff]`.
+                        let bs: Vec<u8> = c
+                            .fields
+                            .iter()
+                            .map(|f| match f {
+                                IValue::Int(n) => *n as u8,
+                                _ => 0,
+                            })
+                            .collect();
+                        crate::interp::render_bytes(&bs)
                     }
                     CellKind::Data if c.fields.is_empty() => c.ctor.clone(),
                     CellKind::Data => {
@@ -1302,6 +1332,136 @@ impl IrInterp {
         }
     }
 
+    /// Bytes builtins. Modeled on `array_builtin`: a `Bytes` is a heap cell whose
+    /// fields are its bytes (each an `IValue::Int` 0..255). `set`/`push` reuse the
+    /// cell in place when uniquely owned (rc == 1) — counting a reuse and leaving
+    /// `live` unchanged — else copy-on-write. Bytes hold no nested heap refs, so
+    /// there are no per-element dup/drop. Returns `Ok(None)` if not a bytes
+    /// builtin. The byte-range policy: a value outside 0..255 on set/push is a
+    /// runtime error (identical across all backends).
+    fn bytes_builtin(&mut self, name: &str, args: &[IValue]) -> Result<Option<IValue>, String> {
+        let as_ref = |v: &IValue| -> Result<usize, String> {
+            match v {
+                IValue::Ref(a) => Ok(*a),
+                _ => Err("ir: bytes builtin expected a Bytes".into()),
+            }
+        };
+        let as_int = |v: &IValue| -> Result<i64, String> {
+            match v {
+                IValue::Int(n) => Ok(*n),
+                _ => Err("ir: bytes builtin expected an Int".into()),
+            }
+        };
+        match name {
+            "bytes_new" => {
+                Ok(Some(IValue::Ref(self.push_cell(CellKind::Bytes, BYTES_TAG, Vec::new()))))
+            }
+            "bytes_len" => {
+                let addr = as_ref(&args[0])?;
+                let len = self.heap[addr].as_ref().ok_or("ir: bytes_len use-after-free")?.fields.len();
+                self.drop_value(&IValue::Ref(addr))?; // consume the bytes arg
+                Ok(Some(IValue::Int(len as i64)))
+            }
+            "bytes_get" => {
+                let addr = as_ref(&args[0])?;
+                let i = as_int(&args[1])?;
+                let cell = self.heap[addr].as_ref().ok_or("ir: bytes_get use-after-free")?;
+                if i < 0 || i as usize >= cell.fields.len() {
+                    return Err(format!(
+                        "ir: bytes_get index {} out of range for bytes of length {}",
+                        i,
+                        cell.fields.len()
+                    ));
+                }
+                let b = match cell.fields[i as usize] {
+                    IValue::Int(n) => n,
+                    _ => 0,
+                };
+                self.drop_value(&IValue::Ref(addr))?;
+                Ok(Some(IValue::Int(b)))
+            }
+            "bytes_set" => {
+                let addr = as_ref(&args[0])?;
+                let i = as_int(&args[1])?;
+                let v = as_int(&args[2])?;
+                let len = self.heap[addr].as_ref().ok_or("ir: bytes_set use-after-free")?.fields.len();
+                if i < 0 || i as usize >= len {
+                    return Err(format!(
+                        "ir: bytes_set index {} out of range for bytes of length {}",
+                        i, len
+                    ));
+                }
+                if !(0..=255).contains(&v) {
+                    return Err(format!("ir: bytes_set byte value {} out of range 0..255", v));
+                }
+                let unique = self.heap[addr].as_ref().unwrap().rc == 1;
+                if unique {
+                    // FBIP: overwrite in place. No allocation, live unchanged.
+                    self.heap[addr].as_mut().unwrap().fields[i as usize] = IValue::Int(v);
+                    self.metrics.reuses += 1;
+                    Ok(Some(IValue::Ref(addr)))
+                } else {
+                    // Copy-on-write (bytes have no heap-ref fields to dup).
+                    let mut newfields =
+                        self.heap[addr].as_ref().unwrap().fields.clone();
+                    newfields[i as usize] = IValue::Int(v);
+                    let naddr = self.push_cell(CellKind::Bytes, BYTES_TAG, newfields);
+                    self.drop_value(&IValue::Ref(addr))?;
+                    Ok(Some(IValue::Ref(naddr)))
+                }
+            }
+            "bytes_push" => {
+                let addr = as_ref(&args[0])?;
+                let v = as_int(&args[1])?;
+                if !(0..=255).contains(&v) {
+                    return Err(format!("ir: bytes_push byte value {} out of range 0..255", v));
+                }
+                let unique = self.heap[addr].as_ref().ok_or("ir: bytes_push use-after-free")?.rc == 1;
+                if unique {
+                    self.heap[addr].as_mut().unwrap().fields.push(IValue::Int(v));
+                    self.metrics.reuses += 1;
+                    Ok(Some(IValue::Ref(addr)))
+                } else {
+                    let mut fields = self.heap[addr].as_ref().unwrap().fields.clone();
+                    fields.push(IValue::Int(v));
+                    let naddr = self.push_cell(CellKind::Bytes, BYTES_TAG, fields);
+                    self.drop_value(&IValue::Ref(addr))?;
+                    Ok(Some(IValue::Ref(naddr)))
+                }
+            }
+            "bytes_from_str" => {
+                // The Str arg is a value type in the IR interpreter (IValue::Str),
+                // not a heap Ref, so there is nothing to consume/drop.
+                let s = match &args[0] {
+                    IValue::Str(s) => s.clone(),
+                    _ => return Err("ir: bytes_from_str expected a Str".into()),
+                };
+                let fields: Vec<IValue> =
+                    s.as_bytes().iter().map(|b| IValue::Int(*b as i64)).collect();
+                Ok(Some(IValue::Ref(self.push_cell(CellKind::Bytes, BYTES_TAG, fields))))
+            }
+            "bytes_to_str" => {
+                let addr = as_ref(&args[0])?;
+                let cell = self.heap[addr].as_ref().ok_or("ir: bytes_to_str use-after-free")?;
+                let bs: Vec<u8> = cell
+                    .fields
+                    .iter()
+                    .map(|f| match f {
+                        IValue::Int(n) => *n as u8,
+                        _ => 0,
+                    })
+                    .collect();
+                let s = match String::from_utf8(bs) {
+                    Ok(s) => s,
+                    Err(_) => return Err("ir: bytes_to_str: invalid UTF-8".into()),
+                };
+                self.drop_value(&IValue::Ref(addr))?; // consume the bytes arg
+                Ok(Some(IValue::Str(s)))
+            }
+            _ => Ok(None),
+        }
+    }
+
     fn eval_bind(&mut self, bind: &Bind, env: &Env) -> Result<IValue, String> {
         match bind {
             Bind::Atom(a) => self.atom(a, env),
@@ -1375,6 +1535,9 @@ impl IrInterp {
                 // (they need `&mut self`), so they are handled here rather than in
                 // the `&self` `builtin` helper used for the unboxed builtins.
                 if let Some(v) = self.array_builtin(name, &vals)? {
+                    return Ok(v);
+                }
+                if let Some(v) = self.bytes_builtin(name, &vals)? {
                     return Ok(v);
                 }
                 if let Some(v) = self.builtin(name, &vals)? {

@@ -107,7 +107,7 @@ impl ElemKind {
             WType::I64 | WType::I32 => ElemKind::Int,
             WType::F64 => ElemKind::Float,
             WType::Str => ElemKind::Str,
-            WType::Ref | WType::Array(_) | WType::Tensor => ElemKind::Ref,
+            WType::Ref | WType::Array(_) | WType::Tensor | WType::Bytes => ElemKind::Ref,
             WType::F32 => ElemKind::Float,
         }
     }
@@ -143,6 +143,9 @@ enum WType {
     Str, // pointer into linear memory (i32 address) — Phase 2d String object
     Tensor, // pointer into linear memory (i32 address) — Phase 2f Tensor object
     Array(ElemKind), // pointer into linear memory (i32 address) — heap Array object
+    Bytes, // pointer into linear memory (i32 address) — a Bytes buffer, stored as
+           // an Array(Int) heap object (one byte per i64 slot) so it reuses the
+           // Array runtime (RC/FBIP), but is a distinct Aria type for ==/display.
     F32, // INTERNAL ONLY: a scalar f32 used for Tensor-helper locals/scratch.
          // No Aria value ever has this type (Tensor data is f32 but is read out
          // as f64); it exists purely so helper bodies can declare f32 locals.
@@ -156,7 +159,7 @@ impl WType {
             WType::I64 => 0x7E,
             WType::F64 => 0x7C,
             WType::F32 => 0x7D,
-            WType::I32 | WType::Ref | WType::Str | WType::Tensor | WType::Array(_) => 0x7F,
+            WType::I32 | WType::Ref | WType::Str | WType::Tensor | WType::Array(_) | WType::Bytes => 0x7F,
         }
     }
 
@@ -188,6 +191,10 @@ impl WType {
                 }
                 Ok(WType::Array(ElemKind::from_wtype(elem)))
             }
+            // The opaque, reference-counted Bytes buffer. Modeled on an Array(Int)
+            // heap object, so it reuses the array runtime; distinguished here so it
+            // gets its own ==/display and the bytes builtins.
+            Ty::Named(n, _) if n == "Bytes" => Ok(WType::Bytes),
             // A named ADT becomes a heap reference. (Generics — args present —
             // are out of the 2b subset and rejected below.)
             Ty::Named(_, args) if args.is_empty() => Ok(WType::Ref),
@@ -531,10 +538,14 @@ enum HeapHelper {
     ArrayGet,   // (ptr:i32, i:i64) -> i64   read+dup elem (kind from hdr), consumes array
     ArraySet,   // (ptr:i32, i:i64, x:i64) -> ptr:i32   FBIP set, returns array
     ArrayPush,  // (ptr:i32, x:i64, kind:i32) -> ptr:i32   FBIP push/grow, returns array
+    // ---- Bytes runtime (a Bytes is an Array(Int) heap object) ----
+    BytesFromStr, // (s:i32) -> ptr:i32   new Array(Int) of the String's UTF-8 bytes; consumes s
+    BytesToStr,   // (ptr:i32) -> i32     new String of the bytes (traps on invalid UTF-8); consumes ptr
+    BytesEq,      // (a:i32, b:i32) -> i32   content equality (1/0); does NOT consume operands
 }
 
 impl HeapHelper {
-    const ALL: [HeapHelper; 36] = [
+    const ALL: [HeapHelper; 39] = [
         HeapHelper::Alloc,
         HeapHelper::Free,
         HeapHelper::Dup,
@@ -571,6 +582,9 @@ impl HeapHelper {
         HeapHelper::ArrayGet,
         HeapHelper::ArraySet,
         HeapHelper::ArrayPush,
+        HeapHelper::BytesFromStr,
+        HeapHelper::BytesToStr,
+        HeapHelper::BytesEq,
     ];
 
     fn offset(self) -> u32 {
@@ -611,6 +625,9 @@ impl HeapHelper {
             HeapHelper::ArrayGet => 33,
             HeapHelper::ArraySet => 34,
             HeapHelper::ArrayPush => 35,
+            HeapHelper::BytesFromStr => 36,
+            HeapHelper::BytesToStr => 37,
+            HeapHelper::BytesEq => 38,
         }
     }
 
@@ -657,6 +674,9 @@ impl HeapHelper {
             HeapHelper::ArrayGet => (vec![WType::I32, WType::I64], WType::I64),
             HeapHelper::ArraySet => (vec![WType::I32, WType::I64, WType::I64], WType::I32),
             HeapHelper::ArrayPush => (vec![WType::I32, WType::I64, WType::I32], WType::I32),
+            HeapHelper::BytesFromStr => (vec![WType::I32], WType::I32),
+            HeapHelper::BytesToStr => (vec![WType::I32], WType::I32),
+            HeapHelper::BytesEq => (vec![WType::I32, WType::I32], WType::I32),
         }
     }
 }
@@ -900,6 +920,14 @@ impl<'a> LocalEnv<'a> {
         idx
     }
 
+    /// Allocate a brand-new anonymous i64 local slot (e.g. a Bytes value
+    /// temporary for the range check). Always fresh, never reused.
+    fn fresh_i64(&mut self) -> u32 {
+        let idx = self.n_params + self.locals.len() as u32;
+        self.locals.push(WType::I64);
+        idx
+    }
+
     fn var_type(&self, name: &str) -> Result<WType, String> {
         self.types
             .get(name)
@@ -968,6 +996,9 @@ fn bind_type(bind: &Bind, env: &LocalEnv) -> Result<WType, String> {
             }
             if let Some((base, kind)) = parse_array_builtin(name) {
                 return Ok(array_builtin_ret(base, kind));
+            }
+            if let Some(ret) = bytes_builtin_ret(name) {
+                return Ok(ret);
             }
             let sig = env
                 .sigs
@@ -1276,6 +1307,14 @@ fn emit_bind(bind: &Bind, env: &mut LocalEnv, code: &mut Vec<u8>) -> Result<WTyp
                 }
                 return emit_adt_eq(*op, l, r, env, code);
             }
+            // Bytes `==`/`!=`: content compare via `__byteseq`, then consume both
+            // (a Bytes is an Array(Int) heap object -> `__drop_array`).
+            if matches!(op, BinOp::Eq | BinOp::Ne) && atom_type(l, env)? == WType::Bytes {
+                if atom_type(r, env)? != WType::Bytes {
+                    return Err("wasm backend: == / != on mismatched types".into());
+                }
+                return emit_bytes_eq(*op, l, r, env, code);
+            }
             let lt = emit_atom(l, env, code)?;
             let rt = emit_atom(r, env, code)?;
             // Add/Sub/Mul on Int are checked: route through an emitted helper
@@ -1321,7 +1360,7 @@ fn emit_bind(bind: &Bind, env: &mut LocalEnv, code: &mut Vec<u8>) -> Result<WTyp
                         Ok(WType::F64)
                     }
                     WType::I32 | WType::Ref | WType::Str | WType::Tensor | WType::Array(_)
-                    | WType::F32 => {
+                    | WType::Bytes | WType::F32 => {
                         Err("wasm backend: numeric negation requires an Int or Float".into())
                     }
                 }
@@ -1350,6 +1389,9 @@ fn emit_bind(bind: &Bind, env: &mut LocalEnv, code: &mut Vec<u8>) -> Result<WTyp
             // (they consume their heap arguments, matching the rc pass).
             if let Some((base, kind)) = parse_array_builtin(name) {
                 return emit_array_builtin(base, kind, args, env, code);
+            }
+            if is_bytes_builtin(name) {
+                return emit_bytes_builtin(name, args, env, code);
             }
             let sig_ret;
             let sig_params;
@@ -1458,7 +1500,7 @@ fn emit_store_cell_fields(
         match fty {
             WType::F64 => f64_store(off, code),
             WType::I64 => i64_store(off, code),
-            WType::I32 | WType::Ref | WType::Str | WType::Tensor | WType::Array(_) => {
+            WType::I32 | WType::Ref | WType::Str | WType::Tensor | WType::Array(_) | WType::Bytes => {
                 code.push(0xAD); // i64.extend_i32_u
                 i64_store(off, code);
             }
@@ -1603,6 +1645,174 @@ fn emit_str_builtin(
             Ok(WType::I32)
         }
         _ => Err(format!("wasm backend: unknown string builtin `{}`", name)),
+    }
+}
+
+/// True iff `name` is one of the Bytes builtins.
+fn is_bytes_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        "bytes_new"
+            | "bytes_len"
+            | "bytes_get"
+            | "bytes_set"
+            | "bytes_push"
+            | "bytes_from_str"
+            | "bytes_to_str"
+    )
+}
+
+/// The wasm result type of a Bytes builtin, or `None` if not a bytes builtin.
+fn bytes_builtin_ret(name: &str) -> Option<WType> {
+    Some(match name {
+        "bytes_new" | "bytes_set" | "bytes_push" | "bytes_from_str" => WType::Bytes,
+        "bytes_len" | "bytes_get" => WType::I64,
+        "bytes_to_str" => WType::Str,
+        _ => return None,
+    })
+}
+
+/// Emit a `0 <= v <= 255` range check on the i64 already pushed on the stack as
+/// the *named local* `vlocal`, trapping (unreachable) otherwise. The value is
+/// left in `vlocal`; nothing is pushed. The byte-range policy (reject) is thus
+/// identical to the interp/IR/native backends.
+fn emit_byte_range_check(vlocal: u32, code: &mut Vec<u8>) {
+    // if v < 0 || v > 255 { unreachable }
+    code.push(0x20); // local.get v
+    leb_u(vlocal as u64, code);
+    code.push(0x42); // i64.const 0
+    leb_s(0, code);
+    code.push(0x53); // i64.lt_s
+    code.push(0x20); // local.get v
+    leb_u(vlocal as u64, code);
+    code.push(0x42); // i64.const 255
+    leb_s(255, code);
+    code.push(0x55); // i64.gt_s
+    code.push(0x72); // i32.or
+    code.push(0x04); // if
+    code.push(0x40); // blocktype void
+    code.push(0x00); // unreachable
+    code.push(0x0B); // end
+}
+
+/// Emit a Bytes builtin. A Bytes is an Array(Int) heap object, so new/len/get/
+/// set/push delegate to the array helpers (kind = Int = 0). `set`/`push` first
+/// range-check the byte value (trap if outside 0..255). `from_str`/`to_str`/`==`
+/// use dedicated helpers. Each consuming builtin consumes its Bytes argument,
+/// matching the rc pass.
+fn emit_bytes_builtin(
+    name: &str,
+    args: &[Atom],
+    env: &mut LocalEnv,
+    code: &mut Vec<u8>,
+) -> Result<WType, String> {
+    const BYTE_KIND: i64 = 0; // ElemKind::Int code
+    match name {
+        "bytes_new" => {
+            if !args.is_empty() {
+                return Err("wasm backend: bytes_new expects no arguments".into());
+            }
+            // __array_new(kind=Int, cap=0)
+            code.push(0x41);
+            leb_s(BYTE_KIND, code);
+            code.push(0x41);
+            leb_s(0, code);
+            code.push(0x10);
+            leb_u(env.heap_index(HeapHelper::AllocArray) as u64, code);
+            Ok(WType::Bytes)
+        }
+        "bytes_len" => {
+            if args.len() != 1 || atom_type(&args[0], env)? != WType::Bytes {
+                return Err("wasm backend: bytes_len expects one Bytes".into());
+            }
+            emit_atom(&args[0], env, code)?;
+            code.push(0x10);
+            leb_u(env.heap_index(HeapHelper::ArrayLen) as u64, code);
+            Ok(WType::I64)
+        }
+        "bytes_get" => {
+            if args.len() != 2 || atom_type(&args[0], env)? != WType::Bytes {
+                return Err("wasm backend: bytes_get expects (Bytes, Int)".into());
+            }
+            emit_atom(&args[0], env, code)?;
+            let it = emit_atom(&args[1], env, code)?;
+            if it != WType::I64 {
+                return Err("wasm backend: bytes_get index must be Int".into());
+            }
+            code.push(0x10);
+            leb_u(env.heap_index(HeapHelper::ArrayGet) as u64, code);
+            // The byte is stored directly in the i64 slot (kind Int); no decode.
+            Ok(WType::I64)
+        }
+        "bytes_set" => {
+            if args.len() != 3 || atom_type(&args[0], env)? != WType::Bytes {
+                return Err("wasm backend: bytes_set expects (Bytes, Int, Int)".into());
+            }
+            // Evaluate the value first into a temp so we can range-check it before
+            // the array pointer/index are on the stack.
+            let v = env.fresh_i64();
+            // ptr
+            emit_atom(&args[0], env, code)?;
+            // index
+            let it = emit_atom(&args[1], env, code)?;
+            if it != WType::I64 {
+                return Err("wasm backend: bytes_set index must be Int".into());
+            }
+            // value -> temp, range-check, then push it back
+            let vt = emit_atom(&args[2], env, code)?;
+            if vt != WType::I64 {
+                return Err("wasm backend: bytes_set value must be Int".into());
+            }
+            code.push(0x21); // local.set v
+            leb_u(v as u64, code);
+            emit_byte_range_check(v, code);
+            code.push(0x20); // local.get v
+            leb_u(v as u64, code);
+            code.push(0x10);
+            leb_u(env.heap_index(HeapHelper::ArraySet) as u64, code);
+            Ok(WType::Bytes)
+        }
+        "bytes_push" => {
+            if args.len() != 2 || atom_type(&args[0], env)? != WType::Bytes {
+                return Err("wasm backend: bytes_push expects (Bytes, Int)".into());
+            }
+            let v = env.fresh_i64();
+            emit_atom(&args[0], env, code)?; // ptr
+            let vt = emit_atom(&args[1], env, code)?;
+            if vt != WType::I64 {
+                return Err("wasm backend: bytes_push value must be Int".into());
+            }
+            code.push(0x21); // local.set v
+            leb_u(v as u64, code);
+            emit_byte_range_check(v, code);
+            code.push(0x20); // local.get v
+            leb_u(v as u64, code);
+            // kind argument (i32)
+            code.push(0x41);
+            leb_s(BYTE_KIND, code);
+            code.push(0x10);
+            leb_u(env.heap_index(HeapHelper::ArrayPush) as u64, code);
+            Ok(WType::Bytes)
+        }
+        "bytes_from_str" => {
+            if args.len() != 1 || atom_type(&args[0], env)? != WType::Str {
+                return Err("wasm backend: bytes_from_str expects one String".into());
+            }
+            emit_atom(&args[0], env, code)?;
+            code.push(0x10);
+            leb_u(env.heap_index(HeapHelper::BytesFromStr) as u64, code);
+            Ok(WType::Bytes)
+        }
+        "bytes_to_str" => {
+            if args.len() != 1 || atom_type(&args[0], env)? != WType::Bytes {
+                return Err("wasm backend: bytes_to_str expects one Bytes".into());
+            }
+            emit_atom(&args[0], env, code)?;
+            code.push(0x10);
+            leb_u(env.heap_index(HeapHelper::BytesToStr) as u64, code);
+            Ok(WType::Str)
+        }
+        _ => Err(format!("wasm backend: unknown bytes builtin `{}`", name)),
     }
 }
 
@@ -1931,6 +2141,45 @@ fn emit_str_eq(
     Ok(WType::I32)
 }
 
+/// Emit a Bytes `==` / `!=`. Mirrors `emit_str_eq`: capture both operands into
+/// temps, content-compare via `__byteseq`, negate for `!=`, then consume both
+/// via `__drop_array` (a Bytes is an Array(Int) heap object).
+fn emit_bytes_eq(
+    op: BinOp,
+    l: &Atom,
+    r: &Atom,
+    env: &mut LocalEnv,
+    code: &mut Vec<u8>,
+) -> Result<WType, String> {
+    let lt = env.fresh_i32();
+    let rt = env.fresh_i32();
+    let byteseq = env.heap_index(HeapHelper::BytesEq);
+    let drop_array = env.heap_index(HeapHelper::DropArray);
+    emit_atom(l, env, code)?;
+    code.push(0x21);
+    leb_u(lt as u64, code);
+    emit_atom(r, env, code)?;
+    code.push(0x21);
+    leb_u(rt as u64, code);
+    code.push(0x20);
+    leb_u(lt as u64, code);
+    code.push(0x20);
+    leb_u(rt as u64, code);
+    code.push(0x10); // call __byteseq
+    leb_u(byteseq as u64, code);
+    if op == BinOp::Ne {
+        code.push(0x45); // i32.eqz
+    }
+    for slot in [lt, rt] {
+        code.push(0x20);
+        leb_u(slot as u64, code);
+        code.push(0x10); // call __drop_array
+        leb_u(drop_array as u64, code);
+        code.push(0x1A); // drop dummy result
+    }
+    Ok(WType::I32)
+}
+
 /// Emit an ADT `==` / `!=`. Both operands are evaluated into fresh i32 temps,
 /// `__eq` compares them structurally (recursively), the result is negated for
 /// `!=`, and BOTH operand pointers are then dropped via `__drop`. `__eq` only
@@ -2055,7 +2304,7 @@ fn emit_make_closure(
         match t {
             WType::F64 => f64_store(off, code),
             WType::I64 => i64_store(off, code),
-            WType::I32 | WType::Ref | WType::Str | WType::Tensor | WType::Array(_) => {
+            WType::I32 | WType::Ref | WType::Str | WType::Tensor | WType::Array(_) | WType::Bytes => {
                 code.push(0xAD); // i64.extend_i32_u
                 i64_store(off, code);
             }
@@ -2285,7 +2534,7 @@ fn emit_arm_body(
                 match fty {
                     WType::F64 => f64_load(off, code),
                     WType::I64 => i64_load(off, code),
-                    WType::I32 | WType::Ref | WType::Str | WType::Tensor | WType::Array(_) => {
+                    WType::I32 | WType::Ref | WType::Str | WType::Tensor | WType::Array(_) | WType::Bytes => {
                         i64_load(off, code);
                         code.push(0xA7); // i32.wrap_i64
                     }
@@ -2412,6 +2661,13 @@ fn emit_prim(op: BinOp, lt: WType, rt: WType, code: &mut Vec<u8>) -> Result<WTyp
                         "wasm backend: `==`/`!=` on Array is outside the wasm subset".into(),
                     )
                 }
+                // Bytes `==` is handled in `emit_bind` (it needs `env` to call
+                // `__byteseq` + drop operands), so it never reaches here.
+                WType::Bytes => {
+                    return Err(
+                        "wasm backend: internal — Bytes `==` should be routed earlier".into(),
+                    )
+                }
                 WType::F32 => unreachable!("F32 is not an Aria value type"),
             }
             Ok(WType::I32)
@@ -2475,6 +2731,9 @@ fn emit_iexpr(e: &IExpr, env: &mut LocalEnv, code: &mut Vec<u8>) -> Result<WType
                 WType::Str => Some(HeapHelper::DupStr),
                 WType::Tensor => Some(HeapHelper::DupTensor),
                 WType::Array(_) => Some(HeapHelper::DupArray),
+                // A Bytes is an Array(Int) heap object, so it dup/drops via the
+                // array helpers (kind-aware drop sees kind=Int -> no child refs).
+                WType::Bytes => Some(HeapHelper::DupArray),
                 _ => None,
             };
             if let Some(h) = h {
@@ -2492,6 +2751,7 @@ fn emit_iexpr(e: &IExpr, env: &mut LocalEnv, code: &mut Vec<u8>) -> Result<WType
                 WType::Str => Some(HeapHelper::DropStr),
                 WType::Tensor => Some(HeapHelper::DropTensor),
                 WType::Array(_) => Some(HeapHelper::DropArray),
+                WType::Bytes => Some(HeapHelper::DropArray),
                 _ => None,
             };
             if let Some(h) = h {
@@ -3768,6 +4028,20 @@ fn emit_heap_helper(
                         WType::Tensor | WType::Array(_) => {
                             body.push(I32_CONST);
                             leb_s(1, &mut body);
+                        }
+                        // A Bytes field compares structurally via `__byteseq`.
+                        WType::Bytes => {
+                            let byteseq_idx = heap_base + HeapHelper::BytesEq.offset();
+                            body.push(LOCAL_GET);
+                            leb_u(0, &mut body); // a
+                            i64_load(off, &mut body);
+                            body.push(I32_WRAP_I64);
+                            body.push(LOCAL_GET);
+                            leb_u(1, &mut body); // b
+                            i64_load(off, &mut body);
+                            body.push(I32_WRAP_I64);
+                            body.push(CALL);
+                            leb_u(byteseq_idx as u64, &mut body);
                         }
                         WType::F32 => unreachable!("F32 is not an Aria field type"),
                     }
@@ -5826,7 +6100,530 @@ fn emit_heap_helper(
                 body,
             )
         }
+        HeapHelper::BytesFromStr => {
+            // (s:i32) -> ptr:i32. A Bytes is an Array(Int) object: allocate one
+            // with cap=len, set len, copy each UTF-8 byte of the String into a
+            // separate i64 slot, then drop the (consumed) String.
+            // Locals: len(1,i32), arr(2,i32), i(3,i32), byte(4,i32).
+            // len = i32.wrap(i64.load[s+8])
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(8, &mut body);
+            body.push(I32_WRAP_I64);
+            body.push(LOCAL_SET);
+            leb_u(1, &mut body); // len
+            // arr = __array_new(0, len)
+            body.push(I32_CONST);
+            leb_s(0, &mut body); // kind Int
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body); // len (cap)
+            body.push(CALL);
+            leb_u(alloc_array_idx as u64, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(2, &mut body); // arr
+            // arr.len = len
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body);
+            body.push(I64_EXTEND_I32_U);
+            i64_store(8, &mut body);
+            // i = 0
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(3, &mut body); // i
+            // loop while i < len
+            body.push(0x03); // loop
+            body.push(BT_VOID);
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body); // i
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body); // len
+            body.push(0x48); // i32.lt_s
+            body.push(IF);
+            body.push(BT_VOID);
+            // byte = i32.load8_u[s + STR_HEADER + i]
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body); // s
+            body.push(I32_CONST);
+            leb_s(STR_HEADER as i64, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body); // i
+            body.push(I32_ADD);
+            i32_load8_u(0, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(4, &mut body); // byte
+            // arr.elems[i] (i64) = byte : address = arr + ARRAY_HEADER + 8*i
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body); // arr
+            body.push(I32_CONST);
+            leb_s(ARRAY_HEADER as i64, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body); // i
+            body.push(I32_CONST);
+            leb_s(SLOT as i64, &mut body);
+            body.push(I32_MUL);
+            body.push(I32_ADD); // element address
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body); // byte (i32)
+            body.push(I64_EXTEND_I32_U); // -> i64
+            i64_store(0, &mut body);
+            // i++
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            body.push(I32_CONST);
+            leb_s(1, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_SET);
+            leb_u(3, &mut body);
+            body.push(0x0C); // br loop
+            leb_u(1, &mut body);
+            body.push(END); // end if
+            body.push(END); // end loop
+            // drop the String (consumed)
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(CALL);
+            leb_u(drop_str_idx as u64, &mut body);
+            body.push(DROP);
+            // return arr
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body);
+            helper_entry(&[WType::I32, WType::I32, WType::I32, WType::I32], body)
+        }
+        HeapHelper::BytesToStr => {
+            // (ptr:i32) -> i32. Validate the bytes are well-formed UTF-8 (trap if
+            // not), allocate a String of the same length, copy each byte, drop the
+            // (consumed) Bytes/Array. Locals: len(1,i32), out(2,i32), i(3,i32),
+            // c(4,i32), need(5,i32), k(6,i32), cc(7,i32), lo(8,i32), hi(9,i32).
+            // len = i32.wrap(i64.load[ptr+8])
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(8, &mut body);
+            body.push(I32_WRAP_I64);
+            body.push(LOCAL_SET);
+            leb_u(1, &mut body); // len
+            // ---- UTF-8 validation: i = 0; while i < len { ... } ----
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(3, &mut body); // i
+            body.push(0x03); // loop  (validation)
+            body.push(BT_VOID);
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body);
+            body.push(0x48); // i32.lt_s
+            body.push(IF);
+            body.push(BT_VOID);
+            // c = byte_at(ptr, i)   (helper reads arr.elems[i] -> i32)
+            emit_bytes_slot_load(&mut body, 0, 3, 4);
+            // defaults: need=0, lo=0x80, hi=0xBF
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(5, &mut body); // need
+            body.push(I32_CONST);
+            leb_s(0x80, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(8, &mut body); // lo
+            body.push(I32_CONST);
+            leb_s(0xBF, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(9, &mut body); // hi
+            // classify c. ASCII (c < 0x80): need stays 0.
+            // We build a chain of if/else on c ranges, setting need/lo/hi or
+            // trapping on an invalid lead byte.
+            emit_utf8_classify(&mut body, 4, 5, 8, 9);
+            // if need > 0 { check continuation bytes }
+            body.push(LOCAL_GET);
+            leb_u(5, &mut body); // need
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            body.push(0x4A); // i32.gt_s
+            body.push(IF);
+            body.push(BT_VOID);
+            // if i + need >= len -> trap (truncated)
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(5, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body);
+            body.push(0x4E); // i32.ge_s
+            body.push(IF);
+            body.push(BT_VOID);
+            body.push(0x00); // unreachable
+            body.push(END);
+            // k = 1; while k <= need { check s[i+k] in [lo|0x80 .. hi|0xBF] }
+            body.push(I32_CONST);
+            leb_s(1, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(6, &mut body); // k
+            body.push(0x03); // loop (continuation bytes)
+            body.push(BT_VOID);
+            body.push(LOCAL_GET);
+            leb_u(6, &mut body); // k
+            body.push(LOCAL_GET);
+            leb_u(5, &mut body); // need
+            body.push(0x4C); // i32.le_s
+            body.push(IF);
+            body.push(BT_VOID);
+            // cc = byte_at(ptr, i + k)
+            // compute index i+k into a scratch via reusing local 7 is cc; need an
+            // index temp — reuse 'c'(4)? c no longer needed; use it as idx temp.
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body); // i
+            body.push(LOCAL_GET);
+            leb_u(6, &mut body); // k
+            body.push(I32_ADD);
+            body.push(LOCAL_SET);
+            leb_u(4, &mut body); // reuse 'c' as (i+k) index
+            emit_bytes_slot_load(&mut body, 0, 4, 7); // cc = byte_at(ptr, idx)
+            // effective lo/hi: for k==1 use lo/hi, else 0x80/0xBF. We emulate by:
+            // if k != 1 { lo=0x80; hi=0xBF }  (after the first iteration the
+            // tighter bounds no longer apply). Since k increments, once k>1 we
+            // relax. Set them at the top of each iteration based on k==1.
+            // if k == 1 keep lo/hi as set by classify; else lo=0x80,hi=0xBF.
+            body.push(LOCAL_GET);
+            leb_u(6, &mut body); // k
+            body.push(I32_CONST);
+            leb_s(1, &mut body);
+            body.push(I32_NE);
+            body.push(IF);
+            body.push(BT_VOID);
+            body.push(I32_CONST);
+            leb_s(0x80, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(8, &mut body); // lo = 0x80
+            body.push(I32_CONST);
+            leb_s(0xBF, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(9, &mut body); // hi = 0xBF
+            body.push(END);
+            // if cc < lo || cc > hi -> trap
+            body.push(LOCAL_GET);
+            leb_u(7, &mut body); // cc
+            body.push(LOCAL_GET);
+            leb_u(8, &mut body); // lo
+            body.push(0x48); // i32.lt_s
+            body.push(LOCAL_GET);
+            leb_u(7, &mut body); // cc
+            body.push(LOCAL_GET);
+            leb_u(9, &mut body); // hi
+            body.push(0x4A); // i32.gt_s
+            body.push(0x72); // i32.or
+            body.push(IF);
+            body.push(BT_VOID);
+            body.push(0x00); // unreachable
+            body.push(END);
+            // k++
+            body.push(LOCAL_GET);
+            leb_u(6, &mut body);
+            body.push(I32_CONST);
+            leb_s(1, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_SET);
+            leb_u(6, &mut body);
+            body.push(0x0C); // br loop (continuation)
+            leb_u(1, &mut body);
+            body.push(END); // end if k<=need
+            body.push(END); // end loop (continuation)
+            body.push(END); // end if need>0
+            // i += need + 1
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(5, &mut body);
+            body.push(I32_ADD);
+            body.push(I32_CONST);
+            leb_s(1, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_SET);
+            leb_u(3, &mut body);
+            body.push(0x0C); // br loop (validation)
+            leb_u(1, &mut body);
+            body.push(END); // end if i<len (validation)
+            body.push(END); // end loop (validation)
+            // ---- copy bytes into a fresh String ----
+            // out = __alloc_str(len)
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body);
+            body.push(CALL);
+            leb_u(alloc_str_idx as u64, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(2, &mut body); // out
+            // i = 0; while i < len { out[STR_HEADER+i] = byte_at(ptr,i) }
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(3, &mut body);
+            body.push(0x03); // loop (copy)
+            body.push(BT_VOID);
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body);
+            body.push(0x48); // i32.lt_s
+            body.push(IF);
+            body.push(BT_VOID);
+            // address = out + STR_HEADER + i
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body); // out
+            body.push(I32_CONST);
+            leb_s(STR_HEADER as i64, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body); // i
+            body.push(I32_ADD);
+            // value = byte_at(ptr, i)
+            emit_bytes_slot_load(&mut body, 0, 3, 4);
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body);
+            i32_store8(0, &mut body);
+            // i++
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            body.push(I32_CONST);
+            leb_s(1, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_SET);
+            leb_u(3, &mut body);
+            body.push(0x0C);
+            leb_u(1, &mut body);
+            body.push(END); // end if (copy)
+            body.push(END); // end loop (copy)
+            // drop the (consumed) Bytes/Array
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(CALL);
+            leb_u(drop_array_idx as u64, &mut body);
+            body.push(DROP);
+            // return out
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body);
+            helper_entry(
+                &[
+                    WType::I32, WType::I32, WType::I32, WType::I32, WType::I32, WType::I32,
+                    WType::I32, WType::I32, WType::I32,
+                ],
+                body,
+            )
+        }
+        HeapHelper::BytesEq => {
+            // (a:i32, b:i32) -> i32. Content equality; does NOT consume operands.
+            // Locals: la(2,i32), lb(3,i32), i(4,i32), va(5,i32), vb(6,i32).
+            // la = len(a); lb = len(b)
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(8, &mut body);
+            body.push(I32_WRAP_I64);
+            body.push(LOCAL_SET);
+            leb_u(2, &mut body); // la
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body);
+            i64_load(8, &mut body);
+            body.push(I32_WRAP_I64);
+            body.push(LOCAL_SET);
+            leb_u(3, &mut body); // lb
+            // if la != lb return 0
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            body.push(I32_NE);
+            body.push(IF);
+            body.push(BT_VOID);
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            body.push(0x0F); // return
+            body.push(END);
+            // i = 0; while i < la { if byte_at(a,i) != byte_at(b,i) return 0 }
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(4, &mut body); // i
+            body.push(0x03); // loop
+            body.push(BT_VOID);
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body);
+            body.push(0x48); // i32.lt_s
+            body.push(IF);
+            body.push(BT_VOID);
+            emit_bytes_slot_load(&mut body, 0, 4, 5); // va
+            emit_bytes_slot_load(&mut body, 1, 4, 6); // vb
+            body.push(LOCAL_GET);
+            leb_u(5, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(6, &mut body);
+            body.push(I32_NE);
+            body.push(IF);
+            body.push(BT_VOID);
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            body.push(0x0F); // return 0
+            body.push(END);
+            // i++
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body);
+            body.push(I32_CONST);
+            leb_s(1, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_SET);
+            leb_u(4, &mut body);
+            body.push(0x0C);
+            leb_u(1, &mut body);
+            body.push(END); // end if i<la
+            body.push(END); // end loop
+            // all equal -> 1
+            body.push(I32_CONST);
+            leb_s(1, &mut body);
+            helper_entry(&[WType::I32, WType::I32, WType::I32, WType::I32, WType::I32], body)
+        }
     }
+}
+
+/// Emit code that loads byte `arr.elems[idx_local]` (an Array(Int) slot, stored
+/// as an i64) of the Bytes object in `ptr_local`, wraps it to i32, and stores it
+/// into `dst_local`. Used by the Bytes UTF-8/eq/copy helpers.
+fn emit_bytes_slot_load(body: &mut Vec<u8>, ptr_local: u32, idx_local: u32, dst_local: u32) {
+    // addr = ptr + ARRAY_HEADER + 8*idx
+    body.push(0x20); // local.get ptr
+    leb_u(ptr_local as u64, body);
+    body.push(0x41); // i32.const ARRAY_HEADER
+    leb_s(ARRAY_HEADER as i64, body);
+    body.push(0x6A); // i32.add
+    body.push(0x20); // local.get idx
+    leb_u(idx_local as u64, body);
+    body.push(0x41); // i32.const SLOT
+    leb_s(SLOT as i64, body);
+    body.push(0x6C); // i32.mul
+    body.push(0x6A); // i32.add
+    i64_load(0, body);
+    body.push(0xA7); // i32.wrap_i64
+    body.push(0x21); // local.set dst
+    leb_u(dst_local as u64, body);
+}
+
+/// Emit the UTF-8 lead-byte classification: given byte `c` in `c_local`, set
+/// `need_local` (continuation count) and `lo_local`/`hi_local` (the allowed
+/// range of the FIRST continuation byte), or `unreachable` on an invalid lead
+/// byte. ASCII (c < 0x80) leaves need = 0 (caller pre-set). Mirrors the native
+/// `aria_utf8_valid` classification exactly.
+fn emit_utf8_classify(body: &mut Vec<u8>, c_local: u32, need_local: u32, lo_local: u32, hi_local: u32) {
+    let getc = |body: &mut Vec<u8>| {
+        body.push(0x20);
+        leb_u(c_local as u64, body);
+    };
+    let set_const = |body: &mut Vec<u8>, local: u32, val: i64| {
+        body.push(0x41);
+        leb_s(val, body);
+        body.push(0x21);
+        leb_u(local as u64, body);
+    };
+    // in_range(c, lo, hi) := (c >= lo) && (c <= hi)
+    let in_range = |body: &mut Vec<u8>, lo: i64, hi: i64| {
+        getc(body);
+        body.push(0x41);
+        leb_s(lo, body);
+        body.push(0x4E); // i32.ge_s
+        getc(body);
+        body.push(0x41);
+        leb_s(hi, body);
+        body.push(0x4C); // i32.le_s
+        body.push(0x71); // i32.and
+    };
+    // if c < 0x80 { /* ASCII: need stays 0 */ } else { classify }
+    getc(body);
+    body.push(0x41);
+    leb_s(0x80, body);
+    body.push(0x48); // i32.lt_s
+    body.push(0x04); // if
+    body.push(0x40);
+    // ASCII: nothing to do
+    body.push(0x05); // else
+    // c in 0xC2..=0xDF -> need 1
+    in_range(body, 0xC2, 0xDF);
+    body.push(0x04);
+    body.push(0x40);
+    set_const(body, need_local, 1);
+    body.push(0x05); // else
+    // c == 0xE0 -> need 2, lo 0xA0
+    getc(body);
+    body.push(0x41);
+    leb_s(0xE0, body);
+    body.push(0x46); // i32.eq
+    body.push(0x04);
+    body.push(0x40);
+    set_const(body, need_local, 2);
+    set_const(body, lo_local, 0xA0);
+    body.push(0x05); // else
+    // c in 0xE1..=0xEC -> need 2
+    in_range(body, 0xE1, 0xEC);
+    body.push(0x04);
+    body.push(0x40);
+    set_const(body, need_local, 2);
+    body.push(0x05); // else
+    // c == 0xED -> need 2, hi 0x9F
+    getc(body);
+    body.push(0x41);
+    leb_s(0xED, body);
+    body.push(0x46);
+    body.push(0x04);
+    body.push(0x40);
+    set_const(body, need_local, 2);
+    set_const(body, hi_local, 0x9F);
+    body.push(0x05); // else
+    // c in 0xEE..=0xEF -> need 2
+    in_range(body, 0xEE, 0xEF);
+    body.push(0x04);
+    body.push(0x40);
+    set_const(body, need_local, 2);
+    body.push(0x05); // else
+    // c == 0xF0 -> need 3, lo 0x90
+    getc(body);
+    body.push(0x41);
+    leb_s(0xF0, body);
+    body.push(0x46);
+    body.push(0x04);
+    body.push(0x40);
+    set_const(body, need_local, 3);
+    set_const(body, lo_local, 0x90);
+    body.push(0x05); // else
+    // c in 0xF1..=0xF3 -> need 3
+    in_range(body, 0xF1, 0xF3);
+    body.push(0x04);
+    body.push(0x40);
+    set_const(body, need_local, 3);
+    body.push(0x05); // else
+    // c == 0xF4 -> need 3, hi 0x8F
+    getc(body);
+    body.push(0x41);
+    leb_s(0xF4, body);
+    body.push(0x46);
+    body.push(0x04);
+    body.push(0x40);
+    set_const(body, need_local, 3);
+    set_const(body, hi_local, 0x8F);
+    body.push(0x05); // else
+    // invalid lead byte -> trap
+    body.push(0x00); // unreachable
+    body.push(0x0B); // end (F4)
+    body.push(0x0B); // end (F1..F3)
+    body.push(0x0B); // end (F0)
+    body.push(0x0B); // end (EE..EF)
+    body.push(0x0B); // end (ED)
+    body.push(0x0B); // end (E1..EC)
+    body.push(0x0B); // end (E0)
+    body.push(0x0B); // end (C2..DF)
+    body.push(0x0B); // end (ASCII vs non-ASCII)
 }
 
 /// Emit code to dup the element slot at `slot_local` (an i64 holding the slot)
@@ -6768,11 +7565,18 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
         // `main` takes no params and returns Int (existing), Float (an f64
         // export decodes to a JS number), or a heap String (Phase 2d); the Node
         // runner decodes the result accordingly.
+        // (A Bytes *return* from `main` is gated cleanly: the Node runner only
+        // decodes an Int/Float/String result, and a Bytes is a heap object the
+        // shared harness cannot render as `Bytes[..]`. Bytes are fully supported
+        // INSIDE a wasm program — built, mutated, compared, round-tripped to a
+        // String — only the top-level main-return rendering is deferred here.)
         if !m.params.is_empty()
             || (m.ret != WType::I64 && m.ret != WType::F64 && m.ret != WType::Str)
         {
             return Err(
-                "wasm backend: `main` must take no params and return Int, Float, or String".into(),
+                "wasm backend: `main` must take no params and return Int, Float, or String \
+                 (a Bytes return is gated; use bytes_to_str or print inside main)"
+                    .into(),
             );
         }
     }
@@ -7063,7 +7867,7 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
             match ct {
                 WType::F64 => f64_load(off, &mut body_code),
                 WType::I64 => i64_load(off, &mut body_code),
-                WType::I32 | WType::Ref | WType::Str | WType::Tensor | WType::Array(_) => {
+                WType::I32 | WType::Ref | WType::Str | WType::Tensor | WType::Array(_) | WType::Bytes => {
                     i64_load(off, &mut body_code);
                     body_code.push(0xA7); // i32.wrap_i64
                 }
