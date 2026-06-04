@@ -193,6 +193,15 @@ struct Env<'a> {
     tmp: usize,
     /// String-literal pool: bytes -> the C global array name holding them.
     str_lits: &'a HashMap<Vec<u8>, String>,
+    /// The enclosing function's `(param_name, type)` list, in order, IFF that
+    /// function is self-tail-recursive (its body was wrapped in a loop). A
+    /// `TailCall` reassigns these and `goto`s the loop top. Empty otherwise.
+    tail_params: &'a [(String, CType)],
+    /// The enclosing function's declared return type. Used as the result type of
+    /// an `if`/`match` ALL of whose branches diverge (every arm is a `TailCall`):
+    /// the temp is never read, but C/wasm still need a type, and the function
+    /// return type is the consistent choice (these are tail constructs).
+    fn_ret: CType,
 }
 
 impl<'a> Env<'a> {
@@ -300,8 +309,11 @@ fn bind_type(bind: &Bind, env: &Env) -> Result<CType, String> {
             let e = iexpr_type(els, env);
             match (t, e) {
                 (Ok(t), Ok(e)) if t == e => Ok(t),
-                (Ok(t), _) if is_unreachable_unit(els) => Ok(t),
-                (_, Ok(e)) if is_unreachable_unit(then) => Ok(e),
+                (Ok(t), _) if is_diverging(els) => Ok(t),
+                (_, Ok(e)) if is_diverging(then) => Ok(e),
+                // Both branches diverge (e.g. each arm is a `TailCall`): the temp
+                // is never read; use the function return type for consistency.
+                (_, _) if is_diverging(then) && is_diverging(els) => Ok(env.fn_ret),
                 (Ok(t), Ok(e)) => Err(format!(
                     "c backend: if-branches differ in type ({:?} vs {:?})",
                     t, e
@@ -330,7 +342,7 @@ fn match_type(scrut: &Atom, arms: &[ir::IArm], env: &Env) -> Result<CType, Strin
         } else if let Some(b) = arm.binders.first() {
             types.insert(b.clone(), CType::Ref);
         }
-        let probe = Env { types, sigs: env.sigs, ctors: env.ctors, tmp: env.tmp, str_lits: env.str_lits };
+        let probe = Env { types, sigs: env.sigs, ctors: env.ctors, tmp: env.tmp, str_lits: env.str_lits, tail_params: env.tail_params, fn_ret: env.fn_ret };
         match iexpr_type(&arm.body, &probe) {
             Ok(t) => {
                 if let Some(prev) = result {
@@ -344,18 +356,50 @@ fn match_type(scrut: &Atom, arms: &[ir::IArm], env: &Env) -> Result<CType, Strin
                     result = Some(t);
                 }
             }
-            Err(_) if is_unreachable_unit(&arm.body) => {}
+            Err(_) if is_diverging(&arm.body) => {}
             Err(e) => return Err(e),
         }
     }
-    result.ok_or_else(|| "c backend: `match` with no arms".into())
+    // Every arm diverged (each a `TailCall`): the temp is never read; use the
+    // function return type for consistency.
+    Ok(result.unwrap_or(env.fn_ret))
 }
 
-/// True when an IExpr is the IR's dead `Ret(Unit)` fall-through marker.
+/// True when an IExpr is the IR's dead `Ret(Unit)` fall-through marker (the
+/// only genuinely unreachable branch — codegen emits a trap for it).
 fn is_unreachable_unit(e: &IExpr) -> bool {
     match e {
         IExpr::Ret(Atom::Unit) => true,
         IExpr::Dup(_, b) | IExpr::Drop(_, b) | IExpr::DropReuse(_, _, b) => is_unreachable_unit(b),
+        _ => false,
+    }
+}
+
+/// True when an IExpr does NOT yield a value at this position: it is the dead
+/// `Ret(Unit)` marker OR it ends in a `TailCall` (a loop back-edge that
+/// re-enters the function). Such a branch imposes no type constraint on a
+/// sibling `if`/`match` arm, so TYPE inference takes the type from the
+/// value-producing arm. (Codegen still distinguishes the two: a TailCall
+/// emits the loop back-edge, only the dead marker emits a trap.)
+fn is_diverging(e: &IExpr) -> bool {
+    match e {
+        IExpr::Ret(Atom::Unit) => true,
+        IExpr::TailCall(_) => true,
+        // A tail `if`/`match` (its result is returned immediately) diverges when
+        // EVERY branch diverges — e.g. an `if` both of whose arms are TailCalls.
+        IExpr::Let(x, Bind::If(_, t, el), cont)
+            if matches!(&**cont, IExpr::Ret(Atom::Var(v)) if v == x) =>
+        {
+            is_diverging(t) && is_diverging(el)
+        }
+        IExpr::Let(x, Bind::Match(_, arms), cont)
+            if matches!(&**cont, IExpr::Ret(Atom::Var(v)) if v == x) =>
+        {
+            arms.iter().all(|a| is_diverging(&a.body))
+        }
+        IExpr::Dup(_, b) | IExpr::Drop(_, b) | IExpr::DropReuse(_, _, b) | IExpr::Let(_, _, b) => {
+            is_diverging(b)
+        }
         _ => false,
     }
 }
@@ -367,16 +411,20 @@ fn iexpr_type(e: &IExpr, env: &Env) -> Result<CType, String> {
             let t = bind_type(bind, env)?;
             let mut types = env.types.clone();
             types.insert(x.clone(), t);
-            let probe = Env { types, sigs: env.sigs, ctors: env.ctors, tmp: env.tmp, str_lits: env.str_lits };
+            let probe = Env { types, sigs: env.sigs, ctors: env.ctors, tmp: env.tmp, str_lits: env.str_lits, tail_params: env.tail_params, fn_ret: env.fn_ret };
             iexpr_type(body, &probe)
         }
         IExpr::Dup(_, body) | IExpr::Drop(_, body) => iexpr_type(body, env),
         IExpr::DropReuse(_, tok, body) => {
             let mut types = env.types.clone();
             types.insert(tok.clone(), CType::Ref); // a reuse token is a void* (cell ptr or NULL)
-            let probe = Env { types, sigs: env.sigs, ctors: env.ctors, tmp: env.tmp, str_lits: env.str_lits };
+            let probe = Env { types, sigs: env.sigs, ctors: env.ctors, tmp: env.tmp, str_lits: env.str_lits, tail_params: env.tail_params, fn_ret: env.fn_ret };
             iexpr_type(body, &probe)
         }
+        // A `TailCall` is a loop back-edge: it yields no value here. Report it as
+        // "no type"; sibling-branch inference treats it like a diverging branch
+        // (`is_unreachable_unit`) and takes the type from the value-producing arm.
+        IExpr::TailCall(_) => Err("c backend: TailCall has no value type".into()),
     }
 }
 
@@ -458,6 +506,30 @@ fn emit_iexpr(
             }
             env.types.insert(tok.clone(), CType::Ref);
             emit_iexpr(body, result, result_ty, env, ind, out)
+        }
+        IExpr::TailCall(args) => {
+            // Self-tail-call -> loop back-edge. Evaluate ALL new argument atoms
+            // into fresh temporaries FIRST (a parameter may appear in another
+            // argument), then overwrite the parameters and jump to the loop top.
+            // Ownership of each new arg transfers to its parameter exactly as a
+            // real call would bind it (rc-balanced: the rc pass already dropped
+            // any parameter the args do not reuse).
+            let params: Vec<(String, CType)> = env.tail_params.to_vec();
+            if params.len() != args.len() {
+                return Err("c backend: TailCall arity mismatch (internal)".into());
+            }
+            let mut temps = Vec::with_capacity(args.len());
+            for (a, (_, pty)) in args.iter().zip(params.iter()) {
+                let (_, ex) = emit_atom(a, env, out)?;
+                let tn = env.fresh();
+                let _ = writeln!(out, "{}{} {} = {};", ind, pty.decl(), cvar(&tn), ex);
+                temps.push(tn);
+            }
+            for ((pname, _), tn) in params.iter().zip(temps.iter()) {
+                let _ = writeln!(out, "{}{} = {};", ind, cvar(pname), cvar(tn));
+            }
+            let _ = writeln!(out, "{}goto aria_loop_top;", ind);
+            Ok(())
         }
     }
 }
@@ -933,6 +1005,11 @@ fn collect_lits_iexpr(e: &IExpr, out: &mut Vec<Vec<u8>>) {
             collect_lits_iexpr(body, out);
         }
         IExpr::Dup(_, b) | IExpr::Drop(_, b) | IExpr::DropReuse(_, _, b) => collect_lits_iexpr(b, out),
+        IExpr::TailCall(args) => {
+            for a in args {
+                collect_lit_atom(a, out);
+            }
+        }
     }
 }
 
@@ -1166,7 +1243,11 @@ pub fn compile(program: &Program) -> Result<String, String> {
     // 2. Lower to ANF IR and insert reference-count + reuse ops — REUSING the
     //    existing pipeline exactly like the wasm backend.
     let lowered: HashMap<String, IFn> = ir::lower_program(program)?;
-    let fns: HashMap<String, IFn> = crate::rc::insert_rc(&lowered);
+    let rcd: HashMap<String, IFn> = crate::rc::insert_rc(&lowered);
+    // Self-tail-call elimination: rewrite each self-tail-recursive function into
+    // a loop (`TailCall` back-edges). Runs after rc so ownership of the new args
+    // transfers to the params exactly as a real call's binding would.
+    let fns: HashMap<String, IFn> = ir::tail_call_optimize(rcd);
 
     // 3. Collect string literals -> a stable C global per distinct literal.
     let mut lit_list: Vec<Vec<u8>> = Vec::new();
@@ -1247,8 +1328,28 @@ pub fn compile(program: &Program) -> Result<String, String> {
             param_decls.join(", ")
         };
         let _ = writeln!(src, "static {} {}({}) {{", sig.ret.decl(), cfn(name), params);
-        let mut env = Env { types, sigs: &sigs, ctors: &ctors, tmp: 0, str_lits: &str_lits };
+        // For a self-tail-recursive function, expose its parameters so a
+        // `TailCall` can reassign them, and emit a loop-top label the back-edge
+        // `goto`s. The function parameters are themselves the mutable loop
+        // induction variables; re-entering re-executes the body's declarations.
+        let tail_params: Vec<(String, CType)> = if ifn.tail_recursive {
+            ifn.params.iter().zip(sig.params.iter()).map(|(pn, pt)| (pn.clone(), *pt)).collect()
+        } else {
+            Vec::new()
+        };
+        let mut env = Env {
+            types,
+            sigs: &sigs,
+            ctors: &ctors,
+            tmp: 0,
+            str_lits: &str_lits,
+            tail_params: &tail_params,
+            fn_ret: sig.ret,
+        };
         let _ = writeln!(src, "    {} aria_ret;", sig.ret.decl());
+        if ifn.tail_recursive {
+            let _ = writeln!(src, "    aria_loop_top:;");
+        }
         emit_iexpr(&ifn.body, "aria_ret", sig.ret, &mut env, "    ", &mut src)?;
         let _ = writeln!(src, "    return aria_ret;");
         let _ = writeln!(src, "}}");
@@ -1553,5 +1654,63 @@ mod tests {
                    fn main() -> Int = 0";
         let r = compile_src(src);
         assert!(r.is_err(), "expected clean Err for a tensor program, got Ok");
+    }
+
+    // ---- self-tail-call optimization (native) --------------------------
+
+    #[test]
+    fn deep_tail_accumulator_native() {
+        // 1,000,000-deep tail-recursive accumulator. Self-tail-call elimination
+        // turns it into a C `while`-loop (param reassignment + `goto`), so the
+        // native program runs in constant C stack and agrees with the
+        // interpreter (= 500000500000), garbage-free.
+        differential(
+            "fn go(n: Int, acc: Int) -> Int = if n == 0 { acc } else { go(n - 1, acc + n) }\n\
+             fn main() -> Int = go(1000000, 0)",
+        );
+    }
+
+    #[test]
+    fn deep_tail_call_in_match_native() {
+        // Self-tail-call in a `match` arm body (tail position flows through every
+        // arm), 1,000,000 deep, with a small flat-ADT scrutinee (so the
+        // interpreter oracle's per-iteration clone is O(1)). Result agrees with
+        // the interpreter (= 500000500000); the native side allocates/frees a
+        // `Step` cell each iteration and must end garbage-free.
+        differential(
+            "type Step = | Done | More(Int)\n\
+             fn step(n: Int) -> Step = if n == 0 { Done } else { More(n) }\n\
+             fn go(n: Int, acc: Int) -> Int = \
+                match step(n) { Done => acc, More(k) => go(k - 1, acc + k), }\n\
+             fn main() -> Int = go(1000000, 0)",
+        );
+    }
+
+    #[test]
+    fn heap_list_tail_recursion_is_garbage_free_native() {
+        // Build then fold a cons-list; both functions are self-tail-recursive and
+        // pass a HEAP parameter (the list) through the tail call. The native
+        // program reassigns that heap param under TCO and must free every cell
+        // (aria_live=0). Depth kept modest because the interpreter oracle
+        // deep-clones the list each step (O(n^2)); the 1M heap case is covered by
+        // the flat-ADT `deep_tail_call_in_match_native` test above.
+        differential(
+            "type L = | Nil | Cons(Int, L)\n\
+             fn build(n: Int, acc: L) -> L = if n == 0 { acc } else { build(n - 1, Cons(n, acc)) }\n\
+             fn length(xs: L, acc: Int) -> Int = \
+                match xs { Nil => acc, Cons(_, r) => length(r, acc + 1), }\n\
+             fn main() -> Int = length(build(300, Nil), 0)",
+        );
+    }
+
+    #[test]
+    fn tail_call_swapping_args_native() {
+        // gcd by subtraction: a tail call whose new args read the OTHER old param.
+        // The loop reassigns via temporaries, so args see the OLD values.
+        differential(
+            "fn gcd(a: Int, b: Int) -> Int = \
+                if b == 0 { a } else { if a < b { gcd(b, a) } else { gcd(a - b, b) } }\n\
+             fn main() -> Int = gcd(1071, 462)",
+        );
     }
 }

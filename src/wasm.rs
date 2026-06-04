@@ -225,7 +225,10 @@ impl CtorTable {
 //          extended i32 address). A freed cell reuses [p+8] as its free-list
 //          "next" link.
 
-const MEM_PAGES: u64 = 256;
+// 1024 pages = 64 MiB of linear memory. Sized so a ~1M-cell heap program (e.g.
+// building then folding a 1,000,000-element list) fits without exhausting the
+// bump allocator and trapping; tail-recursion itself uses constant stack.
+const MEM_PAGES: u64 = 1024;
 const BUMP_PTR_ADDR: u64 = 0; // i32
 const LIVE_ADDR: u64 = 8; // i64 (8-aligned)
 const REUSES_ADDR: u64 = 16; // i64 (8-aligned): in-place reuse counter (FBIP)
@@ -638,6 +641,30 @@ struct LocalEnv<'a> {
     /// Wasm function index of the imported `env.exp` (always 4); used by the
     /// Tensor `softmax` helper for a libm-faithful `exp`.
     exp_idx: u32,
+    /// Current control-block nesting depth during code emission (each `if`/`loop`
+    /// pushes a level). Used to compute the `br` relative target of a `TailCall`
+    /// back to the enclosing tail-loop. Only meaningful during codegen.
+    block_depth: u32,
+    /// Set IFF the function being emitted is self-tail-recursive: the param
+    /// `(local_index, wasm_type)` list and the `block_depth` of the enclosing
+    /// `loop` (its `br` target). A `TailCall` reassigns the params and `br`s to it.
+    tail: Option<TailCtx>,
+    /// The enclosing function's declared return type. Used as the result type of
+    /// an `if`/`match` ALL of whose branches diverge (every arm a `TailCall`):
+    /// the value is never produced, but the block still needs a blocktype, and
+    /// the function return type is the consistent choice.
+    fn_ret: WType,
+}
+
+/// Tail-loop context for a self-tail-recursive wasm function.
+#[derive(Clone)]
+struct TailCtx {
+    /// `(local index, wasm type)` of each parameter, in order.
+    params: Vec<(u32, WType)>,
+    /// The `block_depth` at which the enclosing `loop` opened (its label level).
+    loop_depth: u32,
+    /// The function's declared return type (the loop block's result valtype).
+    ret: WType,
 }
 
 impl<'a> LocalEnv<'a> {
@@ -752,9 +779,13 @@ fn bind_type(bind: &Bind, env: &LocalEnv) -> Result<WType, String> {
                     }
                     Ok(t)
                 }
-                // One branch is an unreachable Unit return; the other wins.
-                (Ok(t), Err(_)) if is_unreachable_unit(els) => Ok(t),
-                (Err(_), Ok(e)) if is_unreachable_unit(then) => Ok(e),
+                // One branch diverges (unreachable Unit, or a `TailCall` loop
+                // back-edge that yields no value); the other branch wins.
+                (Ok(t), Err(_)) if is_diverging(els) => Ok(t),
+                (Err(_), Ok(e)) if is_diverging(then) => Ok(e),
+                // Both branches diverge (e.g. each arm is a `TailCall`): use the
+                // function return type as the (never-materialized) blocktype.
+                (Err(_), Err(_)) if is_diverging(then) && is_diverging(els) => Ok(env.fn_ret),
                 (Err(err), _) => Err(err),
                 (_, Err(err)) => Err(err),
             }
@@ -816,7 +847,15 @@ fn match_type(scrut: &Atom, arms: &[ir::IArm], env: &LocalEnv) -> Result<WType, 
             print_int_idx: env.print_int_idx,
             print_bool_idx: env.print_bool_idx,
             exp_idx: env.exp_idx,
+            block_depth: env.block_depth,
+            tail: env.tail.clone(),
+            fn_ret: env.fn_ret,
         };
+        // A diverging arm (dead Unit marker, or one ending in a `TailCall` loop
+        // back-edge) yields no value and imposes no type constraint; skip it.
+        if is_diverging(&arm.body) {
+            continue;
+        }
         let at = iexpr_type(&arm.body, &probe)?;
         match result {
             None => result = Some(at),
@@ -829,7 +868,9 @@ fn match_type(scrut: &Atom, arms: &[ir::IArm], env: &LocalEnv) -> Result<WType, 
             _ => {}
         }
     }
-    result.ok_or_else(|| "wasm backend: `match` with no arms".into())
+    // Every arm diverged (each a `TailCall`): use the function return type as the
+    // (never-materialized) blocktype.
+    Ok(result.unwrap_or(env.fn_ret))
 }
 
 /// True when an IExpr is a bare `Ret(Unit)` — the IR's marker for the dead
@@ -842,6 +883,34 @@ fn is_unreachable_unit(e: &IExpr) -> bool {
         // The rc pass may wrap the dead branch in `dup`/`drop`s (e.g. dropping a
         // param the live branch consumed). Those are dead too: see through them.
         IExpr::Dup(_, b) | IExpr::Drop(_, b) => is_unreachable_unit(b),
+        _ => false,
+    }
+}
+
+/// True when an IExpr does NOT yield a value at this position: the dead
+/// `Ret(Unit)` marker, OR a branch ending in a `TailCall` (a loop back-edge
+/// that re-enters the function). Such a branch imposes no type constraint on a
+/// sibling `if`/`match` arm. Codegen still distinguishes the two: a TailCall
+/// emits the loop back-edge; only the dead marker emits `unreachable`.
+fn is_diverging(e: &IExpr) -> bool {
+    match e {
+        IExpr::Ret(Atom::Unit) => true,
+        IExpr::TailCall(_) => true,
+        // A tail `if`/`match` (its result is returned immediately) diverges when
+        // EVERY branch diverges — e.g. an `if` both of whose arms are TailCalls.
+        IExpr::Let(x, Bind::If(_, t, el), cont)
+            if matches!(&**cont, IExpr::Ret(Atom::Var(v)) if v == x) =>
+        {
+            is_diverging(t) && is_diverging(el)
+        }
+        IExpr::Let(x, Bind::Match(_, arms), cont)
+            if matches!(&**cont, IExpr::Ret(Atom::Var(v)) if v == x) =>
+        {
+            arms.iter().all(|a| is_diverging(&a.body))
+        }
+        IExpr::Dup(_, b) | IExpr::Drop(_, b) | IExpr::DropReuse(_, _, b) | IExpr::Let(_, _, b) => {
+            is_diverging(b)
+        }
         _ => false,
     }
 }
@@ -874,6 +943,9 @@ fn iexpr_type(e: &IExpr, env: &LocalEnv) -> Result<WType, String> {
             print_int_idx: env.print_int_idx,
             print_bool_idx: env.print_bool_idx,
             exp_idx: env.exp_idx,
+            block_depth: env.block_depth,
+            tail: env.tail.clone(),
+            fn_ret: env.fn_ret,
             };
             iexpr_type(body, &probe)
         }
@@ -899,9 +971,15 @@ fn iexpr_type(e: &IExpr, env: &LocalEnv) -> Result<WType, String> {
             print_int_idx: env.print_int_idx,
             print_bool_idx: env.print_bool_idx,
             exp_idx: env.exp_idx,
+            block_depth: env.block_depth,
+            tail: env.tail.clone(),
+            fn_ret: env.fn_ret,
             };
             iexpr_type(body, &probe)
         }
+        // A `TailCall` is a loop back-edge: it yields no value here. Report it as
+        // "no type"; sibling-branch inference treats it as diverging (skips it).
+        IExpr::TailCall(_) => Err("wasm backend: TailCall has no value type".into()),
     }
 }
 
@@ -1084,26 +1162,14 @@ fn emit_bind(bind: &Bind, env: &mut LocalEnv, code: &mut Vec<u8>) -> Result<WTyp
             let result_ty = bind_type(bind, env)?;
             code.push(0x04); // if
             code.push(result_ty.byte()); // blocktype = result valtype
-            // then-branch
-            if is_unreachable_unit(then) {
-                code.push(0x00); // unreachable (dead branch)
-            } else {
-                let tt = emit_iexpr(then, env, code)?;
-                if tt != result_ty {
-                    return Err("wasm backend: `if` then-branch type disagrees".into());
-                }
-            }
+            // Each branch opens a new control level: bump the block depth so a
+            // nested `TailCall` computes its `br` target relative to the loop.
+            env.block_depth += 1;
+            emit_if_branch(then, result_ty, env, code)?;
             code.push(0x05); // else
-            // else-branch
-            if is_unreachable_unit(els) {
-                code.push(0x00); // unreachable (dead branch)
-            } else {
-                let et = emit_iexpr(els, env, code)?;
-                if et != result_ty {
-                    return Err("wasm backend: `if` else-branch type disagrees".into());
-                }
-            }
+            emit_if_branch(els, result_ty, env, code)?;
             code.push(0x0B); // end
+            env.block_depth -= 1;
             Ok(result_ty)
         }
         Bind::Ctor(name, fields) => emit_ctor(name, fields, env, code),
@@ -1642,10 +1708,14 @@ fn emit_match_chain(
             code.push(0x51); // i64.eq
             code.push(0x04); // if
             code.push(result_ty.byte());
+            // The arm body and the fall-through chain run one control level
+            // deeper; bump the block depth so a nested `TailCall` `br`s correctly.
+            env.block_depth += 1;
             emit_arm_body(scrut, arm, Some(&info), result_ty, env, code)?;
             code.push(0x05); // else
             emit_match_chain(scrut, arms, i + 1, result_ty, env, code)?;
             code.push(0x0B); // end
+            env.block_depth -= 1;
             Ok(())
         }
     }
@@ -1814,6 +1884,32 @@ fn emit_prim(op: BinOp, lt: WType, rt: WType, code: &mut Vec<u8>) -> Result<WTyp
     }
 }
 
+/// Emit one branch of an `if` whose result valtype is `result_ty`. The dead
+/// `Ret(Unit)` marker becomes `unreachable`. A branch ending in a `TailCall`
+/// diverges via `br` (stack-polymorphic) — emit it without a type check. A
+/// normal branch must leave a value of `result_ty`.
+fn emit_if_branch(
+    branch: &IExpr,
+    result_ty: WType,
+    env: &mut LocalEnv,
+    code: &mut Vec<u8>,
+) -> Result<(), String> {
+    if is_unreachable_unit(branch) {
+        code.push(0x00); // unreachable (statically-dead branch)
+        return Ok(());
+    }
+    if is_diverging(branch) {
+        // Ends in a `TailCall` (loop back-edge); the branch leaves via `br`.
+        emit_iexpr(branch, env, code)?;
+        return Ok(());
+    }
+    let t = emit_iexpr(branch, env, code)?;
+    if t != result_ty {
+        return Err("wasm backend: `if` branch type disagrees".into());
+    }
+    Ok(())
+}
+
 /// Emit an `IExpr`, leaving its result value on the operand stack.
 fn emit_iexpr(e: &IExpr, env: &mut LocalEnv, code: &mut Vec<u8>) -> Result<WType, String> {
     match e {
@@ -1878,6 +1974,36 @@ fn emit_iexpr(e: &IExpr, env: &mut LocalEnv, code: &mut Vec<u8>) -> Result<WType
             code.push(0x21); // local.set tok
             leb_u(tok_idx as u64, code);
             emit_iexpr(body, env, code)
+        }
+        IExpr::TailCall(args) => {
+            // Self-tail-call -> loop back-edge. Push ALL new argument values onto
+            // the stack FIRST (each arg reads the OLD param locals, so this is
+            // safe even when a parameter appears in another argument), then pop
+            // them into the param locals in REVERSE order, then `br` to the loop.
+            // Ownership transfers to the params exactly as a real call's binding
+            // (rc-balanced); the old param values are overwritten by the new ones.
+            let tail = env
+                .tail
+                .clone()
+                .ok_or("wasm backend: TailCall outside a tail-recursive function (internal)")?;
+            if tail.params.len() != args.len() {
+                return Err("wasm backend: TailCall arity mismatch (internal)".into());
+            }
+            for a in args {
+                emit_atom(a, env, code)?;
+            }
+            for (idx, _ty) in tail.params.iter().rev() {
+                code.push(0x21); // local.set <param>
+                leb_u(*idx as u64, code);
+            }
+            // `br` to the enclosing loop: relative target = (current depth) -
+            // (loop's depth). Directly inside the loop body that is 0.
+            let target = env.block_depth - tail.loop_depth;
+            code.push(0x0C); // br
+            leb_u(target as u64, code);
+            // After an unconditional `br` the operand stack is polymorphic; report
+            // the function's return type so any value-checking caller is satisfied.
+            Ok(tail.ret)
         }
     }
 }
@@ -4932,6 +5058,11 @@ fn collect_str_lits_iexpr(e: &IExpr, out: &mut Vec<Vec<u8>>) {
         IExpr::Dup(_, body) | IExpr::Drop(_, body) | IExpr::DropReuse(_, _, body) => {
             collect_str_lits_iexpr(body, out)
         }
+        IExpr::TailCall(args) => {
+            for a in args {
+                collect_str_lits_atom(a, out);
+            }
+        }
     }
 }
 
@@ -5048,7 +5179,11 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
     // same-arity constructor reuses that cell's memory in place, matching the IR
     // interpreter. A shared cell yields a null token, so `CtorReuse` falls back
     // to a fresh allocation; either way the heap stays garbage-free.
-    let fns: HashMap<String, IFn> = crate::rc::insert_rc(&lowered);
+    let rcd: HashMap<String, IFn> = crate::rc::insert_rc(&lowered);
+    // Self-tail-call elimination: rewrite each self-tail-recursive function into
+    // a loop (`TailCall` back-edges -> a wasm `loop` + `br`). Runs after rc so
+    // ownership of the new args transfers to the params as a real call's binding.
+    let fns: HashMap<String, IFn> = ir::tail_call_optimize(rcd);
 
     // Helper function indices come after the imports and every user function:
     //   [imports...] [user fns...] [overflow helpers x4] [heap helpers...]
@@ -5135,11 +5270,37 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
             print_int_idx: PRINT_INT_IDX,
             print_bool_idx: PRINT_BOOL_IDX,
             exp_idx: EXP_IDX,
+            block_depth: 0,
+            tail: None,
+            fn_ret: sig.ret,
         };
+        // Self-tail-recursive functions are emitted with their body wrapped in a
+        // `loop` (result type = the function's return type). A `TailCall`
+        // reassigns the param locals and `br`s back to the loop top — constant
+        // stack for tail recursion.
+        if ifn.tail_recursive {
+            let params: Vec<(u32, WType)> = ifn
+                .params
+                .iter()
+                .zip(sig.params.iter())
+                .enumerate()
+                .map(|(i, (_pn, pt))| (i as u32, *pt))
+                .collect();
+            env.tail = Some(TailCtx { params, loop_depth: 1, ret: sig.ret });
+        }
 
         // Emit the body instructions; the result is left on the stack.
         let mut body_code = Vec::new();
+        if ifn.tail_recursive {
+            body_code.push(0x03); // loop
+            body_code.push(sig.ret.byte()); // blocktype = result valtype
+            env.block_depth = 1;
+        }
         let result_ty = emit_iexpr(&ifn.body, &mut env, &mut body_code)?;
+        if ifn.tail_recursive {
+            body_code.push(0x0B); // end loop
+            env.block_depth = 0;
+        }
         if result_ty != sig.ret {
             return Err(format!(
                 "wasm backend: fn `{}` body produces {:?} but is declared to return {:?}",
@@ -6501,5 +6662,59 @@ mod tests {
         assert_eq!(interp, wasm, "wasm != interpreter for unique-tree map");
         assert_eq!(live, 0, "leak: {} live cell(s) after unique-tree map", live);
         assert!(reuses > 0, "expected in-place node reuse, got {}", reuses);
+    }
+
+    // ---- self-tail-call optimization (wasm) ----------------------------
+
+    #[test]
+    fn deep_tail_accumulator_wasm() {
+        // 1,000,000-deep tail-recursive accumulator. Self-tail-call elimination
+        // emits a wasm `loop` + `br` (param reassignment), so this runs in
+        // constant wasm stack under Node's DEFAULT stack (no `--stack-size`) and
+        // agrees with the interpreter (= 500000500000).
+        differential(
+            "fn go(n: Int, acc: Int) -> Int = if n == 0 { acc } else { go(n - 1, acc + n) }\n\
+             fn main() -> Int = go(1000000, 0)",
+        );
+    }
+
+    #[test]
+    fn deep_tail_call_in_match_wasm() {
+        // Self-tail-call in a `match` arm body, 1,000,000 deep, with a small flat
+        // ADT scrutinee (each iteration allocates+frees one `Step` cell). Must
+        // agree with the interpreter and end garbage-free (__live==0).
+        differential_heap(
+            "type Step = | Done | More(Int)\n\
+             fn step(n: Int) -> Step = if n == 0 { Done } else { More(n) }\n\
+             fn go(n: Int, acc: Int) -> Int = \
+                match step(n) { Done => acc, More(k) => go(k - 1, acc + k), }\n\
+             fn main() -> Int = go(1000000, 0)",
+        );
+    }
+
+    #[test]
+    fn heap_list_tail_recursion_is_garbage_free_wasm() {
+        // Build then fold a cons-list; both functions are self-tail-recursive and
+        // pass the HEAP list parameter through the tail call. The compiled module
+        // reassigns that heap param under TCO and must end garbage-free. Depth is
+        // modest because the interpreter oracle deep-clones the list (O(n^2)).
+        differential_heap(
+            "type L = | Nil | Cons(Int, L)\n\
+             fn build(n: Int, acc: L) -> L = if n == 0 { acc } else { build(n - 1, Cons(n, acc)) }\n\
+             fn length(xs: L, acc: Int) -> Int = \
+                match xs { Nil => acc, Cons(_, r) => length(r, acc + 1), }\n\
+             fn main() -> Int = length(build(300, Nil), 0)",
+        );
+    }
+
+    #[test]
+    fn tail_call_swapping_args_wasm() {
+        // gcd by subtraction: the new tail-call args read the OTHER old param, so
+        // all args must be computed before any param local is overwritten.
+        differential(
+            "fn gcd(a: Int, b: Int) -> Int = \
+                if b == 0 { a } else { if a < b { gcd(b, a) } else { gcd(a - b, b) } }\n\
+             fn main() -> Int = gcd(1071, 462)",
+        );
     }
 }

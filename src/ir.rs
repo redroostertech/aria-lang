@@ -75,12 +75,27 @@ pub enum IExpr {
     /// the reuse `token` (binding it for a later `CtorReuse`) instead of fully
     /// freeing it. The token is "empty" when the cell was shared.
     DropReuse(String, String, Box<IExpr>),
+    /// A self-tail-call turned into a loop back-edge: reassign the enclosing
+    /// function's parameters to these argument atoms and re-enter its body from
+    /// the top. Produced by the `tco` pass (see `tail_call_optimize`); the
+    /// argument atoms correspond positionally to `IFn::params`. The backends
+    /// evaluate ALL argument atoms into temporaries *before* overwriting any
+    /// parameter (a parameter may appear in another argument), then jump to the
+    /// loop header instead of performing a real call — giving constant stack for
+    /// tail recursion. Ownership of the new args transfers to the params exactly
+    /// as a real call would bind them, so the rc pass's dup/drop stays balanced.
+    TailCall(Vec<Atom>),
 }
 
 #[derive(Debug, Clone)]
 pub struct IFn {
     pub params: Vec<String>,
     pub body: IExpr,
+    /// Set by the `tco` pass when `body` contains `IExpr::TailCall` back-edges.
+    /// The backends then emit the body wrapped in a loop whose header is the
+    /// re-entry target of every `TailCall`. Freshly-lowered / rc'd IR has this
+    /// `false` (no `TailCall` nodes yet).
+    pub tail_recursive: bool,
 }
 
 pub struct LowerError(pub String);
@@ -350,10 +365,106 @@ pub fn lower_program(program: &Program) -> Result<HashMap<String, IFn>, String> 
         if let Item::Fn(f) = item {
             let body = lw.lower_block(&f.body).map_err(|e| format!("fn `{}`: {}", f.name, e.0))?;
             let params = f.params.iter().map(|p| p.name.clone()).collect();
-            fns.insert(f.name.clone(), IFn { params, body });
+            fns.insert(f.name.clone(), IFn { params, body, tail_recursive: false });
         }
     }
     Ok(fns)
+}
+
+// ---- self-tail-call optimization ----------------------------------------
+
+/// Rewrite every SELF tail-call into a loop back-edge (`IExpr::TailCall`).
+///
+/// A function `f` is *self-tail-recursive* if, in tail position of its body,
+/// it calls itself (`Bind::Call(f, args)`) with matching arity. Tail position
+/// in the (rc'd) ANF IR flows through:
+///   * the body's final `Ret`,
+///   * a `Let(x, If(c, t, e), Ret(Var(x)))` — both branches are tail,
+///   * a `Let(x, Match(s, arms), Ret(Var(x)))` — every arm body is tail,
+///   * `Dup`/`Drop`/`DropReuse` wrappers (they execute, then continue), and
+///   * the continuation of a non-tail `Let`.
+/// A tail self-call has the shape `Let(t, Call(f, args), Ret(Var(t)))`; it is
+/// replaced by `TailCall(args)`. The backends (and the IR interpreter) then
+/// run the body in a loop, reassigning the parameters from `args` and
+/// re-entering — constant stack for tail recursion. Only DIRECT self-calls are
+/// handled; mutual recursion is out of scope.
+///
+/// Runs AFTER `rc::insert_rc`: the new arguments carry ownership transferred to
+/// the parameters exactly as a real call would bind them, so dup/drop stays
+/// balanced (the rc pass already dropped any parameter the recursive arguments
+/// do not reuse, and dup'd any reused more than once).
+pub fn tail_call_optimize(fns: HashMap<String, IFn>) -> HashMap<String, IFn> {
+    fns.into_iter()
+        .map(|(name, f)| {
+            let arity = f.params.len();
+            let mut found = false;
+            let body = rewrite_tail(&name, arity, f.body, &mut found);
+            (name, IFn { params: f.params, body, tail_recursive: found })
+        })
+        .collect()
+}
+
+/// Rewrite an IExpr that is itself in TAIL position. `found` is set when at
+/// least one self-tail-call is replaced.
+fn rewrite_tail(self_name: &str, arity: usize, e: IExpr, found: &mut bool) -> IExpr {
+    match e {
+        // The canonical self-tail-call shape: `let t = self(args) in ret t`.
+        IExpr::Let(ref x, Bind::Call(ref callee, ref args), ref cont)
+            if callee == self_name
+                && args.len() == arity
+                && matches!(&**cont, IExpr::Ret(Atom::Var(v)) if v == x) =>
+        {
+            *found = true;
+            IExpr::TailCall(args.clone())
+        }
+        // A tail `If`/`Match` bound to a temp returned immediately: its result
+        // IS the function result, so both branches / every arm are tail.
+        IExpr::Let(ref x, Bind::If(ref c, ref t, ref el), ref cont)
+            if matches!(&**cont, IExpr::Ret(Atom::Var(v)) if v == x) =>
+        {
+            let t2 = rewrite_tail(self_name, arity, (**t).clone(), found);
+            let e2 = rewrite_tail(self_name, arity, (**el).clone(), found);
+            IExpr::Let(
+                x.clone(),
+                Bind::If(c.clone(), Box::new(t2), Box::new(e2)),
+                cont.clone(),
+            )
+        }
+        IExpr::Let(ref x, Bind::Match(ref s, ref arms), ref cont)
+            if matches!(&**cont, IExpr::Ret(Atom::Var(v)) if v == x) =>
+        {
+            let arms2 = arms
+                .iter()
+                .map(|a| IArm {
+                    ctor: a.ctor.clone(),
+                    binders: a.binders.clone(),
+                    body: rewrite_tail(self_name, arity, a.body.clone(), found),
+                })
+                .collect();
+            IExpr::Let(
+                x.clone(),
+                Bind::Match(s.clone(), arms2),
+                cont.clone(),
+            )
+        }
+        // A non-tail `Let`: only its continuation is in tail position.
+        IExpr::Let(x, bind, body) => {
+            let body2 = rewrite_tail(self_name, arity, *body, found);
+            IExpr::Let(x, bind, Box::new(body2))
+        }
+        // These execute, then continue to the tail.
+        IExpr::Dup(v, body) => {
+            IExpr::Dup(v, Box::new(rewrite_tail(self_name, arity, *body, found)))
+        }
+        IExpr::Drop(v, body) => {
+            IExpr::Drop(v, Box::new(rewrite_tail(self_name, arity, *body, found)))
+        }
+        IExpr::DropReuse(s, t, body) => {
+            IExpr::DropReuse(s, t, Box::new(rewrite_tail(self_name, arity, *body, found)))
+        }
+        // A plain return is the tail value; nothing to rewrite.
+        other @ (IExpr::Ret(_) | IExpr::TailCall(_)) => other,
+    }
 }
 
 // ---- IR interpreter with allocation counting ----------------------------
@@ -527,6 +638,12 @@ impl IrInterp {
                     };
                     env.insert(tok.clone(), token);
                     e = body;
+                }
+                // The IR tree-walking interpreter is the differential oracle and
+                // runs rc'd-but-NOT-tco'd IR (the `tco` pass is applied only in
+                // the wasm/native pipelines), so `TailCall` never reaches here.
+                IExpr::TailCall(_) => {
+                    return Err("ir: TailCall in non-TCO interpreter (internal)".into())
                 }
             }
         }
@@ -1065,6 +1182,57 @@ mod tests {
             .join()
             .expect("ir thread must not abort");
         assert_eq!(out, "3000");
+    }
+
+    // ---- self-tail-call optimization pass ------------------------------
+
+    /// Does an IExpr contain a `TailCall` anywhere?
+    fn has_tail_call(e: &IExpr) -> bool {
+        match e {
+            IExpr::TailCall(_) => true,
+            IExpr::Ret(_) => false,
+            IExpr::Let(_, bind, body) => {
+                let in_bind = match bind {
+                    Bind::If(_, t, el) => has_tail_call(t) || has_tail_call(el),
+                    Bind::Match(_, arms) => arms.iter().any(|a| has_tail_call(&a.body)),
+                    _ => false,
+                };
+                in_bind || has_tail_call(body)
+            }
+            IExpr::Dup(_, b) | IExpr::Drop(_, b) | IExpr::DropReuse(_, _, b) => has_tail_call(b),
+        }
+    }
+
+    #[test]
+    fn tco_pass_marks_and_rewrites_self_tail_call() {
+        // A self-tail-recursive accumulator: after `tail_call_optimize`, `go` is
+        // flagged tail_recursive and its body contains a `TailCall`; the
+        // non-recursive `main` is left untouched.
+        let src = "fn go(n: Int, acc: Int) -> Int = if n == 0 { acc } else { go(n - 1, acc + n) }\n\
+                   fn main() -> Int = go(10, 0)";
+        let prog = parser::parse(lexer::lex(src).unwrap()).unwrap();
+        let rcd = crate::rc::insert_rc(&lower_program(&prog).unwrap());
+        let tco = tail_call_optimize(rcd);
+        let go = tco.get("go").unwrap();
+        assert!(go.tail_recursive, "`go` must be marked self-tail-recursive");
+        assert!(has_tail_call(&go.body), "`go` body must contain a TailCall");
+        let main = tco.get("main").unwrap();
+        assert!(!main.tail_recursive, "`main` is not self-tail-recursive");
+        assert!(!has_tail_call(&main.body));
+    }
+
+    #[test]
+    fn tco_does_not_rewrite_non_tail_self_call() {
+        // The recursive call is an operand of `+` (NOT in tail position), so the
+        // pass must NOT mark the function or insert a TailCall.
+        let src = "fn sumto(n: Int) -> Int = if n == 0 { 0 } else { n + sumto(n - 1) }\n\
+                   fn main() -> Int = sumto(5)";
+        let prog = parser::parse(lexer::lex(src).unwrap()).unwrap();
+        let rcd = crate::rc::insert_rc(&lower_program(&prog).unwrap());
+        let tco = tail_call_optimize(rcd);
+        let f = tco.get("sumto").unwrap();
+        assert!(!f.tail_recursive, "non-tail self-call must NOT be optimized");
+        assert!(!has_tail_call(&f.body));
     }
 }
 

@@ -65,6 +65,14 @@ impl Value {
 
 type Scope = Vec<HashMap<String, Value>>;
 
+/// The result of evaluating a function body in tail position: either a final
+/// value, or a request to re-enter the SAME function (self-tail-call) with these
+/// already-evaluated argument values. Drives the interpreter's TCO loop.
+enum TailOutcome {
+    Value(Value),
+    SelfCall(Vec<Value>),
+}
+
 pub struct Interp {
     fns: HashMap<String, FnDecl>,
     /// constructor name -> arity
@@ -111,7 +119,7 @@ impl Interp {
             return Err("`main` must take no parameters".to_string());
         }
         let mut scope: Scope = vec![HashMap::new()];
-        self.eval(&main.body, &mut scope)
+        self.eval_fn_body("main", &main.body, &mut scope)
     }
 
     fn lookup<'a>(scope: &'a Scope, name: &str) -> Option<&'a Value> {
@@ -204,7 +212,11 @@ impl Interp {
                     ));
                 }
                 self.depth.set(d);
-                let result = self.eval(&f.body, &mut call_scope);
+                // Evaluate the body with SELF-tail-call elimination: a tail call
+                // to `name` reuses this frame (a loop) instead of recursing, so
+                // tail recursion runs in constant stack and never trips the depth
+                // guard. Only this single nested call frame is on the stack.
+                let result = self.eval_fn_body(name, &f.body, &mut call_scope);
                 self.depth.set(d - 1);
                 result
             }
@@ -288,6 +300,117 @@ impl Interp {
                 scope.pop();
                 result
             }
+        }
+    }
+
+    /// Evaluate the body of the function named `self_name` with SELF-tail-call
+    /// elimination. `scope` holds exactly the call frame (params bound at its
+    /// base). We loop: evaluate toward the tail; if the tail is a direct call to
+    /// `self_name` with matching arity, evaluate its argument values, REBIND the
+    /// parameters, and re-iterate the same body (a loop) instead of recursing.
+    /// All new argument values are computed BEFORE any parameter is rebound (a
+    /// parameter may appear in another argument). Non-tail calls — and tail calls
+    /// to OTHER functions — go through the ordinary depth-guarded path.
+    fn eval_fn_body(
+        &self,
+        self_name: &str,
+        body: &Expr,
+        scope: &mut Scope,
+    ) -> Result<Value, String> {
+        loop {
+            match self.eval_tail(self_name, body, scope)? {
+                TailOutcome::Value(v) => return Ok(v),
+                TailOutcome::SelfCall(args) => {
+                    // Rebind the parameters in the (single) call frame and loop.
+                    // The frame is `scope[0]`; tail position never leaves extra
+                    // frames pushed (Block/Match frames are popped before we
+                    // surface a SelfCall — see `eval_tail`).
+                    let params = &self.fns[self_name].params;
+                    let frame = scope.first_mut().expect("call frame present");
+                    for (p, v) in params.iter().zip(args.into_iter()) {
+                        frame.insert(p.name.clone(), v);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Evaluate `e`, which is in TAIL position of the function named
+    /// `self_name`. Returns either the value, or a self-tail-call request
+    /// carrying the already-evaluated argument values. Tail position flows
+    /// through `if` branches, `match` arm bodies, and the final expression of a
+    /// `Block`; any other expression is evaluated normally via `self.eval`.
+    fn eval_tail(
+        &self,
+        self_name: &str,
+        e: &Expr,
+        scope: &mut Scope,
+    ) -> Result<TailOutcome, String> {
+        match e {
+            Expr::Call(name, args) => {
+                // A direct self-call (not shadowed by a local of the same name,
+                // not a builtin) with matching arity is a self-tail-call.
+                let shadowed = Interp::lookup(scope, name).is_some();
+                let is_self = name == self_name
+                    && !shadowed
+                    && self
+                        .fns
+                        .get(name)
+                        .map(|f| f.params.len() == args.len())
+                        .unwrap_or(false);
+                if is_self {
+                    let mut vals = Vec::with_capacity(args.len());
+                    for a in args {
+                        vals.push(self.eval(a, scope)?);
+                    }
+                    Ok(TailOutcome::SelfCall(vals))
+                } else {
+                    self.eval(e, scope).map(TailOutcome::Value)
+                }
+            }
+            Expr::If(cond, then, els) => match self.eval(cond, scope)? {
+                Value::Bool(true) => self.eval_tail(self_name, then, scope),
+                Value::Bool(false) => self.eval_tail(self_name, els, scope),
+                other => Err(format!("`if` condition must be Bool, got {}", other.display())),
+            },
+            Expr::Match(scrut, arms) => {
+                let v = self.eval(scrut, scope)?;
+                for arm in arms {
+                    let mut binds = HashMap::new();
+                    if match_pattern(&arm.pat, &v, &mut binds) {
+                        scope.push(binds);
+                        let result = self.eval_tail(self_name, &arm.body, scope);
+                        scope.pop();
+                        return result;
+                    }
+                }
+                Err(format!("no match arm for value {}", v.display()))
+            }
+            Expr::Block(stmts, last) => {
+                scope.push(HashMap::new());
+                let run = |me: &Self, scope: &mut Scope| -> Result<TailOutcome, String> {
+                    for s in stmts {
+                        match s {
+                            Stmt::Let(name, _ty, value) => {
+                                let val = me.eval(value, scope)?;
+                                scope.last_mut().unwrap().insert(name.clone(), val);
+                            }
+                            Stmt::Expr(ex) => {
+                                me.eval(ex, scope)?;
+                            }
+                        }
+                    }
+                    me.eval_tail(self_name, last, scope)
+                };
+                let result = run(self, scope);
+                // A `SelfCall` carries fully-evaluated argument values, so it is
+                // safe to pop this block's frame before returning it: the values
+                // no longer reference any local bound in the block.
+                scope.pop();
+                result
+            }
+            // Not a tail-position construct: evaluate normally.
+            _ => self.eval(e, scope).map(TailOutcome::Value),
         }
     }
 
@@ -912,5 +1035,70 @@ mod tests {
             Value::Float(f) => assert!((f - 1.0).abs() < 1e-5, "identical text similarity was {f}"),
             v => panic!("expected Float, got {}", v.display()),
         }
+    }
+
+    // ---- self-tail-call optimization -----------------------------------
+
+    #[test]
+    fn deep_tail_accumulator_no_recursion_limit() {
+        // A tail-recursive accumulator 1,000,000 deep — FAR past MAX_CALL_DEPTH.
+        // With self-tail-call elimination this runs as a loop in constant stack,
+        // so it must NOT hit the depth guard and must return 500000500000. Run on
+        // the DEFAULT (small) test-thread stack to prove the stack stays flat.
+        assert!(MAX_CALL_DEPTH < 1_000_000);
+        let v = run(
+            "fn go(n: Int, acc: Int) -> Int = if n == 0 { acc } else { go(n - 1, acc + n) }\n\
+             fn main() -> Int = go(1000000, 0)",
+        );
+        assert!(matches!(v, Value::Int(500000500000)), "got {}", v.display());
+    }
+
+    #[test]
+    fn deep_tail_call_in_match_no_recursion_limit() {
+        // A self-tail-call in a `match` arm body (tail position flows through
+        // every arm), 1,000,000 deep. Scrutinee is a small flat ADT so each
+        // iteration's clone is O(1); TCO gives constant stack.
+        let v = run(
+            "type Step = | Done | More(Int)\n\
+             fn step(n: Int) -> Step = if n == 0 { Done } else { More(n) }\n\
+             fn go(n: Int, acc: Int) -> Int = \
+                match step(n) { Done => acc, More(k) => go(k - 1, acc + k), }\n\
+             fn main() -> Int = go(1000000, 0)",
+        );
+        assert!(matches!(v, Value::Int(500000500000)), "got {}", v.display());
+    }
+
+    #[test]
+    fn tail_call_arg_references_other_param() {
+        // Swap-style tail call where each new argument reads the OTHER (old)
+        // parameter: all args must be evaluated BEFORE any param is rebound.
+        // gcd by subtraction is a clean check (gcd(48, 36) = 12).
+        let v = run(
+            "fn gcd(a: Int, b: Int) -> Int = \
+                if b == 0 { a } else { if a < b { gcd(b, a) } else { gcd(a - b, b) } }\n\
+             fn main() -> Int = gcd(48, 36)",
+        );
+        assert!(matches!(v, Value::Int(12)), "got {}", v.display());
+    }
+
+    #[test]
+    fn non_tail_recursion_unchanged() {
+        // A NON-tail call (the recursive call is an operand of `+`, not in tail
+        // position) is NOT turned into a loop: it still uses a real call frame.
+        // It must keep producing the right answer. Run on a large-stack thread
+        // (as the CLI does) since non-tail recursion consumes native stack per
+        // call; the TCO transform does not change that.
+        let src = "fn sumto(n: Int) -> Int = if n == 0 { 0 } else { n + sumto(n - 1) }\n\
+                   fn main() -> Int = sumto(2000)";
+        let v = std::thread::Builder::new()
+            .stack_size(1 << 30)
+            .spawn(move || {
+                let prog = parser::parse(lexer::lex(src).unwrap()).unwrap();
+                Interp::new(&prog).unwrap().run_main().unwrap()
+            })
+            .unwrap()
+            .join()
+            .expect("non-tail recursion must not crash at this depth");
+        assert!(matches!(v, Value::Int(2001000)), "got {}", v.display());
     }
 }

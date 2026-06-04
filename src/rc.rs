@@ -43,6 +43,9 @@ fn try_reuse(e: &IExpr, arity: usize, tok: &str) -> Option<IExpr> {
             try_reuse(b, arity, tok).map(|b2| IExpr::DropReuse(s.clone(), t.clone(), Box::new(b2)))
         }
         IExpr::Ret(_) => None,
+        // `TailCall` is produced by the `tco` pass, which runs AFTER rc — it is
+        // never present while reuse analysis runs.
+        IExpr::TailCall(_) => None,
     }
 }
 
@@ -58,7 +61,7 @@ pub fn insert_rc(fns: &HashMap<String, IFn>) -> HashMap<String, IFn> {
                     body = IExpr::Drop(p.clone(), Box::new(body));
                 }
             }
-            (name.clone(), IFn { params: f.params.clone(), body })
+            (name.clone(), IFn { params: f.params.clone(), body, tail_recursive: f.tail_recursive })
         })
         .collect()
 }
@@ -88,6 +91,12 @@ fn collect_fv(e: &IExpr, acc: &mut HashSet<String>) {
             collect_fv(body, &mut b);
             b.remove(x);
             acc.extend(b);
+        }
+        // Not present during rc (produced later by `tco`); handled for totality.
+        IExpr::TailCall(args) => {
+            for a in args {
+                add_atom(a, acc);
+            }
         }
     }
 }
@@ -332,6 +341,8 @@ fn rc(e: &IExpr, live: &HashSet<String>) -> IExpr {
         }
 
         IExpr::Dup(..) | IExpr::Drop(..) | IExpr::DropReuse(..) => e.clone(),
+        // Not present during rc (produced later by `tco`); handled for totality.
+        IExpr::TailCall(_) => e.clone(),
     }
 }
 
