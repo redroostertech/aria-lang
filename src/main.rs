@@ -251,9 +251,9 @@ fn run_wasm_run(args: &[String]) -> ExitCode {
          else{{process.stdout.write(decodeStr(v));}}\
          if(ex.__live){{process.stderr.write('__live='+String(ex.__live()));}}\
          if(ex.__reuses){{process.stderr.write(' __reuses='+String(ex.__reuses()));}}}}\
-         catch(e){{process.stdout.write('TRAP');}}\
-         }}).catch(e=>{{process.stdout.write('TRAP');}});}}\
-         catch(e){{process.stdout.write('TRAP');}}",
+         catch(e){{process.stdout.write('TRAP');process.exitCode=1;}}\
+         }}).catch(e=>{{process.stdout.write('TRAP');process.exitCode=1;}});}}\
+         catch(e){{process.stdout.write('TRAP');process.exitCode=1;}}",
         path.to_string_lossy()
     );
     // `--stack-size` raises V8's stack so compiled wasm can recurse as deeply as
@@ -277,7 +277,17 @@ fn run_wasm_run(args: &[String]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Ok(o) => {
-            eprintln!("node error: {}", String::from_utf8_lossy(&o.stderr));
+            // A wasm trap (e.g. overflow / div-by-zero / array OOB): the harness
+            // wrote partial output + `TRAP` to stdout and set a non-zero exit.
+            // Surface that (and any stderr) and fail, matching native/interp.
+            use std::io::Write;
+            let _ = std::io::stdout().write_all(&o.stdout);
+            if !o.stdout.is_empty() {
+                println!();
+            }
+            if !o.stderr.is_empty() {
+                eprintln!("{}", String::from_utf8_lossy(&o.stderr));
+            }
             ExitCode::FAILURE
         }
         Err(e) => {

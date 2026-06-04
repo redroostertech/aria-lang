@@ -591,7 +591,50 @@ impl Lowerer {
 
     /// Lower a `match`. ADT (constructor) patterns become a `Match` bind;
     /// integer/bool literal patterns become an `if`-chain.
+    /// If `arm` is a single irrefutable arm whose constructor pattern has NESTED
+    /// constructor sub-patterns (e.g. tuple/record destructuring `((a,b),c)`),
+    /// flatten it: bind each nested sub-pattern to a fresh variable and re-match
+    /// it inside the body. The IR's flat `Match` then handles each level. Returns
+    /// `None` if the arm is already flat or has a refutable (literal) sub-pattern.
+    fn flatten_nested_arm(&mut self, arm: &crate::ast::Arm) -> Option<crate::ast::Arm> {
+        use crate::ast::Arm;
+        let (name, subs) = match &arm.pat {
+            Pattern::Ctor(n, s) => (n, s),
+            _ => return None,
+        };
+        if !subs.iter().any(|s| matches!(s, Pattern::Ctor(..))) {
+            return None; // already flat
+        }
+        if subs.iter().any(|s| matches!(s, Pattern::Int(_) | Pattern::Bool(_))) {
+            return None; // refutable nesting needs fall-through; leave to the error
+        }
+        let mut flat = Vec::with_capacity(subs.len());
+        let mut body = arm.body.clone();
+        for sub in subs {
+            match sub {
+                Pattern::Var(_) | Pattern::Wild => flat.push(sub.clone()),
+                Pattern::Ctor(..) => {
+                    let f = self.fresh();
+                    flat.push(Pattern::Var(f.clone()));
+                    body = Expr::Match(
+                        Box::new(Expr::Var(f)),
+                        vec![Arm { pat: sub.clone(), body }],
+                    );
+                }
+                _ => return None,
+            }
+        }
+        Some(Arm { pat: Pattern::Ctor(name.clone(), flat), body })
+    }
+
     fn lower_match(&mut self, scrut: Atom, arms: &[crate::ast::Arm]) -> Result<Bind, LowerError> {
+        // Flatten a single nested destructuring arm so the IR's flat matcher can
+        // lower it (tuple/record patterns like `((a, b), c)`).
+        if arms.len() == 1 {
+            if let Some(flat) = self.flatten_nested_arm(&arms[0]) {
+                return self.lower_match(scrut, std::slice::from_ref(&flat));
+            }
+        }
         let has_ctor = arms.iter().any(|a| matches!(a.pat, Pattern::Ctor(_, _)));
         if has_ctor {
             let mut iarms = Vec::new();

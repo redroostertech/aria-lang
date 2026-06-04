@@ -1041,7 +1041,17 @@ fn emit_builtin(
 /// Encode an evaluated element value (C expression `ex` of type `t`) into the
 /// int64 slot representation used by `AriaArray.elems[]`, per the array's kind.
 fn encode_elem_slot(kind: ElemKind, t: CType, ex: &str) -> Result<String, String> {
-    if t != kind.elem_ctype() {
+    // A `Ref`-kind element is any boxed heap value stored as a pointer — an ADT
+    // cell, a string, or a NESTED array — so accept all pointer-typed values
+    // there (this is what makes `Array[Array[..]]` / `Array[String]` work). The
+    // scalar kinds must match exactly so the encoding is correct.
+    let ok = match kind {
+        ElemKind::Int => matches!(t, CType::Int | CType::Bool),
+        ElemKind::Float => t == CType::Float,
+        ElemKind::Str => t == CType::Str,
+        ElemKind::Ref => matches!(t, CType::Ref | CType::Str | CType::Array(_)),
+    };
+    if !ok {
         return Err(format!(
             "c backend: array element type mismatch (got {:?}, expected {:?})",
             t,

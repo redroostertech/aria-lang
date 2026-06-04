@@ -64,6 +64,9 @@ enum Ty {
     /// `Array[Int]`. The generator only ever builds NON-empty arrays, so
     /// index-0 `get`/`set` never trap and the garbage-free check stays active.
     Array,
+    /// `(Int, Int)` — exercises tuple construction, the RC'd tuple cell, and
+    /// destructuring patterns. (Tuples work in every backend.)
+    Tuple,
 }
 
 /// The fixed prelude prepended to every generated program. Only these functions
@@ -128,6 +131,7 @@ impl<'a> Gen<'a> {
             Ty::Str => self.gen_str(fuel),
             Ty::List => self.gen_list(fuel),
             Ty::Array => self.gen_array(fuel),
+            Ty::Tuple => self.gen_tuple(fuel),
         }
     }
 
@@ -181,6 +185,13 @@ impl<'a> Gen<'a> {
                     format!("[{}]", self.rng.below(10))
                 }
             }
+            Ty::Tuple => {
+                if let Some(v) = self.var_of(Ty::Tuple) {
+                    v
+                } else {
+                    format!("({}, {})", self.rng.below(10), self.rng.below(10))
+                }
+            }
         }
     }
 
@@ -200,21 +211,23 @@ impl<'a> Gen<'a> {
         if self.wasm_subset {
             // Restricted universe: Int/Bool/IntList/String AND Array[Int]. No
             // Float, which stays outside the wasm backend's compilable subset.
-            return match self.rng.below(5) {
+            return match self.rng.below(6) {
                 0 => Ty::Int,
                 1 => Ty::Bool,
                 2 => Ty::Str,
                 3 => Ty::List,
-                _ => Ty::Array,
+                4 => Ty::Array,
+                _ => Ty::Tuple,
             };
         }
-        match self.rng.below(6) {
+        match self.rng.below(7) {
             0 => Ty::Int,
             1 => Ty::Bool,
             2 => Ty::Float,
             3 => Ty::Str,
             4 => Ty::List,
-            _ => Ty::Array,
+            5 => Ty::Array,
+            _ => Ty::Tuple,
         }
     }
 
@@ -222,7 +235,7 @@ impl<'a> Gen<'a> {
         // Weighted toward leaves to keep programs small; `below` picks a rule.
         // Arrays are now supported by every backend, so the array consumers run
         // in both the full and wasm-subset generators.
-        match self.rng.below(11) {
+        match self.rng.below(12) {
             0 | 1 => self.leaf(Ty::Int),
             2 => {
                 let op = ["+", "-", "*"][self.rng.choice(3)];
@@ -256,6 +269,18 @@ impl<'a> Gen<'a> {
             // index-0 `get` never traps.
             8 => format!("array_len({})", self.expr(Ty::Array, fuel - 1)),
             9 => format!("array_get({}, 0)", self.expr(Ty::Array, fuel - 1)),
+            10 => {
+                // Destructure a tuple: `match <tuple> { (a, b) => <int> }`.
+                let scrut = self.expr(Ty::Tuple, fuel - 1);
+                let a = self.fresh_name();
+                let b = self.fresh_name();
+                self.scope.push((a.clone(), Ty::Int));
+                self.scope.push((b.clone(), Ty::Int));
+                let body = self.expr(Ty::Int, fuel - 1);
+                self.scope.pop();
+                self.scope.pop();
+                format!("match {} {{ ({}, {}) => {}, }}", scrut, a, b, body)
+            }
             _ => self.let_block(Ty::Int, fuel),
         }
     }
@@ -395,6 +420,24 @@ impl<'a> Gen<'a> {
                 self.expr(Ty::Array, fuel - 1)
             ),
             _ => self.let_block(Ty::Array, fuel),
+        }
+    }
+
+    /// Generate an `(Int, Int)` tuple expression: literal, branch, or binding.
+    fn gen_tuple(&mut self, fuel: u32) -> String {
+        match self.rng.below(5) {
+            0 | 1 | 2 => format!(
+                "({}, {})",
+                self.expr(Ty::Int, fuel - 1),
+                self.expr(Ty::Int, fuel - 1)
+            ),
+            3 => format!(
+                "if {} {{ {} }} else {{ {} }}",
+                self.expr(Ty::Bool, fuel - 1),
+                self.expr(Ty::Tuple, fuel - 1),
+                self.expr(Ty::Tuple, fuel - 1)
+            ),
+            _ => self.let_block(Ty::Tuple, fuel),
         }
     }
 }

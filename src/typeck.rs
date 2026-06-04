@@ -33,6 +33,12 @@ pub fn show(t: &Ty) -> String {
         Ty::Unit => "Unit".to_string(),
         Ty::Var(n) => n.clone(),
         Ty::Named(n, args) => {
+            // Synthetic tuple ADTs (`$TupleN`) print as `(A, B, ..)` — the surface
+            // syntax — never leaking the internal `$TupleN` name to the user.
+            if n.starts_with("$Tuple") && !args.is_empty() {
+                let inner: Vec<String> = args.iter().map(show).collect();
+                return format!("({})", inner.join(", "));
+            }
             if args.is_empty() {
                 n.clone()
             } else {
@@ -1302,12 +1308,22 @@ impl Checker {
                     .collect();
                 let owner = Ty::Named(sig.tyname.clone(), type_args);
                 self.unify(&owner, expected).map_err(|_| {
-                    format!(
-                        "constructor pattern `{}` (of type {}) matched against {}",
-                        name,
-                        sig.tyname,
-                        show(&self.resolve(expected))
-                    )
+                    // Tuple patterns are synthetic ctors; phrase the error in
+                    // tuple terms instead of leaking `$TupleN`.
+                    if name.starts_with("$Tuple") {
+                        format!(
+                            "a {}-element tuple pattern cannot match {}",
+                            subs.len(),
+                            show(&self.resolve(expected))
+                        )
+                    } else {
+                        format!(
+                            "constructor pattern `{}` (of type {}) matched against {}",
+                            name,
+                            sig.tyname,
+                            show(&self.resolve(expected))
+                        )
+                    }
                 })?;
                 if subs.len() != sig.fields.len() {
                     return Err(format!(
