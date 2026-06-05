@@ -2,6 +2,8 @@
 //!
 //! Usage:
 //!   aria run   <file.aria>          parse and execute `main`
+//!   aria check <file.aria>          type-check only (human-readable report)
+//!   aria check --json <file.aria>   type-check, emit structured JSON diagnostics
 //!   aria ast   <file.aria>          print the parsed AST (debugging)
 //!   aria pack  <in> <out>           compress any file (rANS entropy coder)
 //!   aria unpack <in> <out>          decompress an Aria-packed file
@@ -19,6 +21,7 @@ mod arith;
 mod ast;
 mod builtins;
 mod c_backend;
+mod diagnostics;
 mod gbnf;
 mod interp;
 mod ir;
@@ -502,12 +505,80 @@ fn run_demo(which: Option<&str>) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// `aria check --json <file.aria>`: run the lex -> parse -> typeck pipeline and
+/// emit a machine-parseable JSON array of diagnostics to STDOUT — one object per
+/// error, `[]` when clean. Exits 1 if there are any diagnostics, 0 if clean.
+///
+/// This is the structured feedback channel an LLM agent (and a future LSP)
+/// reads to self-correct. The human `aria check` path is untouched. The schema
+/// is documented in `docs/DIAGNOSTICS.md`.
+fn run_check_json(path: &str) -> ExitCode {
+    use diagnostics::{array_to_json, Diagnostic};
+
+    let diags: Vec<Diagnostic> = match std::fs::read_to_string(path) {
+        Err(e) => {
+            // A read failure is a single I/O diagnostic (not a compiler phase);
+            // report it as a `lex`-adjacent error so the array stays uniform.
+            vec![Diagnostic::error(
+                "lex",
+                format!("cannot read {}: {}", path, e),
+            )]
+        }
+        Ok(src) => {
+            // Lex (fail-fast: a lex error means there are no tokens to parse).
+            match lexer::lex(&prelude::wrap(&src)) {
+                Err(e) => vec![Diagnostic::error("lex", e)],
+                Ok(toks) => match parser::parse(toks) {
+                    // Parse (fail-fast: no AST to type-check).
+                    Err(e) => vec![Diagnostic::error("parse", e)],
+                    Ok(program) => typeck::check_structured(&program),
+                },
+            }
+        }
+    };
+
+    println!("{}", array_to_json(&diags));
+    if diags.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
 fn run_source(args: &[String]) -> ExitCode {
+    // Accept `--json` in any position (only meaningful for `aria check`); strip
+    // it out so the remaining positional args are the command + file path.
+    let json = args.iter().skip(2).any(|a| a == "--json");
+    let positional: Vec<String> = args
+        .iter()
+        .enumerate()
+        .filter(|(i, a)| *i < 2 || a.as_str() != "--json")
+        .map(|(_, a)| a.clone())
+        .collect();
+
+    let args = &positional;
+
     if args.len() < 3 {
-        eprintln!("usage: aria {} <file.aria>", args[1]);
+        if json {
+            eprintln!("usage: aria check --json <file.aria>");
+        } else {
+            eprintln!("usage: aria {} <file.aria>", args[1]);
+        }
         return ExitCode::from(2);
     }
     let path = &args[2];
+
+    // `--json` is only defined for `check`; reject it elsewhere so the contract
+    // stays narrow and stable.
+    if json && args[1] != "check" {
+        eprintln!("error: --json is only supported for `aria check`");
+        return ExitCode::from(2);
+    }
+
+    if json {
+        return run_check_json(path);
+    }
+
     let src = match std::fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) => {

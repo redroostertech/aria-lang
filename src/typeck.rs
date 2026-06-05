@@ -491,6 +491,54 @@ pub fn check(program: &Program) -> Result<(), Vec<String>> {
     }
 }
 
+/// Structured type/shape/purity/exhaustiveness checking for `aria check --json`.
+///
+/// Runs the SAME `check` pipeline that the human path uses (single source of
+/// truth — the string messages are identical), then lifts each message into a
+/// [`Diagnostic`], routing the sub-phases that historically share `check`'s
+/// `Vec<String>` (purity, exhaustiveness, tensor shape) into their own `phase`
+/// so consumers see a precise phase + a stable code. A clean program yields an
+/// empty vector.
+pub fn check_structured(program: &Program) -> Vec<crate::diagnostics::Diagnostic> {
+    match check(program) {
+        Ok(()) => Vec::new(),
+        Err(errors) => errors
+            .into_iter()
+            .map(|msg| {
+                let phase = phase_of_type_error(&msg);
+                crate::diagnostics::Diagnostic::error(phase, msg)
+            })
+            .collect(),
+    }
+}
+
+/// Route one message from `typeck::check`'s flat error list to the phase that
+/// actually produced it. Most are genuine `type` errors; a few sub-checks
+/// (exhaustiveness, purity, tensor shape) flow through the same list and get
+/// their own phase here so the structured output is precise.
+fn phase_of_type_error(m: &str) -> &'static str {
+    if m.contains("non-exhaustive match") {
+        "exhaustiveness"
+    } else if m.contains("is declared `pure` but performs IO") || m.starts_with("cannot prove `") {
+        "purity"
+    } else if is_shape_message(m) {
+        "shape"
+    } else {
+        "type"
+    }
+}
+
+/// Recognise a tensor-shape message (emitted by `shape::check_program`, which
+/// prefixes `function `NAME`: ` then a shape-specific body). Matched on the
+/// shape-vocabulary keywords those messages use, so it is robust to the
+/// function-name prefix.
+fn is_shape_message(m: &str) -> bool {
+    m.contains("matmul expects")
+        || m.contains("matmul inner dimensions")
+        || m.contains("transpose expects")
+        || m.contains("add requires identical shapes")
+}
+
 /// Infer and write back the concrete types of *unannotated* lambda parameters
 /// into the AST, so later passes (monomorphization, the compiled backends) see a
 /// type even for a bare `let f = \x -> ..` whose parameter type only the
@@ -2069,6 +2117,70 @@ mod tests {
         let toks = lexer::lex(src).expect("lex");
         let prog = parser::parse(toks).expect("parse");
         check(&prog)
+    }
+
+    fn structured_src(src: &str) -> Vec<crate::diagnostics::Diagnostic> {
+        let toks = lexer::lex(src).expect("lex");
+        let prog = parser::parse(toks).expect("parse");
+        check_structured(&prog)
+    }
+
+    #[test]
+    fn structured_clean_program_is_empty_array() {
+        let diags = structured_src("fn main() -> Int = 42");
+        assert!(diags.is_empty());
+        assert_eq!(crate::diagnostics::array_to_json(&diags), "[]");
+    }
+
+    #[test]
+    fn structured_routes_phases_and_codes() {
+        // Exhaustiveness.
+        let d = structured_src(
+            "type C = | R | G | B\nfn f(c: C) -> Int = match c { R => 0, G => 1 }\nfn main() -> Int = f(R)",
+        );
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].phase, "exhaustiveness");
+        assert_eq!(d[0].code, "E0203");
+        assert_eq!(d[0].function.as_deref(), Some("f"));
+
+        // Type mismatch.
+        let d = structured_src("fn wrong() -> Int = true\nfn main() -> Int = 0");
+        assert!(d.iter().any(|x| x.phase == "type"
+            && x.code == "E0201"
+            && x.function.as_deref() == Some("wrong")));
+
+        // Unknown variable.
+        let d = structured_src("fn main() -> Int = x");
+        assert_eq!(d[0].phase, "type");
+        assert_eq!(d[0].code, "E0200");
+
+        // Purity (higher-order witness).
+        let d = structured_src(
+            "pure fn run(f: (Int) -> Int, x: Int) -> Int = f(x)\nfn main() -> Int = run(\\y -> y, 3)",
+        );
+        assert_eq!(d[0].phase, "purity");
+        assert_eq!(d[0].code, "E0210");
+        assert_eq!(d[0].function.as_deref(), Some("run"));
+
+        // Tensor shape mismatch.
+        let d = structured_src(
+            "fn main() -> Tensor = matmul(tensor_zeros(2,3), tensor_zeros(4,5))",
+        );
+        assert_eq!(d[0].phase, "shape");
+        assert_eq!(d[0].code, "E0300");
+    }
+
+    #[test]
+    fn structured_array_is_valid_json_shape() {
+        let d = structured_src(
+            "fn wrong() -> Int = true\nfn bad(n: Int) -> Bool = n == \"five\"\nfn main() -> Int = 0",
+        );
+        let json = crate::diagnostics::array_to_json(&d);
+        // Two diagnostics, comma-separated, no trailing comma, balanced brackets.
+        assert!(json.starts_with("[{") && json.ends_with("}]"));
+        assert!(json.contains("},{"));
+        assert!(json.contains("\"code\":\"E0201\""));
+        assert!(json.contains("\"phase\":\"type\""));
     }
 
     #[test]

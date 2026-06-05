@@ -179,6 +179,7 @@ byte count); `neural_bits_per_byte` (context-mixing predictor).
 |---|---|---|
 | `aria run <f>` | Typecheck + tree-walk interpret | `aria run examples/intro.aria` |
 | `aria check <f>` | Typecheck only (~instant) | `aria check examples/hof.aria` |
+| `aria check --json <f>` | Typecheck, emit machine-readable JSON diagnostics ([schema](DIAGNOSTICS.md)) | `aria check --json examples/broken.aria` |
 | `aria ast <f>` | Dump parsed AST | `aria ast prog.aria` |
 | `aria mem <f>` | Lower to IR + RC, run, print alloc/reuse + garbage-free | `aria mem examples/mem_bench.aria` |
 | `aria native <f> <out>` | Transpile to C, build native exe via `cc -O2` | `aria native prog.aria prog.bin` |
