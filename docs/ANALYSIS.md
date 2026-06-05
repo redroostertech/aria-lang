@@ -26,15 +26,16 @@ did it fail at runtime?"*. An LLM authoring loop that gets
 
 ```
 runtime error: division by zero
-  at `inner` (line 12)
-  at `middle` (line 8)
+  at `inner` (line 12:5)
+  at `middle` (line 8:3)
   at `main` (line 3)
 ```
 
-knows exactly which function (and definition line) trapped and the chain that
-reached it — a far stronger fix signal than the bare message. The agent loop
-(`aria agent`) feeds this trace back to the model on a clean-checking but
-runtime-failing program, closing the loop **write -> check -> RUN -> fix**.
+knows exactly which function trapped, **the precise call site** (`line:col`)
+that reached it, and the chain back to `main` — a far stronger fix signal than
+the bare message. The agent loop (`aria agent`) feeds this trace back to the
+model on a clean-checking but runtime-failing program, closing the loop
+**write -> check -> RUN -> fix**.
 
 ### Format
 
@@ -42,17 +43,22 @@ runtime-failing program, closing the loop **write -> check -> RUN -> fix**.
 
 ```
 runtime error: <message>
-  at `<function>` (line <N>)
-  at `<function>` (line <N>)
+  at `<function>` (line <L>:<C>)
+  at `<function>` (line <L>:<C>)
   ...
 ```
 
 - **Most-recent call first**: the function that trapped is the first `at` line;
   `main` is last.
-- The line is the function's **definition line** (the `fn` keyword), 1-based.
-- A compiler-generated function (a trait dispatcher, or an applied closure /
-  lambda that has no single source line) prints `(generated)` instead of a line
-  number.
+- The location is the **precise CALL SITE** — the `line:col` of the call
+  expression that entered this function (e.g. `inner` shows where `inner(..)`
+  was written in the caller's body), 1-based. This points at the **exact call**,
+  not merely the callee's definition line.
+- When the call site is unknown — the synthetic entry into `main`, or a
+  compiler-synthesized call with no source span — the frame falls back to the
+  function's **definition line** (`line <N>`, no column).
+- A compiler-generated callee with neither a call site nor a definition line (a
+  trait dispatcher, or an applied closure / lambda) prints `(generated)`.
 - **Consecutive identical frames are collapsed.** A non-tail self-recursive
   function that recurses deeply and then traps yields **one** frame for that
   function, not one per recursive call — so a 100k-deep recursion error does not
@@ -66,7 +72,12 @@ The interpreter exposes a structured runtime error so tools (the agent loop,
 diagnostics, an LSP) can consume the frames directly rather than parse text:
 
 ```rust
-pub struct Frame { pub function: String, pub line: usize }   // line 0 => generated
+pub struct Frame {
+    pub function: String,
+    pub def_line: usize,   // callee's definition line; 0 => generated callee
+    pub call_line: usize,  // precise CALL-SITE line; 0 => call site unknown
+    pub call_col: usize,   // precise CALL-SITE column (when call_line != 0)
+}
 pub struct RuntimeError { pub message: String, pub frames: Vec<Frame> }
 //                         frames are MOST-RECENT call first
 ```
@@ -89,11 +100,13 @@ are unchanged for callers that don't want a trace.
   backends keep their existing bare trap messages; they do **not** emit a stack
   trace in v1. The interpreter is the oracle and what the agent loop runs, so
   that is where the trace lives.
-- **Frame lines are FUNCTION-DEFINITION lines in v1.** Exact **call-site** line
-  precision (the line of the specific call that failed) is the planned next step
-  — the same precise-span work that will upgrade the LSP and structured
-  diagnostics. It requires threading source spans onto `Expr::Call`, which is an
-  explicit follow-on and intentionally **not** done here.
+- **Frame lines are PRECISE CALL SITES.** Every AST expression carries a source
+  span (1-based start/end line+column), and a frame records the span of the
+  `Call`/`Apply` expression at the call site — so the trace points at the exact
+  `callee(..)` that failed, not the callee's definition line. The same
+  precise-span foundation powers the LSP's exact ranges and the structured
+  diagnostics' `line`+`col`. (`main`, the synthetic entry, has no call site and
+  falls back to its definition line.)
 
 ---
 
@@ -130,7 +143,8 @@ so it is always valid — pipe it through `python3 -m json.tool` to confirm.
       "callers":     ["a"],
       "recursive":   false,
       "fan_in":      1,
-      "fan_out":     1
+      "fan_out":     1,
+      "call_sites":  {"c": [[2, 27]], "array_get": [[2, 35]]}
     }
   ],
   "unused":      ["dead"],
@@ -153,6 +167,7 @@ so it is always valid — pipe it through `python3 -m json.tool` to confirm.
 | `functions[].recursive` | `true` iff the function calls itself directly. |
 | `functions[].fan_in` | `callers.len()` — how many functions depend on this one. |
 | `functions[].fan_out` | `callees.len()` — how many user functions this one depends on. |
+| `functions[].call_sites` | **Precise call-site locations** of every edge out of this function: an object keyed by callee NAME (user, library, or builtin), each value the sorted, de-duplicated list of `[line, col]` positions where that callee is called in this function's body. A source-located call graph — jump to the exact `callee(..)`, not just the fact that the edge exists. Bare local-variable references are NOT calls and never appear here. Synthesized calls (no source span) contribute no site; a function with no located calls reports `{}`. |
 | `unused` | User functions with **no callers** and not `main` — dead code. |
 | `unreachable` | User functions **not statically reachable** from `main` (transitive closure over user-to-user edges). Empty if there is no `main`. A function can be unreachable without being directly `unused` (e.g. only called by an unused function). |
 | `cycles` | Recursive groups: strongly-connected components of size > 1 (mutual recursion), plus self-recursive singletons. Each inner array is one cycle (sorted); the outer list is sorted for stable, diffable output. Computed with Tarjan's SCC algorithm (iterative, no external deps). |

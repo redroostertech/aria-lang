@@ -10,8 +10,9 @@
 ## What it supports (v1)
 
 - **Diagnostics only.** On open / change / save the server type-checks the
-  in-memory document and publishes diagnostics. No hover, completion, or
-  go-to-definition yet (those need precise spans — see *Limitations*).
+  in-memory document and publishes diagnostics — with **precise ranges** for
+  expression-level errors (see *Diagnostic → LSP mapping*). No hover,
+  completion, or go-to-definition yet.
 - **Full document sync** (`textDocumentSync = 1`): each change sends the whole
   new document, which the server re-checks.
 - **Transport:** standard LSP over **stdio** — every message is framed as
@@ -45,12 +46,17 @@ Each Aria [`Diagnostic`](DIAGNOSTICS.md#schema) maps to one LSP `Diagnostic`:
 
 | LSP field   | value                                                                                  |
 |-------------|----------------------------------------------------------------------------------------|
-| `range`     | a **whole-line** range: `start = {line: L0, character: 0}`, `end = {line: L0, character: 1000000}`. |
+| `range`     | a **precise range** when the diagnostic carries a span (both `line` **and** `col`): `start = {line: L-1, character: C-1}`, `end = {line: endL-1, character: endC-1}` (LSP is 0-based; the end uses the diagnostic's `end_line`/`end_col`, else one character past the start). Otherwise (line only, e.g. a lex/parse error, or no location) it falls back to a **whole-line** range: `start = {line: L0, character: 0}`, `end = {line: L0, character: 1000000}`. |
 | `L0`        | `diagnostic.line - 1` (LSP lines are 0-based), clamped `>= 0` and `<= last document line`. A `null` line maps to line 0. |
 | `severity`  | `1` (Error).                                                                           |
 | `source`    | `"aria"`.                                                                              |
 | `code`      | the stable Aria code (e.g. `"E0201"`) — see the code table in [DIAGNOSTICS.md](DIAGNOSTICS.md#code-table). |
 | `message`   | the human-readable message (identical to `aria check`).                                |
+
+A type error mid-expression now highlights the **exact sub-expression**. For
+`fn f() -> Int = 1 + true`, the published range is
+`{start:{line:0,character:16}, end:{line:0,character:24}}` — the `1 + true`
+operand — not the whole line.
 
 When the program is **clean**, the server publishes an **empty** `diagnostics`
 array, so the editor clears old squiggles.
@@ -126,13 +132,13 @@ vim.api.nvim_create_autocmd("FileType", {
 
 - **Diagnostics only.** No hover, completion, signature help, or
   go-to-definition yet.
-- **Whole-line ranges.** The compiler currently tracks **line, not column**, for
-  most errors (lex/parse carry a line; semantic errors carry the enclosing
-  function but no span), so diagnostics highlight the whole line. This ties
-  directly into the future **precise-spans** work noted in
-  [DIAGNOSTICS.md](DIAGNOSTICS.md#location-precision-what-is-populated-today):
-  once spans are threaded through the AST, the LSP `range` can narrow to the
-  exact token, and hover/go-to-def become tractable.
+- **Precise ranges for expression-level errors.** The compiler now tracks
+  **line and column** for every token, and threads a precise source span onto
+  every AST expression, so the type/shape checker locates the offending
+  sub-expression exactly. Expression-level diagnostics publish an **exact
+  range** (the precise span); lex/parse errors (which know only a line) and
+  declaration-level/unlocatable errors fall back to a **whole-line** range. The
+  same span foundation makes hover / go-to-definition tractable as a follow-on.
 - **Full sync only** (`textDocumentSync = 1`); no incremental updates. Documents
   are small, so re-checking the whole text on each change is cheap.
 - No workspace/multi-file awareness — each document is checked on its own (with

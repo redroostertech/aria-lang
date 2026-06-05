@@ -1033,10 +1033,12 @@ fn main() -> Int = outer(5)
         assert!(err.message.contains("division by zero"), "msg: {}", err.message);
         let names: Vec<&str> = err.frames.iter().map(|f| f.function.as_str()).collect();
         assert_eq!(names, vec!["inner", "outer", "main"], "most-recent first");
-        // The rendered form embeds the trace the model will see.
+        // The rendered form embeds the trace the model will see. Frames now carry
+        // the precise CALL SITE (`line:col`): `inner` is called at line 2 col 27
+        // (inside `outer`); `main` is the synthetic entry, shown by its def line.
         let rendered = err.render();
-        assert!(rendered.contains("at `inner` (line 1)"));
-        assert!(rendered.contains("at `main` (line 3)"));
+        assert!(rendered.contains("at `inner` (line 2:27)"), "got:\n{}", rendered);
+        assert!(rendered.contains("at `main` (line 3)"), "got:\n{}", rendered);
     }
 
     #[test]

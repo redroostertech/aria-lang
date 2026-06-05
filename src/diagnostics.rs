@@ -28,10 +28,17 @@ pub struct Diagnostic {
     pub message: String,
     /// 1-based source line, if known; else `None`.
     pub line: Option<usize>,
-    /// 1-based column, if known; else `None`. Currently always `None`
-    /// (the lexer/parser track line but not column) — reserved for precise
-    /// spans.
+    /// 1-based column, if known; else `None`. Populated (together with `line`)
+    /// for expression-level type/shape errors from the precise source span of
+    /// the offending sub-expression; `None` for declaration-level errors and
+    /// errors the checker cannot locate to a single expression.
     pub col: Option<usize>,
+    /// 1-based END line of the offending expression's span (one past its last
+    /// character in column terms), if a precise span is known; else `None`.
+    pub end_line: Option<usize>,
+    /// 1-based END column of the offending expression's span, if known; else
+    /// `None`. With `line`/`col` this gives consumers (the LSP) an exact range.
+    pub end_col: Option<usize>,
     /// Enclosing function name, if known; else `None`.
     pub function: Option<String>,
 }
@@ -56,8 +63,25 @@ impl Diagnostic {
             message,
             line,
             col: None,
+            end_line: None,
+            end_col: None,
             function,
         }
+    }
+
+    /// Overwrite this diagnostic's location with a precise source span (1-based
+    /// start and end line/column), as recorded by the type/shape checker for the
+    /// offending sub-expression. Supersedes any line extracted from the message
+    /// text and fills in the column + end position the LSP renders as an exact
+    /// range. A [`crate::ast::Span::none`] span is ignored (its `start_line` is 0).
+    pub fn set_span(&mut self, span: crate::ast::Span) {
+        if span.is_none() {
+            return;
+        }
+        self.line = Some(span.start_line as usize);
+        self.col = Some(span.start_col as usize);
+        self.end_line = Some(span.end_line as usize);
+        self.end_col = Some(span.end_col as usize);
     }
 
     /// Serialize this single diagnostic as a JSON object.
@@ -70,6 +94,8 @@ impl Diagnostic {
         s.push_str(&format!("\"message\":\"{}\",", json_escape(&self.message)));
         s.push_str(&format!("\"line\":{},", json_num_or_null(self.line)));
         s.push_str(&format!("\"col\":{},", json_num_or_null(self.col)));
+        s.push_str(&format!("\"end_line\":{},", json_num_or_null(self.end_line)));
+        s.push_str(&format!("\"end_col\":{},", json_num_or_null(self.end_col)));
         match &self.function {
             Some(f) => s.push_str(&format!("\"function\":\"{}\"", json_escape(f))),
             None => s.push_str("\"function\":null"),

@@ -239,14 +239,23 @@ thread_local! {
     static CALL_STACK: std::cell::RefCell<Option<Vec<Frame>>> = const { std::cell::RefCell::new(None) };
 }
 
-/// One entry in a runtime stack trace: the called function's name and the
-/// 1-based source line of its DEFINITION (the `fn` keyword). In v1 frame lines
-/// are FUNCTION-DEFINITION lines, not exact call-SITE lines; precise call-site
-/// spans are the planned next step (see docs/ANALYSIS.md).
+/// One entry in a runtime stack trace: the called function's name plus the
+/// precise CALL-SITE location (the `(line, col)` of the call expression that
+/// entered this function). `call_line == 0` means the call site is unknown (a
+/// compiler-synthesized call with no source span, or the synthetic entry into
+/// `main`), in which case rendering falls back to the function's DEFINITION
+/// line `def_line`. `def_line == 0` marks a compiler-generated callee (a trait
+/// dispatcher / lowered impl method / closure value) that has no single source
+/// definition line.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Frame {
     pub function: String,
-    pub line: usize,
+    /// 1-based DEFINITION line of the callee (`fn` keyword); 0 = generated.
+    pub def_line: usize,
+    /// 1-based CALL-SITE line (where this function was called); 0 = unknown.
+    pub call_line: usize,
+    /// 1-based CALL-SITE column; meaningful only when `call_line != 0`.
+    pub call_col: usize,
 }
 
 /// A structured runtime error: the trap message plus the call stack at the point
@@ -264,21 +273,29 @@ pub struct RuntimeError {
 }
 
 impl RuntimeError {
-    /// Render the error followed by an indented, most-recent-first stack trace,
-    /// e.g.
+    /// Render the error followed by an indented, most-recent-first stack trace.
+    /// Each frame reports the PRECISE CALL SITE (`line:col`) where that function
+    /// was called, e.g.
     ///   runtime error: division by zero
-    ///     at `inner` (line 12)
-    ///     at `middle` (line 8)
+    ///     at `inner` (line 12:5)
+    ///     at `middle` (line 8:3)
     ///     at `main` (line 3)
-    /// Frames with line 0 (compiler-generated functions: trait dispatchers,
-    /// lowered impl methods) print `(generated)` instead of a line number.
+    /// When the call site is unknown (the synthetic entry into `main`, or a
+    /// synthesized call with no source span) the frame falls back to the
+    /// function's DEFINITION line (`line N`). A compiler-generated callee with
+    /// neither a call site nor a definition line prints `(generated)`.
     pub fn render(&self) -> String {
         let mut s = format!("runtime error: {}", self.message);
         for f in &self.frames {
-            if f.line == 0 {
-                s.push_str(&format!("\n  at `{}` (generated)", f.function));
+            if f.call_line != 0 {
+                s.push_str(&format!(
+                    "\n  at `{}` (line {}:{})",
+                    f.function, f.call_line, f.call_col
+                ));
+            } else if f.def_line != 0 {
+                s.push_str(&format!("\n  at `{}` (line {})", f.function, f.def_line));
             } else {
-                s.push_str(&format!("\n  at `{}` (line {})", f.function, f.line));
+                s.push_str(&format!("\n  at `{}` (generated)", f.function));
             }
         }
         s
@@ -313,11 +330,25 @@ fn with_call_stack<T>(f: impl FnOnce() -> Result<T, String>) -> Result<T, Runtim
 }
 
 /// Push a user-function frame onto the active call stack (no-op when tracking is
-/// off). Called on entry to a user function in the interpreter.
-fn push_frame(function: &str, line: usize) {
+/// off). Called on entry to a user function in the interpreter. `def_line` is the
+/// callee's definition line (0 = generated); `call_span` is the span of the call
+/// EXPRESSION at the call site (its start `(line, col)` is recorded; a
+/// `Span::none` call span leaves the call site unknown, falling back to the
+/// definition line when rendered).
+fn push_frame(function: &str, def_line: usize, call_span: crate::ast::Span) {
     CALL_STACK.with(|c| {
         if let Some(stack) = c.borrow_mut().as_mut() {
-            stack.push(Frame { function: function.to_string(), line });
+            let (call_line, call_col) = if call_span.is_none() {
+                (0, 0)
+            } else {
+                (call_span.start_line as usize, call_span.start_col as usize)
+            };
+            stack.push(Frame {
+                function: function.to_string(),
+                def_line,
+                call_line,
+                call_col,
+            });
         }
     });
 }
@@ -546,9 +577,11 @@ impl Interp {
             return Err("`main` must take no parameters".to_string());
         }
         // Push the `main` frame so a trace bottoms out at `main` (run_main is the
-        // entry point and does not go through the `Expr::Call` push path). No-op
-        // when stack tracking is off.
-        push_frame("main", main.line);
+        // entry point and does not go through the `ExprKind::Call` push path).
+        // `main` has no call SITE (it is the synthetic entry), so its frame uses
+        // a none call span and renders with its definition line. No-op when stack
+        // tracking is off.
+        push_frame("main", main.line, crate::ast::Span::none());
         let mut scope: Scope = vec![HashMap::new()];
         let result = self.eval_fn_body("main", &main.body, &mut scope);
         if result.is_ok() {
@@ -606,14 +639,14 @@ impl Interp {
     }
 
     fn eval(&self, e: &Expr, scope: &mut Scope) -> Result<Value, String> {
-        match e {
-            Expr::Int(n) => Ok(Value::Int(*n)),
-            Expr::Float(f) => Ok(Value::Float(*f)),
-            Expr::Bool(b) => Ok(Value::Bool(*b)),
-            Expr::Str(s) => Ok(Value::Str(s.clone())),
-            Expr::Unit => Ok(Value::Unit),
+        match &e.kind {
+            ExprKind::Int(n) => Ok(Value::Int(*n)),
+            ExprKind::Float(f) => Ok(Value::Float(*f)),
+            ExprKind::Bool(b) => Ok(Value::Bool(*b)),
+            ExprKind::Str(s) => Ok(Value::Str(s.clone())),
+            ExprKind::Unit => Ok(Value::Unit),
 
-            Expr::Var(name) => {
+            ExprKind::Var(name) => {
                 if let Some(v) = Interp::lookup(scope, name) {
                     Ok(v.clone())
                 } else if let Some(c) = self.fn_as_closure(name) {
@@ -624,7 +657,7 @@ impl Interp {
                 }
             }
 
-            Expr::Ctor(name, args) => {
+            ExprKind::Ctor(name, args) => {
                 let arity = self
                     .ctors
                     .get(name)
@@ -647,7 +680,7 @@ impl Interp {
                 })
             }
 
-            Expr::Record(name, fields) => {
+            ExprKind::Record(name, fields) => {
                 let decl = self
                     .record_fields
                     .get(name)
@@ -673,7 +706,7 @@ impl Interp {
                 Ok(Value::Data { ctor: name.clone(), fields: vals })
             }
 
-            Expr::Field(obj, field) => {
+            ExprKind::Field(obj, field) => {
                 let v = self.eval(obj, scope)?;
                 match v {
                     Value::Data { ctor, fields } => {
@@ -695,7 +728,7 @@ impl Interp {
                 }
             }
 
-            Expr::Update(base, updates) => {
+            ExprKind::Update(base, updates) => {
                 let v = self.eval(base, scope)?;
                 match v {
                     Value::Data { ctor, mut fields } => {
@@ -720,7 +753,7 @@ impl Interp {
                 }
             }
 
-            Expr::Call(name, args) => {
+            ExprKind::Call(name, args) => {
                 let mut vals = Vec::with_capacity(args.len());
                 for a in args {
                     vals.push(self.eval(a, scope)?);
@@ -729,7 +762,7 @@ impl Interp {
                 // parameter) is applied as a closure value.
                 if let Some(v) = Interp::lookup(scope, name) {
                     let callee = v.clone();
-                    return self.apply_value(callee, vals, name);
+                    return self.apply_value(callee, vals, name, e.span);
                 }
                 // `grad` is the reverse-mode autodiff builtin. It must invoke the
                 // closure argument (`apply_value`), so it lives on `Interp`
@@ -759,8 +792,10 @@ impl Interp {
                 }
                 let mut call_scope: Scope = vec![frame];
                 // Push this function's frame BEFORE the depth check so a
-                // recursion-limit error's trace includes the function that hit it.
-                push_frame(name, fn_line);
+                // recursion-limit error's trace includes the function that hit
+                // it. The call SITE is this `Call` expression's span, so the
+                // trace points at the exact `name(..)` in the caller's body.
+                push_frame(name, fn_line, e.span);
                 let d = self.depth.get() + 1;
                 if d > MAX_CALL_DEPTH {
                     // Leave the frame on the stack (error path) for the trace.
@@ -783,7 +818,7 @@ impl Interp {
                 result
             }
 
-            Expr::Unary(op, inner) => {
+            ExprKind::Unary(op, inner) => {
                 let v = self.eval(inner, scope)?;
                 match (op, v) {
                     (UnOp::Neg, Value::Int(n)) => Ok(Value::Int(
@@ -800,15 +835,15 @@ impl Interp {
                 }
             }
 
-            Expr::Binary(op, lhs, rhs) => self.eval_binary(*op, lhs, rhs, scope),
+            ExprKind::Binary(op, lhs, rhs) => self.eval_binary(*op, lhs, rhs, scope),
 
-            Expr::If(cond, then, els) => match self.eval(cond, scope)? {
+            ExprKind::If(cond, then, els) => match self.eval(cond, scope)? {
                 Value::Bool(true) => self.eval(then, scope),
                 Value::Bool(false) => self.eval(els, scope),
                 other => Err(format!("`if` condition must be Bool, got {}", other.display())),
             },
 
-            Expr::Match(scrut, arms) => {
+            ExprKind::Match(scrut, arms) => {
                 let v = self.eval(scrut, scope)?;
                 for arm in arms {
                     let mut binds = HashMap::new();
@@ -822,7 +857,7 @@ impl Interp {
                 Err(format!("no match arm for value {}", v.display()))
             }
 
-            Expr::Lambda(params, body, _) => {
+            ExprKind::Lambda(params, body, _) => {
                 // Capture the current environment by flattening all in-scope
                 // frames (inner shadowing outer) into the closure's env.
                 let mut env = HashMap::new();
@@ -838,16 +873,16 @@ impl Interp {
                 })))
             }
 
-            Expr::Apply(callee, args, _) => {
+            ExprKind::Apply(callee, args, _) => {
                 let f = self.eval(callee, scope)?;
                 let mut vals = Vec::with_capacity(args.len());
                 for a in args {
                     vals.push(self.eval(a, scope)?);
                 }
-                self.apply_value(f, vals, "value")
+                self.apply_value(f, vals, "value", e.span)
             }
 
-            Expr::Block(stmts, last) => {
+            ExprKind::Block(stmts, last) => {
                 scope.push(HashMap::new());
                 let mut run = || -> Result<Value, String> {
                     for s in stmts {
@@ -913,8 +948,8 @@ impl Interp {
         e: &Expr,
         scope: &mut Scope,
     ) -> Result<TailOutcome, String> {
-        match e {
-            Expr::Call(name, args) => {
+        match &e.kind {
+            ExprKind::Call(name, args) => {
                 // A direct self-call (not shadowed by a local of the same name,
                 // not a builtin) with matching arity is a self-tail-call.
                 let shadowed = Interp::lookup(scope, name).is_some();
@@ -935,12 +970,12 @@ impl Interp {
                     self.eval(e, scope).map(TailOutcome::Value)
                 }
             }
-            Expr::If(cond, then, els) => match self.eval(cond, scope)? {
+            ExprKind::If(cond, then, els) => match self.eval(cond, scope)? {
                 Value::Bool(true) => self.eval_tail(self_name, then, scope),
                 Value::Bool(false) => self.eval_tail(self_name, els, scope),
                 other => Err(format!("`if` condition must be Bool, got {}", other.display())),
             },
-            Expr::Match(scrut, arms) => {
+            ExprKind::Match(scrut, arms) => {
                 let v = self.eval(scrut, scope)?;
                 for arm in arms {
                     let mut binds = HashMap::new();
@@ -953,7 +988,7 @@ impl Interp {
                 }
                 Err(format!("no match arm for value {}", v.display()))
             }
-            Expr::Block(stmts, last) => {
+            ExprKind::Block(stmts, last) => {
                 scope.push(HashMap::new());
                 let run = |me: &Self, scope: &mut Scope| -> Result<TailOutcome, String> {
                     for s in stmts {
@@ -996,7 +1031,13 @@ impl Interp {
     /// Apply a function VALUE (a closure) to already-evaluated arguments. Binds
     /// the parameters in the closure's captured environment and evaluates the
     /// body, honoring the recursion-depth guard.
-    fn apply_value(&self, callee: Value, args: Vec<Value>, what: &str) -> Result<Value, String> {
+    fn apply_value(
+        &self,
+        callee: Value,
+        args: Vec<Value>,
+        what: &str,
+        call_span: crate::ast::Span,
+    ) -> Result<Value, String> {
         let data = match callee {
             Value::Closure(c) => c,
             other => {
@@ -1020,9 +1061,9 @@ impl Interp {
         }
         let mut call_scope: Scope = vec![frame];
         // A closure has no single source definition line (it may be an anonymous
-        // lambda or a top-level function used as a value), so its trace frame
-        // carries line 0 and prints as `(generated)`.
-        push_frame(what, 0);
+        // lambda or a top-level function used as a value), so its frame carries
+        // def_line 0; the CALL SITE span still locates where it was applied.
+        push_frame(what, 0, call_span);
         let d = self.depth.get() + 1;
         if d > MAX_CALL_DEPTH {
             return Err(format!(
@@ -1075,7 +1116,8 @@ impl Interp {
 
         // Evaluate f(tracing_x). On ANY error, tear down the tape before
         // propagating so a later normal evaluation never sees a stale tape.
-        let result = self.apply_value(callee, vec![tracing_x], "grad function `f`");
+        let result =
+            self.apply_value(callee, vec![tracing_x], "grad function `f`", crate::ast::Span::none());
 
         let grad_or_err = result.and_then(|out| match out {
             // The scalar output must be a single tracing node. A bare constant
@@ -2114,7 +2156,8 @@ mod tests {
     #[test]
     fn stack_trace_three_frames_div_by_zero() {
         // main -> outer -> inner, where inner divides by zero. The trace is
-        // most-recent first with each function's DEFINITION line.
+        // most-recent first; each frame now reports the PRECISE CALL SITE
+        // (`line:col`) where the function was called, not its definition line.
         let src = "\
 fn inner(x: Int) -> Int = 1 / 0
 fn outer(x: Int) -> Int = inner(x)
@@ -2125,17 +2168,20 @@ fn main() -> Int = outer(5)
         assert_eq!(
             err.frames,
             vec![
-                Frame { function: "inner".into(), line: 1 },
-                Frame { function: "outer".into(), line: 2 },
-                Frame { function: "main".into(), line: 3 },
+                // `inner` was called at line 2 col 27 (`inner(x)` in `outer`).
+                Frame { function: "inner".into(), def_line: 1, call_line: 2, call_col: 27 },
+                // `outer` was called at line 3 col 20 (`outer(5)` in `main`).
+                Frame { function: "outer".into(), def_line: 2, call_line: 3, call_col: 20 },
+                // `main` is the synthetic entry: no call site, falls back to def line 3.
+                Frame { function: "main".into(), def_line: 3, call_line: 0, call_col: 0 },
             ]
         );
-        // Rendered form.
+        // Rendered form: call sites as `line:col`, `main` as its definition line.
         let r = err.render();
         assert!(r.starts_with("runtime error: division by zero"));
-        assert!(r.contains("\n  at `inner` (line 1)"));
-        assert!(r.contains("\n  at `outer` (line 2)"));
-        assert!(r.contains("\n  at `main` (line 3)"));
+        assert!(r.contains("\n  at `inner` (line 2:27)"), "got:\n{}", r);
+        assert!(r.contains("\n  at `outer` (line 3:20)"), "got:\n{}", r);
+        assert!(r.contains("\n  at `main` (line 3)"), "got:\n{}", r);
     }
 
     #[test]
@@ -2161,9 +2207,13 @@ fn main() -> Int = get_it(5)
     #[test]
     fn stack_trace_collapses_nontail_self_recursion() {
         // A non-tail self-recursive function that traps must NOT produce one frame
-        // per recursive call: consecutive identical frames collapse to one.
+        // per recursive call: consecutive frames with the SAME call site collapse.
         // `boom` recurses in a non-tail position (the `+ 1` makes it non-tail),
-        // bottoming out by dividing by zero at n == 0.
+        // bottoming out by dividing by zero at n == 0. The 20 recursive calls all
+        // share the call site `boom(n - 1)` (line 1) so they collapse to ONE
+        // frame; the OUTERMOST `boom` was called from `main` (line 2) — a distinct
+        // call site — so it is reported separately. This is strictly MORE precise
+        // than the old definition-line trace (which merged all `boom`s).
         let src = "\
 fn boom(n: Int) -> Int = if n == 0 { 1 / 0 } else { boom(n - 1) + 1 }
 fn main() -> Int = boom(20)
@@ -2171,8 +2221,12 @@ fn main() -> Int = boom(20)
         let err = run_traced_err(src);
         assert_eq!(err.message, "division by zero");
         let names: Vec<&str> = err.frames.iter().map(|f| f.function.as_str()).collect();
-        // Collapsed: a single `boom` frame, then `main` — not 21 `boom` frames.
-        assert_eq!(names, vec!["boom", "main"]);
+        // The recursive boom calls (call site line 1) collapse to one; the entry
+        // boom (call site line 2, from `main`) stays distinct. Not 21 frames.
+        assert_eq!(names, vec!["boom", "boom", "main"]);
+        // The two boom frames carry their two distinct call sites.
+        assert_eq!(err.frames[0].call_line, 1, "inner recursion call site");
+        assert_eq!(err.frames[1].call_line, 2, "entry call from main");
     }
 
     #[test]

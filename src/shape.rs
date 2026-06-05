@@ -158,7 +158,7 @@ pub fn infer(e: &TExpr) -> Result<Shape, ShapeError> {
 // `.aria` programs that catches tensor dimension mismatches before runtime.
 // ===========================================================================
 
-use crate::ast::{Expr, Item, Pattern, Program, Stmt};
+use crate::ast::{Expr, ExprKind, Item, Pattern, Program, Stmt};
 use std::collections::HashMap;
 
 /// A statically-known tensor shape, or `None` when it cannot be determined.
@@ -206,16 +206,16 @@ impl ShapeCtx<'_> {
     /// with a determinable shape. `env` is read-only; child scopes clone it so an
     /// inner `let`/pattern binding cannot leak a shape into an outer scope.
     fn visit(&mut self, e: &Expr, env: &HashMap<String, MaybeShape>) -> MaybeShape {
-        match e {
-            Expr::Var(v) => env.get(v).cloned().flatten(),
-            Expr::Call(name, args) => self.visit_call(name, args, env),
-            Expr::Ctor(_, args) => {
+        match &e.kind {
+            ExprKind::Var(v) => env.get(v).cloned().flatten(),
+            ExprKind::Call(name, args) => self.visit_call(name, args, env),
+            ExprKind::Ctor(_, args) => {
                 for a in args {
                     self.visit(a, env);
                 }
                 None
             }
-            Expr::Lambda(params, body, _) => {
+            ExprKind::Lambda(params, body, _) => {
                 let mut child = env.clone();
                 for (pn, _) in params {
                     child.insert(pn.clone(), None);
@@ -223,40 +223,40 @@ impl ShapeCtx<'_> {
                 self.visit(body, &child);
                 None
             }
-            Expr::Apply(f, args, _) => {
+            ExprKind::Apply(f, args, _) => {
                 self.visit(f, env);
                 for a in args {
                     self.visit(a, env);
                 }
                 None
             }
-            Expr::Record(_, fields) => {
+            ExprKind::Record(_, fields) => {
                 for (_, ex) in fields {
                     self.visit(ex, env);
                 }
                 None
             }
-            Expr::Field(o, _) => {
+            ExprKind::Field(o, _) => {
                 self.visit(o, env);
                 None
             }
-            Expr::Update(o, fields) => {
+            ExprKind::Update(o, fields) => {
                 self.visit(o, env);
                 for (_, ex) in fields {
                     self.visit(ex, env);
                 }
                 None
             }
-            Expr::Unary(_, a) => {
+            ExprKind::Unary(_, a) => {
                 self.visit(a, env);
                 None
             }
-            Expr::Binary(_, a, b) => {
+            ExprKind::Binary(_, a, b) => {
                 self.visit(a, env);
                 self.visit(b, env);
                 None
             }
-            Expr::If(c, t, f) => {
+            ExprKind::If(c, t, f) => {
                 self.visit(c, env);
                 let st = self.visit(t, env);
                 let sf = self.visit(f, env);
@@ -266,7 +266,7 @@ impl ShapeCtx<'_> {
                     _ => None,
                 }
             }
-            Expr::Match(scrut, arms) => {
+            ExprKind::Match(scrut, arms) => {
                 self.visit(scrut, env);
                 let mut joined: MaybeShape = None;
                 let mut agree = true;
@@ -290,7 +290,7 @@ impl ShapeCtx<'_> {
                     None
                 }
             }
-            Expr::Block(stmts, result) => {
+            ExprKind::Block(stmts, result) => {
                 let mut child = env.clone();
                 for s in stmts {
                     match s {
@@ -306,7 +306,7 @@ impl ShapeCtx<'_> {
                 self.visit(result, &child)
             }
             // Literals carry no tensor shape.
-            Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Unit => None,
+            ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Str(_) | ExprKind::Unit => None,
         }
     }
 
@@ -366,8 +366,8 @@ fn input_of(s: &Shape) -> TExpr {
 
 /// A non-negative integer literal as a dimension extent, if `e` is one.
 fn int_lit(e: &Expr) -> Option<usize> {
-    match e {
-        Expr::Int(n) if *n >= 0 => Some(*n as usize),
+    match &e.kind {
+        ExprKind::Int(n) if *n >= 0 => Some(*n as usize),
         _ => None,
     }
 }

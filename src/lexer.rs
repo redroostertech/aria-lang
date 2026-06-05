@@ -60,7 +60,18 @@ pub enum Tok {
 #[derive(Debug, Clone)]
 pub struct Token {
     pub tok: Tok,
+    /// 1-based source line of the token's first character.
     pub line: usize,
+    /// 1-based source column (in Unicode scalar values from the line start) of
+    /// the token's first character.
+    pub col: usize,
+    /// 1-based source line of the position ONE PAST the token's last character.
+    /// For a token that does not span a newline this equals `line`.
+    pub end_line: usize,
+    /// 1-based source column ONE PAST the token's last character. For a
+    /// single-character token at `col` this is `col + 1`, giving a half-open
+    /// `[col, end_col)` extent.
+    pub end_col: usize,
 }
 
 pub fn lex(src: &str) -> Result<Vec<Token>, String> {
@@ -68,27 +79,40 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
     let n = chars.len();
     let mut i = 0;
     let mut line = 1usize;
+    // 1-based column of `chars[i]`. Advanced in lockstep with `i` and reset to 1
+    // after each newline, so every token can record a precise start/end column.
+    let mut col = 1usize;
     let mut out: Vec<Token> = Vec::new();
 
-    let push = |out: &mut Vec<Token>, tok: Tok, line: usize| out.push(Token { tok, line });
+    // Emit a token spanning [(sl, sc) .. (el, ec)) where the end is the current
+    // `(line, col)` position (one past the last consumed character).
+    let push = |out: &mut Vec<Token>, tok: Tok, sl: usize, sc: usize, el: usize, ec: usize| {
+        out.push(Token { tok, line: sl, col: sc, end_line: el, end_col: ec })
+    };
 
     while i < n {
         let c = chars[i];
 
         if c == '\n' {
             line += 1;
+            col = 1;
             i += 1;
             continue;
         }
         if c.is_whitespace() {
             i += 1;
+            col += 1;
             continue;
         }
+
+        // The token starts here; remember its 1-based start column.
+        let start_col = col;
 
         // Line comment: -- ... \n
         if c == '-' && i + 1 < n && chars[i + 1] == '-' {
             while i < n && chars[i] != '\n' {
                 i += 1;
+                col += 1;
             }
             continue;
         }
@@ -108,8 +132,9 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 _ => None,
             };
             if let Some(t) = two_tok {
-                push(&mut out, t, line);
                 i += 2;
+                col += 2;
+                push(&mut out, t, line, start_col, line, col);
                 continue;
             }
         }
@@ -142,14 +167,16 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             _ => None,
         };
         if let Some(t) = single {
-            push(&mut out, t, line);
             i += 1;
+            col += 1;
+            push(&mut out, t, line, start_col, line, col);
             continue;
         }
 
         // String literal.
         if c == '"' {
             i += 1;
+            col += 1; // opening quote
             let mut s = String::new();
             while i < n && chars[i] != '"' {
                 if chars[i] == '\\' && i + 1 < n {
@@ -163,19 +190,22 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                     };
                     s.push(r);
                     i += 2;
+                    col += 2;
                 } else {
                     if chars[i] == '\n' {
                         return Err(format!("line {}: unterminated string", line));
                     }
                     s.push(chars[i]);
                     i += 1;
+                    col += 1;
                 }
             }
             if i >= n {
                 return Err(format!("line {}: unterminated string", line));
             }
             i += 1; // closing quote
-            push(&mut out, Tok::Str(s), line);
+            col += 1;
+            push(&mut out, Tok::Str(s), line, start_col, line, col);
             continue;
         }
 
@@ -201,16 +231,18 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 return Err(format!("line {}: malformed number literal `{}`", line, bad));
             }
             let text: String = chars[start..i].iter().collect();
+            // The number scanned only ASCII digits/`.`, so one char == one column.
+            col += i - start;
             if is_float {
                 let f: f64 = text
                     .parse()
                     .map_err(|_| format!("line {}: bad float `{}`", line, text))?;
-                push(&mut out, Tok::Float(f), line);
+                push(&mut out, Tok::Float(f), line, start_col, line, col);
             } else {
                 let v: i64 = text
                     .parse()
                     .map_err(|_| format!("line {}: integer `{}` out of range", line, text))?;
-                push(&mut out, Tok::Int(v), line);
+                push(&mut out, Tok::Int(v), line, start_col, line, col);
             }
             continue;
         }
@@ -224,6 +256,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 i += 1;
             }
             let word: String = chars[start..i].iter().collect();
+            // Identifiers/keywords are ASCII, so one char == one column.
+            col += i - start;
             let tok = match word.as_str() {
                 "fn" => Tok::Fn,
                 "pure" => Tok::Pure,
@@ -239,13 +273,51 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 "_" => Tok::Underscore,
                 _ => Tok::Ident(word),
             };
-            push(&mut out, tok, line);
+            push(&mut out, tok, line, start_col, line, col);
             continue;
         }
 
         return Err(format!("line {}: unexpected character `{}`", line, c));
     }
 
-    push(&mut out, Tok::Eof, line);
+    // The synthetic EOF sits one past the last character (a zero-width span).
+    push(&mut out, Tok::Eof, line, col, line, col);
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tokens_carry_precise_line_and_column() {
+        // `  fn f` — two leading spaces, so `fn` starts at column 3 and `f` at 6.
+        let toks = lex("  fn f").expect("lex");
+        // [Fn, Ident("f"), Eof]
+        assert_eq!(toks[0].tok, Tok::Fn);
+        assert_eq!((toks[0].line, toks[0].col), (1, 3));
+        // `fn` is two chars wide: [3, 5).
+        assert_eq!((toks[0].end_line, toks[0].end_col), (1, 5));
+        assert_eq!(toks[1].tok, Tok::Ident("f".to_string()));
+        assert_eq!((toks[1].line, toks[1].col), (1, 6));
+        assert_eq!((toks[1].end_line, toks[1].end_col), (1, 7));
+    }
+
+    #[test]
+    fn columns_reset_each_line_and_track_multiline() {
+        // Line 1 holds `x = 1`; line 2 holds `  yy`. Confirm the column resets and
+        // that a token on line 2 reports line 2 with its own column.
+        let toks = lex("x = 1\n  yy").expect("lex");
+        // Find the `yy` identifier.
+        let yy = toks
+            .iter()
+            .find(|t| t.tok == Tok::Ident("yy".to_string()))
+            .expect("yy token");
+        assert_eq!((yy.line, yy.col), (2, 3));
+        assert_eq!((yy.end_line, yy.end_col), (2, 5));
+        // The `1` on line 1 is at column 5.
+        let one = toks.iter().find(|t| t.tok == Tok::Int(1)).expect("int token");
+        assert_eq!((one.line, one.col), (1, 5));
+        assert_eq!((one.end_line, one.end_col), (1, 6));
+    }
 }

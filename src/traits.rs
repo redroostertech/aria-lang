@@ -239,7 +239,7 @@ pub fn lower(
                     .expect("head type exists (checked above)");
                 let impl_fn = impl_method_name(&tm.name, &itf.name, head);
                 let call_args: Vec<Expr> =
-                    params.iter().map(|p| Expr::Var(p.name.clone())).collect();
+                    params.iter().map(|p| Expr::synth(ExprKind::Var(p.name.clone()))).collect();
                 for v in variants {
                     let pat = Pattern::Ctor(
                         v.name.clone(),
@@ -247,7 +247,7 @@ pub fn lower(
                     );
                     arms.push(Arm {
                         pat,
-                        body: Expr::Call(impl_fn.clone(), call_args.clone()),
+                        body: Expr::synth(ExprKind::Call(impl_fn.clone(), call_args.clone())),
                     });
                 }
             }
@@ -264,7 +264,7 @@ pub fn lower(
             if arms.is_empty() {
                 continue;
             }
-            let body = Expr::Match(Box::new(Expr::Var(receiver)), arms);
+            let body = Expr::synth(ExprKind::Match(Box::new(Expr::synth(ExprKind::Var(receiver))), arms));
             items.push(Item::Fn(FnDecl {
                 name: tm.name.clone(),
                 // Compiler-generated trait dispatcher: no single source line.

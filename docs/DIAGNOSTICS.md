@@ -48,7 +48,9 @@ object:
 | `code`     | string          | **Stable** short code per error *category* (see table). Match on this.  |
 | `message`  | string          | Human-readable text (identical to the non-`--json` path).               |
 | `line`     | int or `null`   | 1-based source line if known, else `null`.                              |
-| `col`      | int or `null`   | 1-based column if known, else `null` (currently always `null`).         |
+| `col`      | int or `null`   | 1-based column if known, else `null`. **Populated for expression-level type/shape errors** from the precise span of the offending sub-expression. |
+| `end_line` | int or `null`   | 1-based END line of the offending expression's span (precise spans only), else `null`. |
+| `end_col`  | int or `null`   | 1-based END column (one past the last character) of the span, else `null`. With `line`/`col` this gives an exact range. |
 | `function` | string or `null`| Enclosing function name if known, else `null`.                          |
 
 ### Forward compatibility (consumer rules)
@@ -57,7 +59,7 @@ The schema is designed so precise spans can be added later without breaking
 consumers. A consumer MUST:
 
 - **Ignore unknown object fields** (new fields may be added).
-- **Tolerate `null`** for `line`, `col`, and `function`.
+- **Tolerate `null`** for `line`, `col`, `end_line`, `end_col`, and `function`.
 - **Key off `code`** (and optionally `phase`) for programmatic handling, not off
   the `message` text (messages may be reworded).
 
@@ -87,22 +89,31 @@ New categories will get new `E####` codes; existing codes keep their meaning.
 
 ## Location precision (what is populated today)
 
-- **`lex` / `parse` errors:** `line` IS populated (the lexer tracks a 1-based
-  line per token; these messages carry a `line N:` prefix). `col` is `null` —
-  the lexer does not track columns yet.
-- **`type` / `shape` / `purity` / `exhaustiveness` errors:** `function` is
-  populated **for function-scoped errors** (extracted from the message, which
-  names the enclosing function). It is `null` for declaration-level errors that
-  are not inside any function body — e.g. duplicate-declaration / redefinition
-  errors (`duplicate type`, `duplicate function`, `cannot redefine built-in`)
-  and `io` file-read errors. `line`/`col` are `null` for the semantic phases:
-  attaching a precise source span would require threading a span through every
-  AST node, which is deferred. The schema already has the fields, so adding
-  precision later is non-breaking. Consumers must always tolerate `function:
-  null` (per the forward-compatibility rules).
+Every AST expression now carries a precise source **span** (1-based start/end
+line+column), threaded from the lexer (which tracks line **and** column per
+token) through the parser. The type/shape checker records the span of the
+**innermost offending sub-expression** on each error, so expression-level
+diagnostics point at the EXACT operand / call site, not just the function.
 
-This is a deliberate first-milestone scope: line-level for lex/parse,
-function-level for function-scoped semantic errors.
+- **`lex` / `parse` errors:** `line` IS populated (these messages carry a
+  `line N:` prefix). `col`/`end_line`/`end_col` are `null` — a lex/parse failure
+  is reported at a token, not a fully-parsed expression span.
+- **`type` / `shape` errors at the expression level:** `line` **and** `col`
+  (and `end_line`/`end_col`) are populated from the offending sub-expression's
+  span — e.g. `fn f() -> Int = 1 + true` reports the precise location of
+  `1 + true`, and `1 + (2 * true)` reports the inner `2 * true`. A whole-body
+  return-type mismatch is located at the function's result expression.
+- **`function`** is populated **for function-scoped errors** (extracted from the
+  message, which names the enclosing function). It is `null` for
+  declaration-level errors not inside any function body — e.g.
+  duplicate-declaration / redefinition errors (`duplicate type`,
+  `duplicate function`, `cannot redefine built-in`) and `io` file-read errors.
+- **Declaration-level and unlocatable errors** (duplicate declarations, unknown
+  types in signatures, purity/exhaustiveness messages the checker cannot tie to
+  a single expression) leave `col`/`end_*` `null` — better unset than wrong.
+
+Consumers must always tolerate `null` for any location field (per the
+forward-compatibility rules).
 
 ## Examples
 
@@ -110,9 +121,18 @@ Three known type errors (`examples/broken.aria`):
 
 ```sh
 $ aria check --json examples/broken.aria
-[{"severity":"error","phase":"exhaustiveness","code":"E0203","message":"function `code`: non-exhaustive match on Color: missing case `Blue`","line":null,"col":null,"function":"code"},{"severity":"error","phase":"type","code":"E0201","message":"function `wrong_return`: body has type Bool but return type is Int (expected Bool, found Int)","line":null,"col":null,"function":"wrong_return"},{"severity":"error","phase":"type","code":"E0201","message":"function `bad_compare`: cannot compare Int and String","line":null,"col":null,"function":"bad_compare"}]
+[{"severity":"error","phase":"exhaustiveness","code":"E0203","message":"function `code`: non-exhaustive match on Color: missing case `Blue`","line":12,"col":3,"end_line":15,"end_col":4,"function":"code"},{"severity":"error","phase":"type","code":"E0201","message":"function `wrong_return`: body has type Bool but return type is Int (expected Bool, found Int)","line":18,"col":28,"end_line":18,"end_col":32,"function":"wrong_return"},{"severity":"error","phase":"type","code":"E0201","message":"function `bad_compare`: cannot compare Int and String","line":21,"col":34,"end_line":21,"end_col":45,"function":"bad_compare"}]
 $ echo $?
 1
+```
+
+Each error now carries a precise `line`+`col` (and `end_line`/`end_col`)
+pointing at the offending sub-expression. A type error mid-expression locates
+the exact operand:
+
+```sh
+$ aria check --json -   # fn f() -> Int = 1 + true
+[{"severity":"error","phase":"type","code":"E0201","message":"function `f`: `Add` needs two Ints or two Floats, got Int and Bool","line":1,"col":17,"end_line":1,"end_col":25,"function":"f"}]
 ```
 
 A clean program:
@@ -128,5 +148,5 @@ A parse error (note populated `line`):
 
 ```sh
 $ aria check --json parse_err.aria
-[{"severity":"error","phase":"parse","code":"E0100","message":"line 2: unexpected token Let in expression","line":2,"col":null,"function":null}]
+[{"severity":"error","phase":"parse","code":"E0100","message":"line 2: unexpected token Let in expression","line":2,"col":null,"end_line":null,"end_col":null,"function":null}]
 ```

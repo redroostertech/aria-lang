@@ -20,7 +20,7 @@
 
 use std::collections::HashMap;
 
-use crate::ast::{BinOp, Expr, Item, Pattern, Program, Stmt, UnOp};
+use crate::ast::{BinOp, Expr, ExprKind, Item, Pattern, Program, Stmt, UnOp};
 
 /// Atomic operand: a variable or an unboxed literal.
 #[derive(Debug, Clone)]
@@ -267,19 +267,19 @@ pub(crate) fn pattern_vars(p: &Pattern, acc: &mut std::collections::HashSet<Stri
 /// variables that are not top-level functions or builtins.
 pub(crate) fn ast_free(e: &Expr, bound: &std::collections::HashSet<String>, acc: &mut std::collections::HashSet<String>) {
     use std::collections::HashSet;
-    match e {
-        Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Unit => {}
-        Expr::Var(n) => {
+    match &e.kind {
+        ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Str(_) | ExprKind::Unit => {}
+        ExprKind::Var(n) => {
             if !bound.contains(n) {
                 acc.insert(n.clone());
             }
         }
-        Expr::Ctor(_, args) => {
+        ExprKind::Ctor(_, args) => {
             for a in args {
                 ast_free(a, bound, acc);
             }
         }
-        Expr::Call(name, args) => {
+        ExprKind::Call(name, args) => {
             if !bound.contains(name) {
                 acc.insert(name.clone());
             }
@@ -287,35 +287,35 @@ pub(crate) fn ast_free(e: &Expr, bound: &std::collections::HashSet<String>, acc:
                 ast_free(a, bound, acc);
             }
         }
-        Expr::Apply(callee, args, _) => {
+        ExprKind::Apply(callee, args, _) => {
             ast_free(callee, bound, acc);
             for a in args {
                 ast_free(a, bound, acc);
             }
         }
-        Expr::Record(_, fields) => {
+        ExprKind::Record(_, fields) => {
             for (_, v) in fields {
                 ast_free(v, bound, acc);
             }
         }
-        Expr::Field(obj, _) => ast_free(obj, bound, acc),
-        Expr::Update(base, updates) => {
+        ExprKind::Field(obj, _) => ast_free(obj, bound, acc),
+        ExprKind::Update(base, updates) => {
             ast_free(base, bound, acc);
             for (_, v) in updates {
                 ast_free(v, bound, acc);
             }
         }
-        Expr::Unary(_, inner) => ast_free(inner, bound, acc),
-        Expr::Binary(_, l, r) => {
+        ExprKind::Unary(_, inner) => ast_free(inner, bound, acc),
+        ExprKind::Binary(_, l, r) => {
             ast_free(l, bound, acc);
             ast_free(r, bound, acc);
         }
-        Expr::If(c, t, e2) => {
+        ExprKind::If(c, t, e2) => {
             ast_free(c, bound, acc);
             ast_free(t, bound, acc);
             ast_free(e2, bound, acc);
         }
-        Expr::Match(s, arms) => {
+        ExprKind::Match(s, arms) => {
             ast_free(s, bound, acc);
             for arm in arms {
                 let mut b = bound.clone();
@@ -323,14 +323,14 @@ pub(crate) fn ast_free(e: &Expr, bound: &std::collections::HashSet<String>, acc:
                 ast_free(&arm.body, &b, acc);
             }
         }
-        Expr::Lambda(params, body, _) => {
+        ExprKind::Lambda(params, body, _) => {
             let mut b = bound.clone();
             for (n, _) in params {
                 b.insert(n.clone());
             }
             ast_free(body, &b, acc);
         }
-        Expr::Block(stmts, last) => {
+        ExprKind::Block(stmts, last) => {
             let mut b: HashSet<String> = bound.clone();
             for s in stmts {
                 match s {
@@ -398,32 +398,32 @@ impl Lowerer {
 
     /// Lower `e`, pushing any needed bindings to `stmts`, returning its atom.
     fn lower(&mut self, e: &Expr, stmts: &mut Vec<(String, Bind)>) -> Result<Atom, LowerError> {
-        match e {
-            Expr::Int(n) => Ok(Atom::Int(*n)),
-            Expr::Float(f) => Ok(Atom::Float(*f)),
-            Expr::Bool(b) => Ok(Atom::Bool(*b)),
-            Expr::Str(s) => Ok(Atom::Str(s.clone())),
-            Expr::Unit => Ok(Atom::Unit),
+        match &e.kind {
+            ExprKind::Int(n) => Ok(Atom::Int(*n)),
+            ExprKind::Float(f) => Ok(Atom::Float(*f)),
+            ExprKind::Bool(b) => Ok(Atom::Bool(*b)),
+            ExprKind::Str(s) => Ok(Atom::Str(s.clone())),
+            ExprKind::Unit => Ok(Atom::Unit),
             // Records are interpreter-only so far; the IR/compiled backends do
             // not lower them yet (cleanly rejected, like tensors/arrays).
-            Expr::Record(name, _) => Err(LowerError(format!(
+            ExprKind::Record(name, _) => Err(LowerError(format!(
                 "records are not yet supported in the IR/compiled backends \
                  (use the interpreter `aria run`): record `{}`",
                 name
             ))),
-            Expr::Field(_, field) => Err(LowerError(format!(
+            ExprKind::Field(_, field) => Err(LowerError(format!(
                 "record field access `.{}` is not yet supported in the IR/compiled \
                  backends (use the interpreter `aria run`)",
                 field
             ))),
-            Expr::Update(_, _) => Err(LowerError(
+            ExprKind::Update(_, _) => Err(LowerError(
                 "record update `{ r | .. }` is not yet supported in the IR/compiled \
                  backends (use the interpreter `aria run`)"
                     .to_string(),
             )),
-            Expr::Var(n) => {
+            ExprKind::Var(n) => {
                 // A bare top-level function name in value position (it would be an
-                // `Expr::Call` if it were applied) becomes a closure over a
+                // `ExprKind::Call` if it were applied) becomes a closure over a
                 // zero-capture wrapper that forwards to the direct call — UNLESS a
                 // local of the same name shadows it (then it is an ordinary local).
                 if !self.bound.contains(n) && self.fn_arities.contains_key(n) {
@@ -436,7 +436,7 @@ impl Lowerer {
                 }
             }
 
-            Expr::Binary(op, l, r) => {
+            ExprKind::Binary(op, l, r) => {
                 // Short-circuit `&&` / `||` must NOT evaluate the rhs eagerly —
                 // lower to control flow so the rhs runs only in the taken branch
                 // (matching the interpreter's short-circuit semantics).
@@ -457,19 +457,19 @@ impl Lowerer {
                 stmts.push((t.clone(), Bind::Prim(*op, la, ra)));
                 Ok(Atom::Var(t))
             }
-            Expr::Unary(op, inner) => {
+            ExprKind::Unary(op, inner) => {
                 let a = self.lower(inner, stmts)?;
                 let t = self.fresh();
                 stmts.push((t.clone(), Bind::Unary(*op, a)));
                 Ok(Atom::Var(t))
             }
-            Expr::Ctor(name, args) => {
+            ExprKind::Ctor(name, args) => {
                 let atoms = self.lower_all(args, stmts)?;
                 let t = self.fresh();
                 stmts.push((t.clone(), Bind::Ctor(name.clone(), atoms)));
                 Ok(Atom::Var(t))
             }
-            Expr::Call(name, args) => {
+            ExprKind::Call(name, args) => {
                 // A local binding (parameter / let / lambda capture) applied by
                 // name is a closure application — the tree-walker resolves the
                 // scope before the global function table, so a local shadows any
@@ -541,7 +541,7 @@ impl Lowerer {
                 stmts.push((t.clone(), Bind::Call(name.clone(), atoms)));
                 Ok(Atom::Var(t))
             }
-            Expr::If(c, th, el) => {
+            ExprKind::If(c, th, el) => {
                 let ca = self.lower(c, stmts)?;
                 let th_ir = self.lower_block(th)?;
                 let el_ir = self.lower_block(el)?;
@@ -549,14 +549,14 @@ impl Lowerer {
                 stmts.push((t.clone(), Bind::If(ca, Box::new(th_ir), Box::new(el_ir))));
                 Ok(Atom::Var(t))
             }
-            Expr::Match(scrut, arms) => {
+            ExprKind::Match(scrut, arms) => {
                 let sa = self.lower(scrut, stmts)?;
                 let bind = self.lower_match(sa, arms)?;
                 let t = self.fresh();
                 stmts.push((t.clone(), bind));
                 Ok(Atom::Var(t))
             }
-            Expr::Lambda(params, body, sig) => {
+            ExprKind::Lambda(params, body, sig) => {
                 // Lift the lambda to a top-level function and allocate a closure
                 // cell holding its captured free variables. When monomorphization
                 // has attached a concrete `ClosureSig`, take the capture list (and
@@ -616,14 +616,14 @@ impl Lowerer {
                 stmts.push((t.clone(), Bind::MakeClosure(lam_name, cap_atoms)));
                 Ok(Atom::Var(t))
             }
-            Expr::Apply(callee, args, result_ty) => {
+            ExprKind::Apply(callee, args, result_ty) => {
                 let c = self.lower(callee, stmts)?;
                 let atoms = self.lower_all(args, stmts)?;
                 let t = self.fresh();
                 stmts.push((t.clone(), Bind::ApplyClosure(c, atoms, result_ty.clone())));
                 Ok(Atom::Var(t))
             }
-            Expr::Block(block_stmts, last) => {
+            ExprKind::Block(block_stmts, last) => {
                 // A block opens a scope: its `let` bindings are local for the rest
                 // of the block but must not leak to siblings. (`let` is
                 // non-recursive — the value is lowered before the name is bound.)
@@ -681,10 +681,10 @@ impl Lowerer {
                 Pattern::Ctor(..) => {
                     let f = self.fresh();
                     flat.push(Pattern::Var(f.clone()));
-                    body = Expr::Match(
-                        Box::new(Expr::Var(f)),
+                    body = Expr::synth(ExprKind::Match(
+                        Box::new(Expr::synth(ExprKind::Var(f))),
                         vec![Arm { pat: sub.clone(), body }],
-                    );
+                    ));
                 }
                 _ => return None,
             }

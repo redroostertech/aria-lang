@@ -69,7 +69,7 @@ struct CtorInfo {
     type_params: Vec<String>,
     fields: Vec<Ty>,
     tyname: String,
-    /// `Some(names)` iff a record constructor — used to desugar `Expr::Record`/
+    /// `Some(names)` iff a record constructor — used to desugar `ExprKind::Record`/
     /// `Field`/`Update` and `Pattern::Record` to positional form.
     field_names: Option<Vec<String>>,
 }
@@ -560,22 +560,22 @@ impl<'a> Mono<'a> {
     /// `None` here is never fatal — it just means this argument contributes
     /// nothing to the seed and is resolved in the rewriting pass instead.
     fn synth_ty(&mut self, e: &Expr, env: &HashMap<String, Ty>) -> Option<Ty> {
-        match e {
-            Expr::Int(_) => Some(Ty::Int),
-            Expr::Float(_) => Some(Ty::Float),
-            Expr::Bool(_) => Some(Ty::Bool),
-            Expr::Str(_) => Some(Ty::Str),
-            Expr::Unit => Some(Ty::Unit),
-            Expr::Var(n) => env.get(n).cloned(),
-            Expr::Unary(_, inner) => self.synth_ty(inner, env),
-            Expr::Binary(op, l, _) => {
+        match &e.kind {
+            ExprKind::Int(_) => Some(Ty::Int),
+            ExprKind::Float(_) => Some(Ty::Float),
+            ExprKind::Bool(_) => Some(Ty::Bool),
+            ExprKind::Str(_) => Some(Ty::Str),
+            ExprKind::Unit => Some(Ty::Unit),
+            ExprKind::Var(n) => env.get(n).cloned(),
+            ExprKind::Unary(_, inner) => self.synth_ty(inner, env),
+            ExprKind::Binary(op, l, _) => {
                 let lt = self.synth_ty(l, env)?;
                 Some(binary_ret(*op, &lt))
             }
             // Records are interpreter-only so far; the compiled pipeline does not
             // type or lower them (cleanly rejected in `rewrite_expr`).
-            Expr::Record(..) | Expr::Field(..) | Expr::Update(..) => None,
-            Expr::Ctor(name, args) => {
+            ExprKind::Record(..) | ExprKind::Field(..) | ExprKind::Update(..) => None,
+            ExprKind::Ctor(name, args) => {
                 // Only synthesizable if every owning type parameter is pinned by
                 // the constructor's own field types (no expected-type context
                 // available here). Otherwise return None.
@@ -595,7 +595,7 @@ impl<'a> Mono<'a> {
                 }
                 Some(Ty::Named(self.mangle_type_name(&sig.tyname, &targs), Vec::new()))
             }
-            Expr::Call(name, args) => {
+            ExprKind::Call(name, args) => {
                 // `array_lit` (variadic array-literal desugaring): the element
                 // type is the first argument's synthesized type.
                 if name == "array_lit" {
@@ -655,10 +655,10 @@ impl<'a> Mono<'a> {
                 }))
             }
             // If / Match / Block need full rewriting to type; skip for seeding.
-            Expr::If(_, _, _) | Expr::Match(_, _) | Expr::Block(_, _) => None,
+            ExprKind::If(_, _, _) | ExprKind::Match(_, _) | ExprKind::Block(_, _) => None,
             // A lambda: best-effort `Fn` type from annotated params + synthesized
             // body. Unannotated params block synthesis (handled by full rewriting).
-            Expr::Lambda(params, body, _) => {
+            ExprKind::Lambda(params, body, _) => {
                 let mut ptys = Vec::new();
                 for (_, ann) in params {
                     if contains_var(ann) {
@@ -674,7 +674,7 @@ impl<'a> Mono<'a> {
                 Some(Ty::Fn(ptys, Box::new(bt)))
             }
             // An application: the callee's `Fn` return type, if synthesizable.
-            Expr::Apply(callee, _, _) => match self.synth_ty(callee, env)? {
+            ExprKind::Apply(callee, _, _) => match self.synth_ty(callee, env)? {
                 Ty::Fn(_, ret) => Some(*ret),
                 _ => None,
             },
@@ -746,7 +746,7 @@ impl<'a> Mono<'a> {
                 // type — a callee param, a `let` annotation, or a sibling arg).
                 let elem = default_empty_elem(expected.and_then(array_elem_of).unwrap_or(Ty::Unit));
                 let tag = array_elem_tag(&elem);
-                Ok(Some((Expr::Call(format!("array_new${}", tag), Vec::new()), arr(elem))))
+                Ok(Some((Expr::synth(ExprKind::Call(format!("array_new${}", tag), Vec::new())), arr(elem))))
             }
             "array_push" => {
                 // args = [array, value]: the value fixes `E`; push it down into
@@ -754,7 +754,7 @@ impl<'a> Mono<'a> {
                 let (rval, elem) = self.rewrite_expr(&args[1], env, tymap, None)?;
                 let (rarr, _) = self.rewrite_expr(&args[0], env, tymap, Some(&arr(elem.clone())))?;
                 let tag = array_elem_tag(&elem);
-                Ok(Some((Expr::Call(format!("array_push${}", tag), vec![rarr, rval]), arr(elem))))
+                Ok(Some((Expr::synth(ExprKind::Call(format!("array_push${}", tag), vec![rarr, rval])), arr(elem))))
             }
             "array_set" => {
                 // args = [array, index, value].
@@ -763,7 +763,7 @@ impl<'a> Mono<'a> {
                 let (ridx, _) = self.rewrite_expr(&args[1], env, tymap, None)?;
                 let tag = array_elem_tag(&elem);
                 Ok(Some((
-                    Expr::Call(format!("array_set${}", tag), vec![rarr, ridx, rval]),
+                    Expr::synth(ExprKind::Call(format!("array_set${}", tag), vec![rarr, ridx, rval])),
                     arr(elem),
                 )))
             }
@@ -776,13 +776,13 @@ impl<'a> Mono<'a> {
                     array_elem_of(&arr_ty).or_else(|| expected.cloned()).unwrap_or(Ty::Unit);
                 let (ridx, _) = self.rewrite_expr(&args[1], env, tymap, None)?;
                 let tag = array_elem_tag(&elem);
-                Ok(Some((Expr::Call(format!("array_get${}", tag), vec![rarr, ridx]), elem)))
+                Ok(Some((Expr::synth(ExprKind::Call(format!("array_get${}", tag), vec![rarr, ridx])), elem)))
             }
             "array_len" => {
                 let (rarr, arr_ty) = self.rewrite_expr(&args[0], env, tymap, None)?;
                 let elem = array_elem_of(&arr_ty).unwrap_or(Ty::Unit);
                 let tag = array_elem_tag(&elem);
-                Ok(Some((Expr::Call(format!("array_len${}", tag), vec![rarr]), Ty::Int)))
+                Ok(Some((Expr::synth(ExprKind::Call(format!("array_len${}", tag), vec![rarr])), Ty::Int)))
             }
             _ => Ok(None),
         }
@@ -815,7 +815,7 @@ impl<'a> Mono<'a> {
                 }
                 let suffix = map_suffix(&k, &v);
                 Ok(Some((
-                    Expr::Call(format!("map_new${}", suffix), Vec::new()),
+                    Expr::synth(ExprKind::Call(format!("map_new${}", suffix), Vec::new())),
                     mapty(k, v),
                 )))
             }
@@ -831,7 +831,7 @@ impl<'a> Mono<'a> {
                     self.rewrite_expr(&args[0], env, tymap, Some(&mapty(k.clone(), v.clone())))?;
                 let suffix = map_suffix(&k, &v);
                 Ok(Some((
-                    Expr::Call(format!("map_insert${}", suffix), vec![rmap, rkey, rval]),
+                    Expr::synth(ExprKind::Call(format!("map_insert${}", suffix), vec![rmap, rkey, rval])),
                     mapty(k, v),
                 )))
             }
@@ -846,7 +846,7 @@ impl<'a> Mono<'a> {
                     self.rewrite_expr(&args[0], env, tymap, Some(&mapty(k.clone(), v.clone())))?;
                 let suffix = map_suffix(&k, &v);
                 Ok(Some((
-                    Expr::Call(format!("map_get_or${}", suffix), vec![rmap, rkey, rdef]),
+                    Expr::synth(ExprKind::Call(format!("map_get_or${}", suffix), vec![rmap, rkey, rdef])),
                     v,
                 )))
             }
@@ -856,7 +856,7 @@ impl<'a> Mono<'a> {
                 let v = map_kv_of(&map_ty).map(|(_, v)| v).unwrap_or(Ty::Unit);
                 let suffix = map_suffix(&k, &v);
                 Ok(Some((
-                    Expr::Call(format!("map_has${}", suffix), vec![rmap, rkey]),
+                    Expr::synth(ExprKind::Call(format!("map_has${}", suffix), vec![rmap, rkey])),
                     Ty::Bool,
                 )))
             }
@@ -865,7 +865,7 @@ impl<'a> Mono<'a> {
                 let (k, v) = map_kv_of(&map_ty).unwrap_or((Ty::Unit, Ty::Unit));
                 let suffix = map_suffix(&k, &v);
                 Ok(Some((
-                    Expr::Call(format!("map_len${}", suffix), vec![rmap]),
+                    Expr::synth(ExprKind::Call(format!("map_len${}", suffix), vec![rmap])),
                     Ty::Int,
                 )))
             }
@@ -882,7 +882,7 @@ impl<'a> Mono<'a> {
                 }
                 let suffix = map_suffix(&k, &v);
                 Ok(Some((
-                    Expr::Call(format!("map_remove${}", suffix), vec![rmap, rkey]),
+                    Expr::synth(ExprKind::Call(format!("map_remove${}", suffix), vec![rmap, rkey])),
                     mapty(k, v),
                 )))
             }
@@ -891,7 +891,7 @@ impl<'a> Mono<'a> {
                 let (k, v) = map_kv_of(&map_ty).unwrap_or((Ty::Unit, Ty::Unit));
                 let suffix = map_suffix(&k, &v);
                 Ok(Some((
-                    Expr::Call(format!("map_show${}", suffix), vec![rmap]),
+                    Expr::synth(ExprKind::Call(format!("map_show${}", suffix), vec![rmap])),
                     Ty::Str,
                 )))
             }
@@ -917,7 +917,7 @@ impl<'a> Mono<'a> {
                 let elem = if name == "map_keys" { k.clone() } else { v.clone() };
                 let suffix = map_suffix(&k, &v);
                 Ok(Some((
-                    Expr::Call(format!("{}${}", name, suffix), vec![rmap]),
+                    Expr::synth(ExprKind::Call(format!("{}${}", name, suffix), vec![rmap])),
                     Ty::Named("Array".to_string(), vec![elem]),
                 )))
             }
@@ -926,7 +926,7 @@ impl<'a> Mono<'a> {
                 let t = default_empty_elem(expected.and_then(set_elem_of).unwrap_or(Ty::Unit));
                 let suffix = array_elem_tag(&t);
                 Ok(Some((
-                    Expr::Call(format!("set_new${}", suffix), Vec::new()),
+                    Expr::synth(ExprKind::Call(format!("set_new${}", suffix), Vec::new())),
                     setty(t),
                 )))
             }
@@ -935,7 +935,7 @@ impl<'a> Mono<'a> {
                 let (rset, _) = self.rewrite_expr(&args[0], env, tymap, Some(&setty(t.clone())))?;
                 let suffix = array_elem_tag(&t);
                 Ok(Some((
-                    Expr::Call(format!("set_add${}", suffix), vec![rset, relem]),
+                    Expr::synth(ExprKind::Call(format!("set_add${}", suffix), vec![rset, relem])),
                     setty(t),
                 )))
             }
@@ -944,7 +944,7 @@ impl<'a> Mono<'a> {
                 let (rset, _) = self.rewrite_expr(&args[0], env, tymap, Some(&setty(t.clone())))?;
                 let suffix = array_elem_tag(&t);
                 Ok(Some((
-                    Expr::Call(format!("set_has${}", suffix), vec![rset, relem]),
+                    Expr::synth(ExprKind::Call(format!("set_has${}", suffix), vec![rset, relem])),
                     Ty::Bool,
                 )))
             }
@@ -953,7 +953,7 @@ impl<'a> Mono<'a> {
                 let t = set_elem_of(&set_ty).unwrap_or(Ty::Unit);
                 let suffix = array_elem_tag(&t);
                 Ok(Some((
-                    Expr::Call(format!("set_len${}", suffix), vec![rset]),
+                    Expr::synth(ExprKind::Call(format!("set_len${}", suffix), vec![rset])),
                     Ty::Int,
                 )))
             }
@@ -963,7 +963,7 @@ impl<'a> Mono<'a> {
                     self.rewrite_expr(&args[0], env, tymap, Some(&setty(t.clone())))?;
                 let suffix = array_elem_tag(&t);
                 Ok(Some((
-                    Expr::Call(format!("set_remove${}", suffix), vec![rset, relem]),
+                    Expr::synth(ExprKind::Call(format!("set_remove${}", suffix), vec![rset, relem])),
                     setty(t),
                 )))
             }
@@ -972,7 +972,7 @@ impl<'a> Mono<'a> {
                 let t = set_elem_of(&set_ty).unwrap_or(Ty::Unit);
                 let suffix = array_elem_tag(&t);
                 Ok(Some((
-                    Expr::Call(format!("set_show${}", suffix), vec![rset]),
+                    Expr::synth(ExprKind::Call(format!("set_show${}", suffix), vec![rset])),
                     Ty::Str,
                 )))
             }
@@ -988,7 +988,7 @@ impl<'a> Mono<'a> {
                     .unwrap_or(Ty::Unit);
                 let suffix = array_elem_tag(&t);
                 Ok(Some((
-                    Expr::Call(format!("set_to_array${}", suffix), vec![rset]),
+                    Expr::synth(ExprKind::Call(format!("set_to_array${}", suffix), vec![rset])),
                     Ty::Named("Array".to_string(), vec![t]),
                 )))
             }
@@ -1055,7 +1055,7 @@ impl<'a> Mono<'a> {
         }
         let target = self.specialize_fn(&impl_fn, &[])?;
         let rt = self.mangle_concrete(&info.decl.ret);
-        Ok((Expr::Call(target, rargs), rt))
+        Ok((Expr::synth(ExprKind::Call(target, rargs)), rt))
     }
 
     fn rewrite_expr(
@@ -1065,12 +1065,16 @@ impl<'a> Mono<'a> {
         tymap: &HashMap<String, Ty>,
         expected: Option<&Ty>,
     ) -> Result<(Expr, Ty), String> {
-        match e {
-            Expr::Int(v) => Ok((Expr::Int(*v), Ty::Int)),
-            Expr::Float(v) => Ok((Expr::Float(*v), Ty::Float)),
-            Expr::Bool(v) => Ok((Expr::Bool(*v), Ty::Bool)),
-            Expr::Str(s) => Ok((Expr::Str(s.clone()), Ty::Str)),
-            Expr::Unit => Ok((Expr::Unit, Ty::Unit)),
+        // Spans are pure metadata that the IR + compiled backends ignore; the
+        // monomorphized AST never reaches the interpreter (which runs the
+        // original, fully-spanned AST). So every node rewritten or fabricated
+        // here carries the no-location sentinel span via `Expr::synth`.
+        match &e.kind {
+            ExprKind::Int(v) => Ok((Expr::synth(ExprKind::Int(*v)), Ty::Int)),
+            ExprKind::Float(v) => Ok((Expr::synth(ExprKind::Float(*v)), Ty::Float)),
+            ExprKind::Bool(v) => Ok((Expr::synth(ExprKind::Bool(*v)), Ty::Bool)),
+            ExprKind::Str(s) => Ok((Expr::synth(ExprKind::Str(s.clone())), Ty::Str)),
+            ExprKind::Unit => Ok((Expr::synth(ExprKind::Unit), Ty::Unit)),
 
             // Records desugar to positional ADT form HERE, where the receiver's
             // concrete record type is known. After this, the IR + backends see
@@ -1079,7 +1083,7 @@ impl<'a> Mono<'a> {
             // A record literal is exactly a positional constructor application,
             // so reorder its fields and recurse through the `Ctor` arm (which
             // handles all the generic mangling / type-arg solving).
-            Expr::Record(name, fields) => {
+            ExprKind::Record(name, fields) => {
                 let sig = self
                     .ctors
                     .get(name)
@@ -1093,11 +1097,11 @@ impl<'a> Mono<'a> {
                     .iter()
                     .map(|fname| fields.iter().find(|(n, _)| n == fname).unwrap().1.clone())
                     .collect();
-                self.rewrite_expr(&Expr::Ctor(name.clone(), ordered), env, tymap, expected)
+                self.rewrite_expr(&Expr::synth(ExprKind::Ctor(name.clone(), ordered)), env, tymap, expected)
             }
             // `obj.field` -> `match obj { Ctor(b0,..,bn) => b_idx }`. `obj` is
             // rewritten first to learn its concrete (mangled) record type.
-            Expr::Field(obj, field) => {
+            ExprKind::Field(obj, field) => {
                 let (robj, obj_ty) = self.rewrite_expr(obj, env, tymap, None)?;
                 let (ctor, fnames, ftys) = self.record_shape(&obj_ty)?;
                 let idx = fnames
@@ -1107,12 +1111,12 @@ impl<'a> Mono<'a> {
                 let binders = fresh_field_binders(fnames.len());
                 let pat =
                     Pattern::Ctor(ctor, binders.iter().cloned().map(Pattern::Var).collect());
-                let arm = Arm { pat, body: Expr::Var(binders[idx].clone()) };
-                Ok((Expr::Match(Box::new(robj), vec![arm]), ftys[idx].clone()))
+                let arm = Arm { pat, body: Expr::synth(ExprKind::Var(binders[idx].clone())) };
+                Ok((Expr::synth(ExprKind::Match(Box::new(robj), vec![arm])), ftys[idx].clone()))
             }
             // `{ base | f = v }` -> `match base { Ctor(b0,..,bn) => Ctor(g0,..,gn) }`
             // where g_i is the new value for updated fields, else Var(b_i).
-            Expr::Update(base, updates) => {
+            ExprKind::Update(base, updates) => {
                 let (rbase, base_ty) = self.rewrite_expr(base, env, tymap, None)?;
                 let (ctor, fnames, _ftys) = self.record_shape(&base_ty)?;
                 let binders = fresh_field_binders(fnames.len());
@@ -1124,19 +1128,19 @@ impl<'a> Mono<'a> {
                 let rebuilt: Vec<Expr> = fnames
                     .iter()
                     .zip(binders.iter())
-                    .map(|(fname, b)| new_vals.remove(fname).unwrap_or_else(|| Expr::Var(b.clone())))
+                    .map(|(fname, b)| new_vals.remove(fname).unwrap_or_else(|| Expr::synth(ExprKind::Var(b.clone()))))
                     .collect();
                 let pat = Pattern::Ctor(
                     ctor.clone(),
                     binders.iter().cloned().map(Pattern::Var).collect(),
                 );
-                let arm = Arm { pat, body: Expr::Ctor(ctor, rebuilt) };
-                Ok((Expr::Match(Box::new(rbase), vec![arm]), base_ty))
+                let arm = Arm { pat, body: Expr::synth(ExprKind::Ctor(ctor, rebuilt)) };
+                Ok((Expr::synth(ExprKind::Match(Box::new(rbase), vec![arm])), base_ty))
             }
 
-            Expr::Var(name) => {
+            ExprKind::Var(name) => {
                 if let Some(ty) = env.get(name).cloned() {
-                    return Ok((Expr::Var(name.clone()), ty));
+                    return Ok((Expr::synth(ExprKind::Var(name.clone())), ty));
                 }
                 // A top-level function referenced as a value (e.g. passed by name
                 // to a higher-order function). Specialize it — non-generic only,
@@ -1154,12 +1158,12 @@ impl<'a> Mono<'a> {
                     let pts: Vec<Ty> =
                         info.decl.params.iter().map(|p| self.mangle_concrete(&p.ty)).collect();
                     let rt = self.mangle_concrete(&info.decl.ret);
-                    return Ok((Expr::Var(target), Ty::Fn(pts, Box::new(rt))));
+                    return Ok((Expr::synth(ExprKind::Var(target)), Ty::Fn(pts, Box::new(rt))));
                 }
                 Err(format!("monomorphize: unbound variable `{}`", name))
             }
 
-            Expr::Ctor(name, args) => {
+            ExprKind::Ctor(name, args) => {
                 let sig = self
                     .ctors
                     .get(name)
@@ -1203,14 +1207,14 @@ impl<'a> Mono<'a> {
                     Self::mangle_ctor_name(name, &owner_mangled)
                 };
                 let result_ty = Ty::Named(owner_mangled, Vec::new());
-                Ok((Expr::Ctor(cname, rargs), result_ty))
+                Ok((Expr::synth(ExprKind::Ctor(cname, rargs)), result_ty))
             }
 
-            Expr::Call(name, args) => {
+            ExprKind::Call(name, args) => {
                 // A local `Fn`-typed binding applied by name (e.g. a function
                 // parameter `f` in `f(x)`) — the tree-walker resolves the scope
                 // before the global function table, so do the same here. Keep it
-                // an `Expr::Call`; lowering turns a non-global, non-builtin callee
+                // an `ExprKind::Call`; lowering turns a non-global, non-builtin callee
                 // into a closure application.
                 if let Some(Ty::Fn(param_tys, ret)) = env.get(name).cloned() {
                     let mut rargs = Vec::new();
@@ -1222,11 +1226,11 @@ impl<'a> Mono<'a> {
                     // type; lowering turns an applied local variable into a
                     // closure call.
                     return Ok((
-                        Expr::Apply(
-                            Box::new(Expr::Var(name.clone())),
+                        Expr::synth(ExprKind::Apply(
+                            Box::new(Expr::synth(ExprKind::Var(name.clone()))),
                             rargs,
                             Some((*ret).clone()),
-                        ),
+                        )),
                         (*ret).clone(),
                     ));
                 }
@@ -1267,7 +1271,7 @@ impl<'a> Mono<'a> {
                     // never runs monomorphize, so it keeps using `array_lit`.
                     let suffixed = format!("array_lit${}", array_elem_tag(&elem));
                     let rt = Ty::Named("Array".to_string(), vec![elem]);
-                    return Ok((Expr::Call(suffixed, rargs), rt));
+                    return Ok((Expr::synth(ExprKind::Call(suffixed, rargs)), rt));
                 }
                 // Builtin?  (Identified by NOT being a user function.) Rewrite the
                 // arguments, then compute the result type. For a GENERIC builtin
@@ -1322,7 +1326,7 @@ impl<'a> Mono<'a> {
                             rt = resolve(&rt, &sub);
                         }
                     }
-                    return Ok((Expr::Call(name.clone(), rargs), rt));
+                    return Ok((Expr::synth(ExprKind::Call(name.clone(), rargs)), rt));
                 }
                 let info = self.fns.get(name).cloned().unwrap();
                 let mut sub: HashMap<String, Ty> = HashMap::new();
@@ -1365,32 +1369,32 @@ impl<'a> Mono<'a> {
                     .zip(type_args.iter().cloned())
                     .collect();
                 let rt = self.subst_ty(&info.decl.ret, &callee_map)?;
-                Ok((Expr::Call(target, rargs), rt))
+                Ok((Expr::synth(ExprKind::Call(target, rargs)), rt))
             }
 
-            Expr::Unary(op, inner) => {
+            ExprKind::Unary(op, inner) => {
                 let (ri, it) = self.rewrite_expr(inner, env, tymap, None)?;
-                Ok((Expr::Unary(*op, Box::new(ri)), it))
+                Ok((Expr::synth(ExprKind::Unary(*op, Box::new(ri))), it))
             }
 
-            Expr::Binary(op, l, r) => {
+            ExprKind::Binary(op, l, r) => {
                 let (rl, lt) = self.rewrite_expr(l, env, tymap, None)?;
                 let (rr, _rt) = self.rewrite_expr(r, env, tymap, None)?;
                 let ty = binary_ret(*op, &lt);
-                Ok((Expr::Binary(*op, Box::new(rl), Box::new(rr)), ty))
+                Ok((Expr::synth(ExprKind::Binary(*op, Box::new(rl), Box::new(rr))), ty))
             }
 
-            Expr::If(c, t, e2) => {
+            ExprKind::If(c, t, e2) => {
                 let (rc, _) = self.rewrite_expr(c, env, tymap, None)?;
                 let (rt, tt) = self.rewrite_expr(t, env, tymap, expected)?;
                 // The else branch shares the then branch's concrete type, which
                 // is a stronger expectation than the caller's (it may have been
                 // None).
                 let (re, _) = self.rewrite_expr(e2, env, tymap, Some(&tt))?;
-                Ok((Expr::If(Box::new(rc), Box::new(rt), Box::new(re)), tt))
+                Ok((Expr::synth(ExprKind::If(Box::new(rc), Box::new(rt), Box::new(re))), tt))
             }
 
-            Expr::Match(scrut, arms) => {
+            ExprKind::Match(scrut, arms) => {
                 let (rscrut, scrut_ty) = self.rewrite_expr(scrut, env, tymap, None)?;
                 let mut rarms = Vec::new();
                 let mut result_ty: Option<Ty> = None;
@@ -1409,10 +1413,10 @@ impl<'a> Mono<'a> {
                     });
                 }
                 let rt = result_ty.ok_or("monomorphize: empty match")?;
-                Ok((Expr::Match(Box::new(rscrut), rarms), rt))
+                Ok((Expr::synth(ExprKind::Match(Box::new(rscrut), rarms)), rt))
             }
 
-            Expr::Block(stmts, last) => {
+            ExprKind::Block(stmts, last) => {
                 let mut scope = env.clone();
                 let mut rstmts = Vec::new();
                 for s in stmts {
@@ -1437,10 +1441,10 @@ impl<'a> Mono<'a> {
                     }
                 }
                 let (rlast, lt) = self.rewrite_expr(last, &mut scope, tymap, expected)?;
-                Ok((Expr::Block(rstmts, Box::new(rlast)), lt))
+                Ok((Expr::synth(ExprKind::Block(rstmts, Box::new(rlast))), lt))
             }
 
-            Expr::Lambda(params, body, _) => {
+            ExprKind::Lambda(params, body, _) => {
                 // Concrete parameter types come from the expected `Fn` type when
                 // the lambda flows into a known position (a function argument or a
                 // direct application); otherwise fall back to the (substituted)
@@ -1500,10 +1504,10 @@ impl<'a> Mono<'a> {
                     Box::new(bt.clone()),
                 );
                 let sig = crate::ast::ClosureSig { captures, ret: bt };
-                Ok((Expr::Lambda(rparams, Box::new(rbody), Some(sig)), lam_ty))
+                Ok((Expr::synth(ExprKind::Lambda(rparams, Box::new(rbody), Some(sig))), lam_ty))
             }
 
-            Expr::Apply(callee, args, _) => {
+            ExprKind::Apply(callee, args, _) => {
                 // Rewrite the arguments first so a directly-applied lambda
                 // (`(\x -> ..)(5)`) can take its parameter types from them.
                 let mut rargs = Vec::new();
@@ -1529,7 +1533,7 @@ impl<'a> Mono<'a> {
                     }
                 };
                 Ok((
-                    Expr::Apply(Box::new(rcallee), rargs, Some(ret_ty.clone())),
+                    Expr::synth(ExprKind::Apply(Box::new(rcallee), rargs, Some(ret_ty.clone()))),
                     ret_ty,
                 ))
             }

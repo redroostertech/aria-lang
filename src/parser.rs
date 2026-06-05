@@ -128,6 +128,42 @@ impl Parser {
         self.toks[self.pos].line
     }
 
+    /// The (line, col) START of the current (not-yet-consumed) token — the start
+    /// of whatever node is about to be parsed.
+    fn here(&self) -> (usize, usize) {
+        let t = &self.toks[self.pos];
+        (t.line, t.col)
+    }
+
+    /// The (line, col) END (one past the last char) of the MOST RECENTLY consumed
+    /// token, i.e. `toks[pos-1]`. Used as the end of a node whose last token was
+    /// just consumed. Falls back to the current token's start at position 0.
+    fn prev_end(&self) -> (usize, usize) {
+        if self.pos == 0 {
+            let t = &self.toks[0];
+            (t.line, t.col)
+        } else {
+            let t = &self.toks[self.pos - 1];
+            (t.end_line, t.end_col)
+        }
+    }
+
+    /// Build an `Expr` from a `kind` and a start position captured BEFORE parsing
+    /// began, ending at the most recently consumed token. This is the canonical
+    /// way the parser attaches a precise span to a node.
+    fn spanned(&self, start: (usize, usize), kind: ExprKind) -> Expr {
+        let (el, ec) = self.prev_end();
+        Expr::new(
+            kind,
+            Span {
+                start_line: start.0 as u32,
+                start_col: start.1 as u32,
+                end_line: el as u32,
+                end_col: ec as u32,
+            },
+        )
+    }
+
     fn advance(&mut self) -> Tok {
         let t = self.toks[self.pos].tok.clone();
         if self.pos + 1 < self.toks.len() {
@@ -564,6 +600,8 @@ impl Parser {
         // of overflowing the Rust stack (which would SIGSEGV / exit 134 and break
         // the `--json` "valid JSON or clean error" contract).
         let _guard = self.enter_depth()?;
+        // The left operand's start is the start of the whole binary expression.
+        let start = self.here();
         let mut lhs = self.parse_unary()?;
         loop {
             let (op, lbp, rbp) = match Parser::bin_power(self.peek()) {
@@ -575,20 +613,23 @@ impl Parser {
             }
             self.advance(); // consume operator
             let rhs = self.parse_expr(rbp)?;
-            lhs = Expr::Binary(op, Box::new(lhs), Box::new(rhs));
+            lhs = self.spanned(start, ExprKind::Binary(op, Box::new(lhs), Box::new(rhs)));
         }
         Ok(lhs)
     }
 
     fn parse_unary(&mut self) -> Result<Expr, String> {
+        let start = self.here();
         match self.peek() {
             Tok::Minus => {
                 self.advance();
-                Ok(Expr::Unary(UnOp::Neg, Box::new(self.parse_unary()?)))
+                let inner = self.parse_unary()?;
+                Ok(self.spanned(start, ExprKind::Unary(UnOp::Neg, Box::new(inner))))
             }
             Tok::Bang => {
                 self.advance();
-                Ok(Expr::Unary(UnOp::Not, Box::new(self.parse_unary()?)))
+                let inner = self.parse_unary()?;
+                Ok(self.spanned(start, ExprKind::Unary(UnOp::Not, Box::new(inner))))
             }
             Tok::Backslash => self.parse_lambda(),
             _ => self.parse_postfix(),
@@ -601,6 +642,7 @@ impl Parser {
     // checker to solve from use; the parenthesized form carries explicit
     // annotations. The body extends as far right as possible.
     fn parse_lambda(&mut self) -> Result<Expr, String> {
+        let start = self.here();
         self.expect(&Tok::Backslash)?;
         let mut params = Vec::new();
         if *self.peek() == Tok::LParen {
@@ -627,7 +669,7 @@ impl Parser {
         }
         self.expect(&Tok::Arrow)?;
         let body = self.parse_expr(0)?;
-        Ok(Expr::Lambda(params, Box::new(body), None))
+        Ok(self.spanned(start, ExprKind::Lambda(params, Box::new(body), None)))
     }
 
     // Parse an atom, then any trailing `(args)` applications. A trailing call on
@@ -635,6 +677,7 @@ impl Parser {
     // any other callee (a lambda, a parenthesized expression, or a further
     // application) becomes `Expr::Apply`.
     fn parse_postfix(&mut self) -> Result<Expr, String> {
+        let start = self.here();
         let mut e = self.parse_atom()?;
         // `parse_atom` already consumes the first `(args)` for `name(args)`
         // (yielding a by-name Call/Ctor). Any further `(args)` here — or an
@@ -645,18 +688,18 @@ impl Parser {
             match self.peek() {
                 Tok::LParen => {
                     let args = self.parse_args()?;
-                    e = Expr::Apply(Box::new(e), args, None);
+                    e = self.spanned(start, ExprKind::Apply(Box::new(e), args, None));
                 }
                 Tok::LBracket => {
                     self.advance(); // `[`
                     let idx = self.parse_sub_expr(0)?;
                     self.expect(&Tok::RBracket)?;
-                    e = Expr::Call("array_get".to_string(), vec![e, idx]);
+                    e = self.spanned(start, ExprKind::Call("array_get".to_string(), vec![e, idx]));
                 }
                 Tok::Dot => {
                     self.advance(); // `.`
                     let field = self.expect_ident()?;
-                    e = Expr::Field(Box::new(e), field);
+                    e = self.spanned(start, ExprKind::Field(Box::new(e), field));
                 }
                 _ => break,
             }
@@ -691,7 +734,7 @@ impl Parser {
 
     /// `Name { field: expr, ... }` — a record literal. The leading `Name` and the
     /// opening `{` have already been recognized by `parse_atom`.
-    fn parse_record_literal(&mut self, name: String) -> Result<Expr, String> {
+    fn parse_record_literal(&mut self, name: String, start: (usize, usize)) -> Result<Expr, String> {
         self.expect(&Tok::LBrace)?;
         let mut fields = Vec::new();
         if *self.peek() != Tok::RBrace {
@@ -708,30 +751,31 @@ impl Parser {
             }
         }
         self.expect(&Tok::RBrace)?;
-        Ok(Expr::Record(name, fields))
+        Ok(self.spanned(start, ExprKind::Record(name, fields)))
     }
 
     fn parse_atom(&mut self) -> Result<Expr, String> {
+        let start = self.here();
         match self.peek().clone() {
             Tok::Int(v) => {
                 self.advance();
-                Ok(Expr::Int(v))
+                Ok(self.spanned(start, ExprKind::Int(v)))
             }
             Tok::Float(v) => {
                 self.advance();
-                Ok(Expr::Float(v))
+                Ok(self.spanned(start, ExprKind::Float(v)))
             }
             Tok::Str(s) => {
                 self.advance();
-                Ok(Expr::Str(s))
+                Ok(self.spanned(start, ExprKind::Str(s)))
             }
             Tok::True => {
                 self.advance();
-                Ok(Expr::Bool(true))
+                Ok(self.spanned(start, ExprKind::Bool(true)))
             }
             Tok::False => {
                 self.advance();
-                Ok(Expr::Bool(false))
+                Ok(self.spanned(start, ExprKind::Bool(false)))
             }
             Tok::If => self.parse_if(),
             Tok::Match => self.parse_match(),
@@ -755,7 +799,7 @@ impl Parser {
                     }
                 }
                 self.expect(&Tok::RBracket)?;
-                Ok(Expr::Call("array_lit".to_string(), elems))
+                Ok(self.spanned(start, ExprKind::Call("array_lit".to_string(), elems)))
             }
             Tok::LParen => {
                 self.advance();
@@ -763,7 +807,7 @@ impl Parser {
                 // (the synthetic `$TupleN` constructor).
                 if *self.peek() == Tok::RParen {
                     self.advance();
-                    return Ok(Expr::Unit);
+                    return Ok(self.spanned(start, ExprKind::Unit));
                 }
                 let mut elems = vec![self.parse_sub_expr(0)?];
                 while *self.peek() == Tok::Comma {
@@ -772,10 +816,14 @@ impl Parser {
                 }
                 self.expect(&Tok::RParen)?;
                 if elems.len() == 1 {
+                    // A parenthesized single expression keeps its OWN span (the
+                    // inner node), not the paren extent — the parens are pure
+                    // grouping with no node of their own.
                     Ok(elems.into_iter().next().unwrap())
                 } else {
                     let n = elems.len();
-                    Ok(Expr::Ctor(self.tuple_name(n), elems))
+                    let tname = self.tuple_name(n);
+                    Ok(self.spanned(start, ExprKind::Ctor(tname, elems)))
                 }
             }
             Tok::Ident(name) => {
@@ -786,20 +834,20 @@ impl Parser {
                     && *self.peek() == Tok::LBrace
                     && !self.no_record_literal
                 {
-                    return self.parse_record_literal(name);
+                    return self.parse_record_literal(name, start);
                 }
                 let has_args = *self.peek() == Tok::LParen;
                 if has_args {
                     let args = self.parse_args()?;
                     if is_upper(&name) {
-                        Ok(Expr::Ctor(name, args))
+                        Ok(self.spanned(start, ExprKind::Ctor(name, args)))
                     } else {
-                        Ok(Expr::Call(name, args))
+                        Ok(self.spanned(start, ExprKind::Call(name, args)))
                     }
                 } else if is_upper(&name) {
-                    Ok(Expr::Ctor(name, Vec::new()))
+                    Ok(self.spanned(start, ExprKind::Ctor(name, Vec::new())))
                 } else {
-                    Ok(Expr::Var(name))
+                    Ok(self.spanned(start, ExprKind::Var(name)))
                 }
             }
             other => Err(format!(
@@ -831,15 +879,17 @@ impl Parser {
     }
 
     fn parse_if(&mut self) -> Result<Expr, String> {
+        let start = self.here();
         self.expect(&Tok::If)?;
         let cond = self.parse_head_expr()?;
         let then = self.parse_block()?;
         self.expect(&Tok::Else)?;
         let els = self.parse_block()?;
-        Ok(Expr::If(Box::new(cond), Box::new(then), Box::new(els)))
+        Ok(self.spanned(start, ExprKind::If(Box::new(cond), Box::new(then), Box::new(els))))
     }
 
     fn parse_match(&mut self) -> Result<Expr, String> {
+        let start = self.here();
         self.expect(&Tok::Match)?;
         let scrut = self.parse_head_expr()?;
         self.expect(&Tok::LBrace)?;
@@ -861,7 +911,7 @@ impl Parser {
         if arms.is_empty() {
             return Err(format!("line {}: match needs at least one arm", self.line()));
         }
-        Ok(Expr::Match(Box::new(scrut), arms))
+        Ok(self.spanned(start, ExprKind::Match(Box::new(scrut), arms)))
     }
 
     fn parse_pattern(&mut self) -> Result<Pattern, String> {
@@ -952,22 +1002,25 @@ impl Parser {
     }
 
     fn parse_block(&mut self) -> Result<Expr, String> {
+        // The block's span starts at its opening `{`.
+        let start = self.here();
         self.expect(&Tok::LBrace)?;
         // Inside a block, record literals are allowed again (an `if`/`match` head
         // suppressed them only up to its block).
         let saved_no_rec = self.no_record_literal;
         self.no_record_literal = false;
-        let result = self.parse_block_body();
+        let result = self.parse_block_body(start);
         self.no_record_literal = saved_no_rec;
         result
     }
 
-    fn parse_block_body(&mut self) -> Result<Expr, String> {
+    fn parse_block_body(&mut self, start: (usize, usize)) -> Result<Expr, String> {
         let mut stmts = Vec::new();
-        // Empty block evaluates to Unit.
+        // Empty block evaluates to Unit. The synthesized `Unit` result has no
+        // source token, so it carries the no-location sentinel span.
         if *self.peek() == Tok::RBrace {
             self.advance();
-            return Ok(Expr::Block(stmts, Box::new(Expr::Unit)));
+            return Ok(self.spanned(start, ExprKind::Block(stmts, Box::new(Expr::synth(ExprKind::Unit)))));
         }
         // Functional record update `{ base | field = expr, ... }`: if the block
         // does not start with `let`, parse the first expression; a following `|`
@@ -976,7 +1029,9 @@ impl Parser {
         if *self.peek() != Tok::Let {
             let first = self.parse_expr(0)?;
             if *self.peek() == Tok::Pipe {
-                return self.parse_update_tail(first);
+                // The update spans the base through `}`; its start is the base's.
+                let base_start = (first.span.start_line as usize, first.span.start_col as usize);
+                return self.parse_update_tail(first, base_start);
             }
             // Not an update: `first` is a statement (`;`) or the block result.
             if *self.peek() == Tok::Semi {
@@ -984,11 +1039,11 @@ impl Parser {
                 stmts.push(Stmt::Expr(first));
                 if *self.peek() == Tok::RBrace {
                     self.advance();
-                    return Ok(Expr::Block(stmts, Box::new(Expr::Unit)));
+                    return Ok(self.spanned(start, ExprKind::Block(stmts, Box::new(Expr::synth(ExprKind::Unit)))));
                 }
             } else {
                 self.expect(&Tok::RBrace)?;
-                return Ok(Expr::Block(stmts, Box::new(first)));
+                return Ok(self.spanned(start, ExprKind::Block(stmts, Box::new(first))));
             }
         }
         let final_expr;
@@ -1013,28 +1068,29 @@ impl Parser {
                 self.advance();
                 stmts.push(Stmt::Expr(e));
                 if *self.peek() == Tok::RBrace {
-                    // trailing `;` then close: result is Unit.
-                    final_expr = Expr::Unit;
+                    // trailing `;` then close: result is Unit (synthesized, no span).
+                    final_expr = Expr::synth(ExprKind::Unit);
                     break;
                 }
                 continue;
             } else if *self.peek() == Tok::Pipe {
                 // `{ stmts...; base | f = v, ... }` — the block result is an update.
-                let upd = self.parse_update_tail(e)?;
-                return Ok(Expr::Block(stmts, Box::new(upd)));
+                let base_start = (e.span.start_line as usize, e.span.start_col as usize);
+                let upd = self.parse_update_tail(e, base_start)?;
+                return Ok(self.spanned(start, ExprKind::Block(stmts, Box::new(upd))));
             } else {
                 final_expr = e;
                 break;
             }
         }
         self.expect(&Tok::RBrace)?;
-        Ok(Expr::Block(stmts, Box::new(final_expr)))
+        Ok(self.spanned(start, ExprKind::Block(stmts, Box::new(final_expr))))
     }
 
     /// Parse the tail of a functional update `| field = expr, ... }` given the
     /// already-parsed `base`. The leading `|` is the next token; consumes through
-    /// the closing `}`.
-    fn parse_update_tail(&mut self, base: Expr) -> Result<Expr, String> {
+    /// the closing `}`. `start` is the position the whole update expression began.
+    fn parse_update_tail(&mut self, base: Expr, start: (usize, usize)) -> Result<Expr, String> {
         self.expect(&Tok::Pipe)?;
         let mut updates = Vec::new();
         loop {
@@ -1049,7 +1105,7 @@ impl Parser {
             }
         }
         self.expect(&Tok::RBrace)?;
-        Ok(Expr::Update(Box::new(base), updates))
+        Ok(self.spanned(start, ExprKind::Update(Box::new(base), updates)))
     }
 }
 

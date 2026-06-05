@@ -28,7 +28,7 @@
 //! a bare function-name reference as a use). Constructor applications are not part
 //! of the call graph (they are data, not control flow).
 
-use crate::ast::{Expr, Item, Program, Stmt};
+use crate::ast::{Expr, ExprKind, Item, Program, Stmt};
 use crate::diagnostics::json_escape;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -57,6 +57,14 @@ pub struct FnInfo {
     pub fan_in: usize,
     /// Number of `callees` (distinct user functions this one calls).
     pub fan_out: usize,
+    /// Precise CALL-SITE locations of every edge OUT of this function: for each
+    /// callee NAME (user, library, or builtin) that this function calls, the
+    /// sorted, de-duplicated list of `(line, col)` positions where the call
+    /// appears in this function's body. A source-located call graph: a consumer
+    /// can jump to the exact `callee(..)` rather than only knowing that the edge
+    /// exists. Synthesized calls (no source span) contribute no site. Keyed by
+    /// callee name, sorted for stable output.
+    pub call_sites: Vec<(String, Vec<(u32, u32)>)>,
 }
 
 /// Whole-program call-graph analysis.
@@ -108,14 +116,20 @@ pub fn analyze(program: &Program, prelude_names: &HashSet<String>) -> CallGraph 
         }
     }
 
-    // Compute callees per function by walking its body for `Expr::Call` names and
-    // bare function-name `Expr::Var` references (a function used as a value).
+    // Compute callees per function by walking its body for `ExprKind::Call`
+    // names and bare function-name `ExprKind::Var` references (a function used as
+    // a value). Alongside the names, collect each call's precise SOURCE SITE so
+    // the graph is source-located (every edge knows the `(line, col)` it occurs
+    // at). Keyed by caller, then by callee name.
     let mut callees_user: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut callees_lib: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut call_sites: BTreeMap<String, BTreeMap<String, BTreeSet<(u32, u32)>>> = BTreeMap::new();
     for item in &program.items {
         if let Item::Fn(f) = item {
             let mut names: BTreeSet<String> = BTreeSet::new();
             collect_call_names(&f.body, &mut names);
+            let sites = call_sites.entry(f.name.clone()).or_default();
+            collect_call_sites(&f.body, sites);
             let u = callees_user.entry(f.name.clone()).or_default();
             let l = callees_lib.entry(f.name.clone()).or_default();
             for n in names {
@@ -154,6 +168,22 @@ pub fn analyze(program: &Program, prelude_names: &HashSet<String>) -> CallGraph 
         let fn_callers: Vec<String> =
             callers.get(name).into_iter().flatten().cloned().collect();
         let recursive = user_callees.iter().any(|c| c == name);
+        // Flatten this function's per-callee call sites into a sorted list,
+        // keeping ONLY real edges: a callee that is a known function node (user
+        // or library) or a builtin. A bare local-variable `Var` reference (a
+        // param/`let`, e.g. `x`) is not a call and is filtered out — mirroring
+        // how the name-based edge computation ignores non-function names.
+        let fn_call_sites: Vec<(String, Vec<(u32, u32)>)> = call_sites
+            .get(name)
+            .into_iter()
+            .flatten()
+            .filter(|(callee, _)| {
+                decls.contains_key(callee.as_str())
+                    || builtin.contains(callee.as_str())
+                    || callee.as_str() == "grad"
+            })
+            .map(|(callee, sites)| (callee.clone(), sites.iter().copied().collect()))
+            .collect();
         functions.push(FnInfo {
             name: name.clone(),
             line,
@@ -164,6 +194,7 @@ pub fn analyze(program: &Program, prelude_names: &HashSet<String>) -> CallGraph 
             callees: user_callees,
             lib_callees,
             callers: fn_callers,
+            call_sites: fn_call_sites,
         });
     }
 
@@ -201,8 +232,8 @@ pub fn analyze(program: &Program, prelude_names: &HashSet<String>) -> CallGraph 
 /// reference (an `Expr::Var` used as a value) into `out`. Constructor applications
 /// (`Expr::Ctor`) are data, not control flow, and are deliberately skipped.
 fn collect_call_names(e: &Expr, out: &mut BTreeSet<String>) {
-    match e {
-        Expr::Call(name, args) => {
+    match &e.kind {
+        ExprKind::Call(name, args) => {
             out.insert(name.clone());
             for a in args {
                 collect_call_names(a, out);
@@ -212,50 +243,50 @@ fn collect_call_names(e: &Expr, out: &mut BTreeSet<String>) {
         // top-level function used as a value (`array_map(xs, helper)`). We record
         // every `Var` name; the caller filters by which names are actual function
         // nodes, so a plain variable reference simply finds no node and is ignored.
-        Expr::Var(name) => {
+        ExprKind::Var(name) => {
             out.insert(name.clone());
         }
-        Expr::Ctor(_, args) => {
+        ExprKind::Ctor(_, args) => {
             for a in args {
                 collect_call_names(a, out);
             }
         }
-        Expr::Record(_, fields) => {
+        ExprKind::Record(_, fields) => {
             for (_, v) in fields {
                 collect_call_names(v, out);
             }
         }
-        Expr::Field(obj, _) => collect_call_names(obj, out),
-        Expr::Update(base, updates) => {
+        ExprKind::Field(obj, _) => collect_call_names(obj, out),
+        ExprKind::Update(base, updates) => {
             collect_call_names(base, out);
             for (_, v) in updates {
                 collect_call_names(v, out);
             }
         }
-        Expr::Lambda(_, body, _) => collect_call_names(body, out),
-        Expr::Apply(callee, args, _) => {
+        ExprKind::Lambda(_, body, _) => collect_call_names(body, out),
+        ExprKind::Apply(callee, args, _) => {
             collect_call_names(callee, out);
             for a in args {
                 collect_call_names(a, out);
             }
         }
-        Expr::Unary(_, inner) => collect_call_names(inner, out),
-        Expr::Binary(_, lhs, rhs) => {
+        ExprKind::Unary(_, inner) => collect_call_names(inner, out),
+        ExprKind::Binary(_, lhs, rhs) => {
             collect_call_names(lhs, out);
             collect_call_names(rhs, out);
         }
-        Expr::If(c, t, e2) => {
+        ExprKind::If(c, t, e2) => {
             collect_call_names(c, out);
             collect_call_names(t, out);
             collect_call_names(e2, out);
         }
-        Expr::Match(scrut, arms) => {
+        ExprKind::Match(scrut, arms) => {
             collect_call_names(scrut, out);
             for arm in arms {
                 collect_call_names(&arm.body, out);
             }
         }
-        Expr::Block(stmts, last) => {
+        ExprKind::Block(stmts, last) => {
             for s in stmts {
                 match s {
                     Stmt::Let(_, _, v) => collect_call_names(v, out),
@@ -264,7 +295,84 @@ fn collect_call_names(e: &Expr, out: &mut BTreeSet<String>) {
             }
             collect_call_names(last, out);
         }
-        Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Unit => {}
+        ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Str(_) | ExprKind::Unit => {}
+    }
+}
+
+/// Walk `e`, recording the precise SOURCE SITE (`(line, col)` start of the call
+/// expression) of every call by callee NAME, into `out` (keyed by callee). This
+/// mirrors [`collect_call_names`] but keeps each call's location so the graph is
+/// source-located. A `Call` records the `Call` expression's span; a bare
+/// function-name `Var` records the `Var`'s span. Synthesized nodes (no span)
+/// contribute nothing. The caller filters which names are real graph nodes.
+fn collect_call_sites(e: &Expr, out: &mut BTreeMap<String, BTreeSet<(u32, u32)>>) {
+    let note = |name: &str, span: crate::ast::Span, out: &mut BTreeMap<String, BTreeSet<(u32, u32)>>| {
+        if !span.is_none() {
+            out.entry(name.to_string())
+                .or_default()
+                .insert((span.start_line, span.start_col));
+        }
+    };
+    match &e.kind {
+        ExprKind::Call(name, args) => {
+            note(name, e.span, out);
+            for a in args {
+                collect_call_sites(a, out);
+            }
+        }
+        ExprKind::Var(name) => {
+            note(name, e.span, out);
+        }
+        ExprKind::Ctor(_, args) => {
+            for a in args {
+                collect_call_sites(a, out);
+            }
+        }
+        ExprKind::Record(_, fields) => {
+            for (_, v) in fields {
+                collect_call_sites(v, out);
+            }
+        }
+        ExprKind::Field(obj, _) => collect_call_sites(obj, out),
+        ExprKind::Update(base, updates) => {
+            collect_call_sites(base, out);
+            for (_, v) in updates {
+                collect_call_sites(v, out);
+            }
+        }
+        ExprKind::Lambda(_, body, _) => collect_call_sites(body, out),
+        ExprKind::Apply(callee, args, _) => {
+            collect_call_sites(callee, out);
+            for a in args {
+                collect_call_sites(a, out);
+            }
+        }
+        ExprKind::Unary(_, inner) => collect_call_sites(inner, out),
+        ExprKind::Binary(_, lhs, rhs) => {
+            collect_call_sites(lhs, out);
+            collect_call_sites(rhs, out);
+        }
+        ExprKind::If(c, t, e2) => {
+            collect_call_sites(c, out);
+            collect_call_sites(t, out);
+            collect_call_sites(e2, out);
+        }
+        ExprKind::Match(scrut, arms) => {
+            collect_call_sites(scrut, out);
+            for arm in arms {
+                collect_call_sites(&arm.body, out);
+            }
+        }
+        ExprKind::Block(stmts, last) => {
+            for s in stmts {
+                match s {
+                    Stmt::Let(_, _, v) => collect_call_sites(v, out),
+                    Stmt::Expr(ex) => collect_call_sites(ex, out),
+                }
+            }
+            collect_call_sites(last, out);
+        }
+        ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Str(_) | ExprKind::Unit => {}
     }
 }
 
@@ -420,7 +528,7 @@ impl CallGraph {
                 s.push(',');
             }
             s.push_str(&format!(
-                "{{\"name\":\"{}\",\"line\":{},\"user\":{},\"callees\":{},\"lib_callees\":{},\"callers\":{},\"recursive\":{},\"fan_in\":{},\"fan_out\":{}}}",
+                "{{\"name\":\"{}\",\"line\":{},\"user\":{},\"callees\":{},\"lib_callees\":{},\"callers\":{},\"recursive\":{},\"fan_in\":{},\"fan_out\":{},\"call_sites\":{}}}",
                 json_escape(&f.name),
                 f.line,
                 f.user,
@@ -430,6 +538,7 @@ impl CallGraph {
                 f.recursive,
                 f.fan_in,
                 f.fan_out,
+                call_sites_json(&f.call_sites),
             ));
         }
         s.push(']');
@@ -515,6 +624,29 @@ fn str_array_json(xs: &[String]) -> String {
         s.push_str(&format!("\"{}\"", json_escape(x)));
     }
     s.push(']');
+    s
+}
+
+/// JSON-encode a function's call sites as an object keyed by callee name, each
+/// value an array of `[line, col]` pairs (the precise positions that callee is
+/// called from in this function), e.g. `{"helper":[[3,5],[4,9]]}`. Empty `{}`
+/// when the function makes no located calls.
+fn call_sites_json(sites: &[(String, Vec<(u32, u32)>)]) -> String {
+    let mut s = String::from("{");
+    for (i, (callee, locs)) in sites.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(&format!("\"{}\":[", json_escape(callee)));
+        for (j, (line, col)) in locs.iter().enumerate() {
+            if j > 0 {
+                s.push(',');
+            }
+            s.push_str(&format!("[{},{}]", line, col));
+        }
+        s.push(']');
+    }
+    s.push('}');
     s
 }
 
@@ -671,10 +803,42 @@ fn main() -> Int = helper()
         assert!(json.contains("\"entry\":\"main\""));
         assert!(json.contains("\"unused\":[\"unused\"]"));
         assert!(json.contains("\"name\":\"helper\""));
+        // Each function carries a `call_sites` object; `main` calls `helper` at a
+        // precise `[line, col]` (line 3). The empty-call function reports `{}`.
+        assert!(json.contains("\"call_sites\":"));
+        assert!(json.contains("\"call_sites\":{\"helper\":[[3,"), "got {}", json);
         // Roundtrip-ish: balanced braces/brackets.
         let braces = json.chars().filter(|&c| c == '{').count();
         let close = json.chars().filter(|&c| c == '}').count();
         assert_eq!(braces, close, "balanced braces in {}", json);
+    }
+
+    #[test]
+    fn call_sites_record_precise_locations_and_filter_locals() {
+        // Each edge OUT of a function carries the precise `(line, col)` it occurs
+        // at; a bare local-variable reference (`x`) is NOT an edge and must not
+        // appear among the call sites.
+        let src = "\
+fn helper(x: Int) -> Int = x + 1
+fn main() -> Int = helper(1) + helper(2)
+";
+        let g = graph_of(src);
+        let m = info(&g, "main");
+        let sites: &Vec<(u32, u32)> = &m
+            .call_sites
+            .iter()
+            .find(|(c, _)| c == "helper")
+            .expect("helper edge has call sites")
+            .1;
+        // Two calls to `helper` on line 2, at the two precise columns.
+        assert_eq!(sites, &vec![(2, 20), (2, 32)], "precise call sites of helper");
+        // `helper` itself only references its param `x`, which is not a call edge.
+        let h = info(&g, "helper");
+        assert!(
+            h.call_sites.is_empty(),
+            "local var `x` must not be a call site: {:?}",
+            h.call_sites
+        );
     }
 
     #[test]

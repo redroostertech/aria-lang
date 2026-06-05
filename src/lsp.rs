@@ -261,10 +261,16 @@ pub fn publish_diagnostics_notification(uri: &str, diags: &[Diagnostic], text: &
 
 /// Map one Aria [`Diagnostic`] to an LSP `Diagnostic` JSON object.
 ///
-/// - `range` is a WHOLE-LINE range (the compiler tracks line, not column, for
-///   most errors): `{start:{line:L0,character:0}, end:{line:L0,character:BIG}}`.
-/// - `L0` = `(diagnostic.line - 1)` clamped to `>= 0`, and clamped `<= last_line`
-///   so it can never point past the user's document. A `null` line maps to 0.
+/// - When the diagnostic carries a PRECISE expression span (both `line` and
+///   `col`, from the type/shape checker), the `range` is the EXACT extent of the
+///   offending sub-expression: `{start:{line,character}, end:{line,character}}`,
+///   converted to LSP's 0-based coordinates (`line-1`, `col-1`). The end uses
+///   the diagnostic's end position when present, else a one-character span.
+/// - Otherwise (only a `line` is known, e.g. a lex/parse error, or no location)
+///   the `range` falls back to the WHOLE LINE
+///   (`character 0 .. BIG`, which editors clamp to the line length).
+/// - All lines are clamped into `[0, last_line]` so the range can never point
+///   past the user's document. A `null` line maps to line 0.
 /// - `severity` = 1 (Error). `source` = "aria". `code` = the Aria code.
 fn lsp_diagnostic_json(d: &Diagnostic, last_line: usize) -> String {
     // LSP lines are 0-based; Aria lines are 1-based (or None → line 0).
@@ -273,12 +279,31 @@ fn lsp_diagnostic_json(d: &Diagnostic, last_line: usize) -> String {
         None => 0,
     };
     let l0 = l0.min(last_line);
-    // A large end-character marks the whole line (editors clamp to line length).
     const EOL: u32 = 1_000_000;
+    let (start_char, end_line, end_char) = match d.col {
+        // Precise span: column known → an exact range. Convert to 0-based.
+        Some(c) => {
+            let sc = (c.saturating_sub(1)) as u32;
+            // End position: the span's end if known, else one char past start.
+            let el = match d.end_line {
+                Some(n) => n.saturating_sub(1).min(last_line),
+                None => l0,
+            };
+            let ec = match d.end_col {
+                Some(n) => (n.saturating_sub(1)) as u32,
+                None => sc + 1,
+            };
+            (sc, el, ec)
+        }
+        // No column: fall back to the whole-line range.
+        None => (0, l0, EOL),
+    };
     format!(
-        r#"{{"range":{{"start":{{"line":{l},"character":0}},"end":{{"line":{l},"character":{eol}}}}},"severity":1,"source":"aria","code":"{code}","message":"{msg}"}}"#,
-        l = l0,
-        eol = EOL,
+        r#"{{"range":{{"start":{{"line":{sl},"character":{sc}}},"end":{{"line":{el},"character":{ec}}}}},"severity":1,"source":"aria","code":"{code}","message":"{msg}"}}"#,
+        sl = l0,
+        sc = start_char,
+        el = end_line,
+        ec = end_char,
         code = d.code,
         msg = json_escape(&d.message),
     )
@@ -862,6 +887,50 @@ fn main() -> Int = code(Blue)
         assert!(text.contains(r#""diagnostics":[]"#), "didChange should clear: {}", text);
         // shutdown returns null.
         assert!(text.contains(r#""id":2,"result":null"#), "{}", text);
+    }
+
+    #[test]
+    fn precise_expression_error_publishes_exact_range_not_whole_line() {
+        // A type error mid-expression (`1 + true`) now carries a precise span, so
+        // the LSP must emit an EXACT range (line:char start..end) rather than the
+        // whole-line `character:0 .. 1000000` fallback. `1 + true` sits at columns
+        // 17..25 on line 1, i.e. 0-based LSP `line:0, char:16 .. 24`.
+        let mut input = Vec::new();
+        let push = |buf: &mut Vec<u8>, body: &str| {
+            write_message(buf, body).unwrap();
+        };
+        push(&mut input, r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#);
+        push(
+            &mut input,
+            r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///p.aria","text":"fn f() -> Int = 1 + true\nfn main() -> Int = f()"}}}"#,
+        );
+        push(&mut input, r#"{"jsonrpc":"2.0","id":2,"method":"shutdown"}"#);
+        push(&mut input, r#"{"jsonrpc":"2.0","method":"exit"}"#);
+
+        let mut reader = std::io::Cursor::new(input);
+        let mut out: Vec<u8> = Vec::new();
+        let code = serve(&mut reader, &mut out);
+        assert_eq!(code, 0);
+        let text = String::from_utf8(out).unwrap();
+        // The published diagnostic carries the EXACT range, not a whole-line one.
+        assert!(
+            text.contains(r#""range":{"start":{"line":0,"character":16},"end":{"line":0,"character":24}}"#),
+            "expected an exact range, got: {}",
+            text
+        );
+        // And it is NOT the whole-line fallback (the big sentinel end character).
+        assert!(!text.contains("1000000"), "should not be a whole-line range: {}", text);
+        assert!(text.contains(r#""code":"E0201""#), "{}", text);
+    }
+
+    #[test]
+    fn parse_error_still_falls_back_to_whole_line_range() {
+        // A lex/parse error knows only a line (no column), so the LSP keeps the
+        // whole-line range. (`@` is an unexpected character on line 1.)
+        let d = Diagnostic::error("lex", "line 1: unexpected character `@`".into());
+        let js = lsp_diagnostic_json(&d, 10);
+        assert!(js.contains(r#""start":{"line":0,"character":0}"#), "{}", js);
+        assert!(js.contains("1000000"), "whole-line fallback expected: {}", js);
     }
 
     #[test]

@@ -136,14 +136,72 @@ struct Checker {
     // writes back into the AST so the compiled backends can type unannotated
     // lambdas (e.g. `let f = \x -> ..`). Cleared per function.
     lam_vars: RefCell<Vec<(String, Ty)>>,
+    /// The precise source span of the INNERMOST expression that produced the
+    /// current per-function error, captured by `synth`/`check` so a structured
+    /// diagnostic can point at the exact sub-expression rather than the
+    /// function's definition line. Set on the FIRST error to surface (the
+    /// deepest failing node sets it before any enclosing node), and cleared
+    /// before each function body is checked. `None` (or a [`Span::none`] node)
+    /// leaves the diagnostic's `col` unset.
+    err_span: RefCell<Option<Span>>,
+}
+
+/// An error accumulator that records each message alongside an OPTIONAL precise
+/// source span. Most checker errors are declaration-level and carry no span
+/// (`push`); a body-level type error carries the span of the offending
+/// sub-expression (`push_at`). `check` discards the spans (string-only public
+/// API); `check_collect` keeps them for the structured `--json` path.
+#[derive(Default)]
+struct Errors {
+    msgs: Vec<String>,
+    spans: Vec<Option<Span>>,
+}
+
+impl Errors {
+    /// Record a message with no precise location (declaration-level error).
+    fn push(&mut self, m: String) {
+        self.msgs.push(m);
+        self.spans.push(None);
+    }
+
+    /// Record a message located at `span` (a body-level expression error). The
+    /// no-location sentinel maps to `None` so the diagnostic's `col` stays unset.
+    fn push_at(&mut self, m: String, span: Option<Span>) {
+        self.msgs.push(m);
+        self.spans.push(span.filter(|s| !s.is_none()));
+    }
+
+    /// Append plain (location-less) messages, e.g. tensor-shape diagnostics.
+    fn extend_plain(&mut self, it: impl IntoIterator<Item = String>) {
+        for m in it {
+            self.push(m);
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.msgs.is_empty()
+    }
 }
 
 /// Type-check a whole program. Returns every error found, not just the first.
+/// The string messages are the single source of truth shared with the
+/// structured (`--json`) path via [`check_collect`].
 pub fn check(program: &Program) -> Result<(), Vec<String>> {
+    match check_collect(program) {
+        e if e.is_empty() => Ok(()),
+        e => Err(e.msgs),
+    }
+}
+
+/// The core checker: returns the [`Errors`] accumulator (messages + optional
+/// precise spans). Both the string-only [`check`] and the structured
+/// [`check_structured`] are thin wrappers over this, so their messages are
+/// byte-for-byte identical.
+fn check_collect(program: &Program) -> Errors {
     let mut fns: HashMap<String, FnSig> = HashMap::new();
     let mut ctors: HashMap<String, CtorSig> = HashMap::new();
     let mut types: HashMap<String, (Vec<String>, Vec<String>)> = HashMap::new();
-    let mut errors: Vec<String> = Vec::new();
+    let mut errors = Errors::default();
 
     // Pass 1: gather declarations.
     for item in &program.items {
@@ -209,7 +267,7 @@ pub fn check(program: &Program) -> Result<(), Vec<String>> {
         t: &Ty,
         types: &HashMap<String, (Vec<String>, Vec<String>)>,
         params: &[String],
-        errs: &mut Vec<String>,
+        errs: &mut Errors,
         ctx: &str,
     ) {
         match t {
@@ -385,6 +443,7 @@ pub fn check(program: &Program) -> Result<(), Vec<String>> {
         subst: RefCell::new(HashMap::new()),
         counter: RefCell::new(0),
         lam_vars: RefCell::new(Vec::new()),
+        err_span: RefCell::new(None),
     };
 
     // Pass 3: check each function body against its declared return type. Each
@@ -410,19 +469,32 @@ pub fn check(program: &Program) -> Result<(), Vec<String>> {
             for p in &f.params {
                 scope[0].insert(p.name.clone(), p.ty.clone());
             }
+            // Clear the per-function error-span tracker; `synth`/`check` fill it
+            // with the innermost offending sub-expression's span on error, so the
+            // resulting diagnostic can point at the EXACT call site / operand
+            // rather than the function's definition line.
+            *checker.err_span.borrow_mut() = None;
             match checker.synth(&f.body, &mut scope) {
                 Ok(t) => {
                     if let Err(e) = checker.unify(&t, &f.ret) {
-                        errors.push(format!(
-                            "function `{}`: body has type {} but return type is {} ({})",
-                            f.name,
-                            show(&checker.resolve(&t)),
-                            show(&checker.resolve(&f.ret)),
-                            e
-                        ));
+                        // A whole-body return-type mismatch is located at the
+                        // body's span (the function's result expression).
+                        errors.push_at(
+                            format!(
+                                "function `{}`: body has type {} but return type is {} ({})",
+                                f.name,
+                                show(&checker.resolve(&t)),
+                                show(&checker.resolve(&f.ret)),
+                                e
+                            ),
+                            Some(f.body.span),
+                        );
                     }
                 }
-                Err(e) => errors.push(format!("function `{}`: {}", f.name, e)),
+                Err(e) => {
+                    let span = *checker.err_span.borrow();
+                    errors.push_at(format!("function `{}`: {}", f.name, e), span);
+                }
             }
         }
     }
@@ -481,14 +553,10 @@ pub fn check(program: &Program) -> Result<(), Vec<String>> {
     // it rejects a program only when statically-known tensor dimensions provably
     // do not line up (see `shape::check_program`).
     if errors.is_empty() {
-        errors.extend(crate::shape::check_program(program));
+        errors.extend_plain(crate::shape::check_program(program));
     }
 
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(errors)
-    }
+    errors
 }
 
 /// Structured type/shape/purity/exhaustiveness checking for `aria check --json`.
@@ -500,16 +568,24 @@ pub fn check(program: &Program) -> Result<(), Vec<String>> {
 /// so consumers see a precise phase + a stable code. A clean program yields an
 /// empty vector.
 pub fn check_structured(program: &Program) -> Vec<crate::diagnostics::Diagnostic> {
-    match check(program) {
-        Ok(()) => Vec::new(),
-        Err(errors) => errors
-            .into_iter()
-            .map(|msg| {
-                let phase = phase_of_type_error(&msg);
-                crate::diagnostics::Diagnostic::error(phase, msg)
-            })
-            .collect(),
-    }
+    let errors = check_collect(program);
+    errors
+        .msgs
+        .into_iter()
+        .zip(errors.spans)
+        .map(|(msg, span)| {
+            let phase = phase_of_type_error(&msg);
+            let mut d = crate::diagnostics::Diagnostic::error(phase, msg);
+            // Attach the precise expression location when the checker knew it.
+            // The `error` constructor already extracted any `line N:` prefix; a
+            // real expression span supersedes it with both LINE and COLUMN (and
+            // an end position) pointing at the exact sub-expression.
+            if let Some(s) = span {
+                d.set_span(s);
+            }
+            d
+        })
+        .collect()
 }
 
 /// Route one message from `typeck::check`'s flat error list to the phase that
@@ -544,7 +620,7 @@ fn is_shape_message(m: &str) -> bool {
 /// type even for a bare `let f = \x -> ..` whose parameter type only the
 /// surrounding context fixes. Best-effort: it assumes the program already
 /// type-checked (callers run `check` first), re-runs body inference solely to
-/// resolve each lambda placeholder, and rewrites `Expr::Lambda` parameter
+/// resolve each lambda placeholder, and rewrites `ExprKind::Lambda` parameter
 /// annotations in place. Anything it cannot resolve is left untouched.
 pub fn annotate_lambda_params(program: &mut Program) {
     // Pass 1 (mirrors `check`): gather declarations.
@@ -587,6 +663,7 @@ pub fn annotate_lambda_params(program: &mut Program) {
         subst: RefCell::new(HashMap::new()),
         counter: RefCell::new(0),
         lam_vars: RefCell::new(Vec::new()),
+        err_span: RefCell::new(None),
     };
     // Resolve each lambda placeholder by re-checking each body (a fresh context
     // per function, exactly like `check`'s Pass 3).
@@ -631,14 +708,14 @@ pub fn annotate_lambda_params(program: &mut Program) {
 /// Replace any unannotated lambda parameter annotation (`Ty::Var("$lamN")`) with
 /// its resolved type, recursing through the whole expression tree.
 fn annotate_expr(e: &mut Expr, resolved: &HashMap<String, Ty>) {
-    match e {
-        Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Unit | Expr::Var(_) => {}
-        Expr::Ctor(_, args) | Expr::Call(_, args) => {
+    match &mut e.kind {
+        ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Str(_) | ExprKind::Unit | ExprKind::Var(_) => {}
+        ExprKind::Ctor(_, args) | ExprKind::Call(_, args) => {
             for a in args {
                 annotate_expr(a, resolved);
             }
         }
-        Expr::Lambda(params, body, _) => {
+        ExprKind::Lambda(params, body, _) => {
             for (_, ty) in params.iter_mut() {
                 if let Ty::Var(v) = ty {
                     if v.starts_with("$lam") {
@@ -650,41 +727,41 @@ fn annotate_expr(e: &mut Expr, resolved: &HashMap<String, Ty>) {
             }
             annotate_expr(body, resolved);
         }
-        Expr::Apply(callee, args, _) => {
+        ExprKind::Apply(callee, args, _) => {
             annotate_expr(callee, resolved);
             for a in args {
                 annotate_expr(a, resolved);
             }
         }
-        Expr::Record(_, fields) => {
+        ExprKind::Record(_, fields) => {
             for (_, v) in fields {
                 annotate_expr(v, resolved);
             }
         }
-        Expr::Field(obj, _) => annotate_expr(obj, resolved),
-        Expr::Update(base, updates) => {
+        ExprKind::Field(obj, _) => annotate_expr(obj, resolved),
+        ExprKind::Update(base, updates) => {
             annotate_expr(base, resolved);
             for (_, v) in updates {
                 annotate_expr(v, resolved);
             }
         }
-        Expr::Unary(_, inner) => annotate_expr(inner, resolved),
-        Expr::Binary(_, l, r) => {
+        ExprKind::Unary(_, inner) => annotate_expr(inner, resolved),
+        ExprKind::Binary(_, l, r) => {
             annotate_expr(l, resolved);
             annotate_expr(r, resolved);
         }
-        Expr::If(c, t, e2) => {
+        ExprKind::If(c, t, e2) => {
             annotate_expr(c, resolved);
             annotate_expr(t, resolved);
             annotate_expr(e2, resolved);
         }
-        Expr::Match(scrut, arms) => {
+        ExprKind::Match(scrut, arms) => {
             annotate_expr(scrut, resolved);
             for arm in arms {
                 annotate_expr(&mut arm.body, resolved);
             }
         }
-        Expr::Block(stmts, last) => {
+        ExprKind::Block(stmts, last) => {
             for s in stmts {
                 match s {
                     Stmt::Let(_, _, v) => annotate_expr(v, resolved),
@@ -715,56 +792,56 @@ fn ty_mentions_var(ty: &Ty, v: &str) -> bool {
 /// a pure syntactic walk over calls; it records both builtin and user-function
 /// callees by name.
 fn collect_calls(e: &Expr, out: &mut HashSet<String>) {
-    match e {
-        Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Unit
-        | Expr::Var(_) => {}
-        Expr::Ctor(_, args) => {
+    match &e.kind {
+        ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Str(_) | ExprKind::Unit
+        | ExprKind::Var(_) => {}
+        ExprKind::Ctor(_, args) => {
             for a in args {
                 collect_calls(a, out);
             }
         }
-        Expr::Call(name, args) => {
+        ExprKind::Call(name, args) => {
             out.insert(name.clone());
             for a in args {
                 collect_calls(a, out);
             }
         }
-        Expr::Lambda(_, body, _) => collect_calls(body, out),
-        Expr::Apply(callee, args, _) => {
+        ExprKind::Lambda(_, body, _) => collect_calls(body, out),
+        ExprKind::Apply(callee, args, _) => {
             collect_calls(callee, out);
             for a in args {
                 collect_calls(a, out);
             }
         }
-        Expr::Record(_, fields) => {
+        ExprKind::Record(_, fields) => {
             for (_, v) in fields {
                 collect_calls(v, out);
             }
         }
-        Expr::Field(obj, _) => collect_calls(obj, out),
-        Expr::Update(base, updates) => {
+        ExprKind::Field(obj, _) => collect_calls(obj, out),
+        ExprKind::Update(base, updates) => {
             collect_calls(base, out);
             for (_, v) in updates {
                 collect_calls(v, out);
             }
         }
-        Expr::Unary(_, x) => collect_calls(x, out),
-        Expr::Binary(_, a, b) => {
+        ExprKind::Unary(_, x) => collect_calls(x, out),
+        ExprKind::Binary(_, a, b) => {
             collect_calls(a, out);
             collect_calls(b, out);
         }
-        Expr::If(c, t, e2) => {
+        ExprKind::If(c, t, e2) => {
             collect_calls(c, out);
             collect_calls(t, out);
             collect_calls(e2, out);
         }
-        Expr::Match(scrut, arms) => {
+        ExprKind::Match(scrut, arms) => {
             collect_calls(scrut, out);
             for a in arms {
                 collect_calls(&a.body, out);
             }
         }
-        Expr::Block(stmts, tail) => {
+        ExprKind::Block(stmts, tail) => {
             for s in stmts {
                 match s {
                     Stmt::Let(_, _, x) => collect_calls(x, out),
@@ -835,7 +912,7 @@ fn infer_io(program: &Program) -> HashSet<String> {
 /// non-builtin callee as a potential effect.
 ///
 /// Known-pure-or-tracked callees that do NOT count:
-///   * a direct `Expr::Call` to a top-level function (its IO-ness is tracked by
+///   * a direct `ExprKind::Call` to a top-level function (its IO-ness is tracked by
 ///     `infer_io`) or to a builtin (IO builtins are caught separately),
 ///   * a directly-applied lambda literal `(\x -> ...)(a)` — its body is walked
 ///     in place, so its effects are visible.
@@ -843,8 +920,8 @@ fn higher_order_effect_witness(
     e: &Expr,
     fnset: &HashSet<String>,
 ) -> Option<String> {
-    match e {
-        Expr::Call(name, args) => {
+    match &e.kind {
+        ExprKind::Call(name, args) => {
             // A callee that is neither a top-level function nor a builtin must be
             // a function *value* in scope (a parameter or a let-bound closure):
             // applying it has unknown effects.
@@ -858,12 +935,12 @@ fn higher_order_effect_witness(
             }
             None
         }
-        Expr::Apply(callee, args, _) => {
+        ExprKind::Apply(callee, args, _) => {
             // Applying anything other than a lambda literal applies an unknown
             // function value.
-            if !matches!(callee.as_ref(), Expr::Lambda(..)) {
-                let who = match callee.as_ref() {
-                    Expr::Var(n) => n.clone(),
+            if !matches!(callee.kind, ExprKind::Lambda(..)) {
+                let who = match &callee.kind {
+                    ExprKind::Var(n) => n.clone(),
                     _ => "<closure value>".to_string(),
                 };
                 return Some(who);
@@ -878,29 +955,29 @@ fn higher_order_effect_witness(
             }
             None
         }
-        Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Unit
-        | Expr::Var(_) => None,
-        Expr::Ctor(_, args) => args.iter().find_map(|a| higher_order_effect_witness(a, fnset)),
-        Expr::Lambda(_, body, _) => higher_order_effect_witness(body, fnset),
-        Expr::Record(_, fields) => fields
+        ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Str(_) | ExprKind::Unit
+        | ExprKind::Var(_) => None,
+        ExprKind::Ctor(_, args) => args.iter().find_map(|a| higher_order_effect_witness(a, fnset)),
+        ExprKind::Lambda(_, body, _) => higher_order_effect_witness(body, fnset),
+        ExprKind::Record(_, fields) => fields
             .iter()
             .find_map(|(_, v)| higher_order_effect_witness(v, fnset)),
-        Expr::Field(obj, _) => higher_order_effect_witness(obj, fnset),
-        Expr::Update(base, updates) => higher_order_effect_witness(base, fnset).or_else(|| {
+        ExprKind::Field(obj, _) => higher_order_effect_witness(obj, fnset),
+        ExprKind::Update(base, updates) => higher_order_effect_witness(base, fnset).or_else(|| {
             updates
                 .iter()
                 .find_map(|(_, v)| higher_order_effect_witness(v, fnset))
         }),
-        Expr::Unary(_, x) => higher_order_effect_witness(x, fnset),
-        Expr::Binary(_, a, b) => {
+        ExprKind::Unary(_, x) => higher_order_effect_witness(x, fnset),
+        ExprKind::Binary(_, a, b) => {
             higher_order_effect_witness(a, fnset).or_else(|| higher_order_effect_witness(b, fnset))
         }
-        Expr::If(c, t, e2) => higher_order_effect_witness(c, fnset)
+        ExprKind::If(c, t, e2) => higher_order_effect_witness(c, fnset)
             .or_else(|| higher_order_effect_witness(t, fnset))
             .or_else(|| higher_order_effect_witness(e2, fnset)),
-        Expr::Match(scrut, arms) => higher_order_effect_witness(scrut, fnset)
+        ExprKind::Match(scrut, arms) => higher_order_effect_witness(scrut, fnset)
             .or_else(|| arms.iter().find_map(|a| higher_order_effect_witness(&a.body, fnset))),
-        Expr::Block(stmts, tail) => {
+        ExprKind::Block(stmts, tail) => {
             for s in stmts {
                 let inner = match s {
                     Stmt::Let(_, _, x) => x,
@@ -1091,15 +1168,39 @@ impl Checker {
 
     // ---- synthesis -------------------------------------------------------
 
+    /// Synthesize the type of `e`, recording the span of the innermost failing
+    /// expression in `err_span` so a structured diagnostic can point at the exact
+    /// sub-expression. The deepest failing node sets the span first; enclosing
+    /// nodes do not overwrite it.
     fn synth(&self, e: &Expr, scope: &mut Scope) -> Result<Ty, String> {
-        match e {
-            Expr::Int(_) => Ok(Ty::Int),
-            Expr::Float(_) => Ok(Ty::Float),
-            Expr::Bool(_) => Ok(Ty::Bool),
-            Expr::Str(_) => Ok(Ty::Str),
-            Expr::Unit => Ok(Ty::Unit),
+        let r = self.synth_inner(e, scope);
+        if r.is_err() {
+            self.note_err_span(e.span);
+        }
+        r
+    }
 
-            Expr::Var(name) => {
+    /// Record `span` as the location of the current error, unless one is already
+    /// set (keep the innermost) or `span` is the no-location sentinel.
+    fn note_err_span(&self, span: Span) {
+        if span.is_none() {
+            return;
+        }
+        let mut slot = self.err_span.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(span);
+        }
+    }
+
+    fn synth_inner(&self, e: &Expr, scope: &mut Scope) -> Result<Ty, String> {
+        match &e.kind {
+            ExprKind::Int(_) => Ok(Ty::Int),
+            ExprKind::Float(_) => Ok(Ty::Float),
+            ExprKind::Bool(_) => Ok(Ty::Bool),
+            ExprKind::Str(_) => Ok(Ty::Str),
+            ExprKind::Unit => Ok(Ty::Unit),
+
+            ExprKind::Var(name) => {
                 if let Some(t) = Checker::lookup_var(scope, name) {
                     Ok(t)
                 } else if let Some(sig) = self.fns.get(name).cloned() {
@@ -1114,7 +1215,7 @@ impl Checker {
                 }
             }
 
-            Expr::Ctor(name, args) => {
+            ExprKind::Ctor(name, args) => {
                 let sig = self
                     .ctors
                     .get(name)
@@ -1145,7 +1246,7 @@ impl Checker {
                 Ok(Ty::Named(sig.tyname.clone(), type_args))
             }
 
-            Expr::Record(name, fields) => {
+            ExprKind::Record(name, fields) => {
                 let sig = self
                     .ctors
                     .get(name)
@@ -1185,7 +1286,7 @@ impl Checker {
                 Ok(Ty::Named(sig.tyname.clone(), type_args))
             }
 
-            Expr::Field(obj, field) => {
+            ExprKind::Field(obj, field) => {
                 let ot = self.synth(obj, scope)?;
                 let ot = self.prune(&ot);
                 let (tyname, type_args) = match &ot {
@@ -1219,7 +1320,7 @@ impl Checker {
                 Ok(Self::apply_map(&sig.fields[idx], &map))
             }
 
-            Expr::Update(base, updates) => {
+            ExprKind::Update(base, updates) => {
                 let bt = self.synth(base, scope)?;
                 let bt = self.prune(&bt);
                 let (tyname, type_args) = match &bt {
@@ -1261,7 +1362,7 @@ impl Checker {
                 Ok(bt)
             }
 
-            Expr::Call(name, args) => {
+            ExprKind::Call(name, args) => {
                 // A local binding shadowing a name (e.g. a function-valued
                 // parameter `f`) is applied as a function VALUE, not a by-name
                 // top-level call. This makes `f(x)` work inside a HOF.
@@ -1324,7 +1425,7 @@ impl Checker {
                 // by the function signature or a sibling argument, are in scope
                 // before its body is checked.
                 for (i, (arg, pt)) in args.iter().zip(params.iter()).enumerate() {
-                    if !matches!(arg, Expr::Lambda(..)) {
+                    if !matches!(arg.kind, ExprKind::Lambda(..)) {
                         let at = self.synth(arg, scope)?;
                         let expected = Self::apply_map(pt, &map);
                         self.unify(&expected, &at).map_err(|e| {
@@ -1333,7 +1434,7 @@ impl Checker {
                     }
                 }
                 for (i, (arg, pt)) in args.iter().zip(params.iter()).enumerate() {
-                    if matches!(arg, Expr::Lambda(..)) {
+                    if matches!(arg.kind, ExprKind::Lambda(..)) {
                         let expected = Self::apply_map(pt, &map);
                         self.check(arg, &expected, scope).map_err(|e| {
                             format!("function `{}` argument {}: {}", name, i, e)
@@ -1407,7 +1508,7 @@ impl Checker {
                 Ok(Self::apply_map(&ret, &map))
             }
 
-            Expr::Unary(op, inner) => {
+            ExprKind::Unary(op, inner) => {
                 let t = self.prune(&self.synth(inner, scope)?);
                 match (op, &t) {
                     (UnOp::Neg, Ty::Int) => Ok(Ty::Int),
@@ -1417,13 +1518,13 @@ impl Checker {
                 }
             }
 
-            Expr::Binary(op, lhs, rhs) => {
+            ExprKind::Binary(op, lhs, rhs) => {
                 let lt = self.synth(lhs, scope)?;
                 let rt = self.synth(rhs, scope)?;
                 self.synth_binary(*op, &lt, &rt)
             }
 
-            Expr::If(cond, then, els) => {
+            ExprKind::If(cond, then, els) => {
                 let ct = self.synth(cond, scope)?;
                 self.unify(&Ty::Bool, &ct)
                     .map_err(|_| format!("`if` condition must be Bool, got {}", show(&self.resolve(&ct))))?;
@@ -1439,9 +1540,9 @@ impl Checker {
                 Ok(self.resolve(&tt))
             }
 
-            Expr::Match(scrut, arms) => self.synth_match(scrut, arms, scope),
+            ExprKind::Match(scrut, arms) => self.synth_match(scrut, arms, scope),
 
-            Expr::Lambda(params, body, _) => {
+            ExprKind::Lambda(params, body, _) => {
                 // Parameters are typed from their annotations. An unannotated
                 // `\x -> ...` carries a parser-supplied placeholder var (`$lamN`);
                 // give it a FRESH unification variable so its type can be solved
@@ -1474,12 +1575,12 @@ impl Checker {
                 Ok(Ty::Fn(param_tys, Box::new(self.resolve(&body_ty))))
             }
 
-            Expr::Apply(callee, args, _) => {
+            ExprKind::Apply(callee, args, _) => {
                 let ct = self.synth(callee, scope)?;
                 self.synth_apply(&ct, args, scope, "value")
             }
 
-            Expr::Block(stmts, last) => {
+            ExprKind::Block(stmts, last) => {
                 scope.push(HashMap::new());
                 let result = (|| {
                     for s in stmts {
@@ -1525,8 +1626,16 @@ impl Checker {
     /// (`apply2(\x -> \y -> x + y, ..)`) type-checks. Every other expression
     /// falls back to synthesis + unification.
     fn check(&self, e: &Expr, expected: &Ty, scope: &mut Scope) -> Result<(), String> {
+        let r = self.check_inner(e, expected, scope);
+        if r.is_err() {
+            self.note_err_span(e.span);
+        }
+        r
+    }
+
+    fn check_inner(&self, e: &Expr, expected: &Ty, scope: &mut Scope) -> Result<(), String> {
         let exp = self.prune(expected);
-        if let (Expr::Lambda(params, body, _), Ty::Fn(ep, er)) = (e, &exp) {
+        if let (ExprKind::Lambda(params, body, _), Ty::Fn(ep, er)) = (&e.kind, &exp) {
             if params.len() == ep.len() {
                 let mut frame = HashMap::new();
                 for ((n, t), pexp) in params.iter().zip(ep.iter()) {
@@ -1658,14 +1767,14 @@ impl Checker {
         // function's signature (or a sibling argument) is checked with those
         // types already in scope.
         for (i, (arg, pv)) in args.iter().zip(arg_vars.iter()).enumerate() {
-            if !matches!(arg, Expr::Lambda(..)) {
+            if !matches!(arg.kind, ExprKind::Lambda(..)) {
                 let at = self.synth(arg, scope)?;
                 self.unify(pv, &at)
                     .map_err(|e| format!("applying {} argument {}: {}", what, i, e))?;
             }
         }
         for (i, (arg, pv)) in args.iter().zip(arg_vars.iter()).enumerate() {
-            if matches!(arg, Expr::Lambda(..)) {
+            if matches!(arg.kind, ExprKind::Lambda(..)) {
                 self.check(arg, pv, scope)
                     .map_err(|e| format!("applying {} argument {}: {}", what, i, e))?;
             }

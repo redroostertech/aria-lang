@@ -33,8 +33,67 @@ pub struct ClosureSig {
     pub ret: Ty,
 }
 
+/// A precise source span: the 1-based start and end (line, column) of a token
+/// or a parsed node. Columns are 1-based and count Unicode scalar values from
+/// the start of the line. `end_line`/`end_col` point one past the last
+/// character of the node (a half-open `[start, end)` extent in column terms),
+/// so a single-character token at line 4 col 7 has `end_col == 8`.
+///
+/// A compiler-synthesized node (one with no single source location: a
+/// monomorphizer rewrite, a desugared tuple/record/array op, a lowered trait
+/// dispatcher, a prelude-internal construct) carries [`Span::none`], whose
+/// fields are all zero. Spans are pure METADATA: no backend, the monomorphizer,
+/// or the evaluator reads them, so they never affect codegen or a program's
+/// result. They feed diagnostics, runtime stack traces, the call graph, and the
+/// LSP, which point at the EXACT sub-expression rather than the function's
+/// definition line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Span {
+    pub start_line: u32,
+    pub start_col: u32,
+    pub end_line: u32,
+    pub end_col: u32,
+}
+
+impl Span {
+    /// The sentinel span for a compiler-synthesized node with no source
+    /// location: all fields zero. Consumers treat a zero `start_line` as
+    /// "no precise location" and fall back to the function-definition line.
+    pub const fn none() -> Span {
+        Span { start_line: 0, start_col: 0, end_line: 0, end_col: 0 }
+    }
+
+    /// `true` for the [`Span::none`] sentinel (no precise source location).
+    pub fn is_none(&self) -> bool {
+        self.start_line == 0
+    }
+}
+
+/// An expression: its `kind` (the shape of the node) plus the precise source
+/// `span` it was parsed from. Splitting the span out of every variant means a
+/// single field carries the location for the whole AST, and matching is done on
+/// `&expr.kind`. Synthesized expressions use [`Span::none`].
 #[derive(Debug, Clone)]
-pub enum Expr {
+pub struct Expr {
+    pub kind: ExprKind,
+    pub span: Span,
+}
+
+impl Expr {
+    /// Build an expression node from its kind and span.
+    pub fn new(kind: ExprKind, span: Span) -> Expr {
+        Expr { kind, span }
+    }
+
+    /// Build a compiler-synthesized expression (no source location): used by the
+    /// monomorphizer, trait lowering, and any pass that fabricates a node.
+    pub fn synth(kind: ExprKind) -> Expr {
+        Expr { kind, span: Span::none() }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum ExprKind {
     Int(i64),
     Float(f64),
     Bool(bool),
