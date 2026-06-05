@@ -212,6 +212,36 @@ thread_local! {
     /// passed to `grad`. `None` everywhere else, so the tracing branches in
     /// `eval_binary`/the vector builtins are inert for normal programs.
     static GRAD_TAPE: std::cell::RefCell<Option<Tape>> = const { std::cell::RefCell::new(None) };
+
+    /// The active OUTPUT-CAPTURE buffer. `None` (the default) means the `print_*`
+    /// builtins write to this process's stdout EXACTLY as before — normal `aria
+    /// run` and every existing test/example is unaffected. `Some(buf)` (set only
+    /// for the duration of a `run_main_capturing` call) makes the same builtins
+    /// APPEND their formatted line (identical formatting + trailing newline) to
+    /// `buf` instead of touching stdout, so a caller (the agent loop / benchmark)
+    /// can observe what a program PRINTED. Thread-local so it never crosses the
+    /// large-stack worker thread the interpreter runs on, and so capture is
+    /// strictly scoped to the capturing run.
+    static OUTPUT_CAPTURE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Emit one already-formatted output LINE from a `print_*` builtin: append it to
+/// the active capture buffer when capturing, else write it (plus a newline) to
+/// stdout exactly as `println!` did before. The single choke point that keeps
+/// the captured text byte-for-byte identical to the printed text.
+fn emit_line(line: &str) {
+    OUTPUT_CAPTURE.with(|c| {
+        let mut b = c.borrow_mut();
+        match b.as_mut() {
+            Some(buf) => {
+                buf.push_str(line);
+                buf.push('\n');
+            }
+            None => {
+                println!("{}", line);
+            }
+        }
+    });
 }
 
 /// Read the forward value of a tracing scalar from the active tape. Errors
@@ -409,6 +439,27 @@ impl Interp {
         }
         let mut scope: Scope = vec![HashMap::new()];
         self.eval_fn_body("main", &main.body, &mut scope)
+    }
+
+    /// Run `main` with OUTPUT CAPTURE on: every `print_*` builtin appends its
+    /// formatted line to a buffer instead of writing to stdout. Returns BOTH
+    /// `main`'s value AND the captured stdout `String` (byte-for-byte what a
+    /// normal run would have printed). The capture buffer is installed for the
+    /// duration of this call only and torn down afterward — success OR error — so
+    /// a subsequent `run_main` (or any other code) prints to real stdout exactly
+    /// as before. Used by the agent loop / benchmark to grade what a program
+    /// PRINTS, not just what `main` returns.
+    pub fn run_main_capturing(&self) -> Result<(Value, String), String> {
+        // Install a fresh capture buffer. Nesting is not expected (the agent
+        // loop runs one program at a time), but if one were already active we
+        // would still restore it below, so the outer capture is preserved.
+        let prev = OUTPUT_CAPTURE.with(|c| c.borrow_mut().replace(String::new()));
+        let result = self.run_main();
+        // Always retrieve our buffer and restore the EXACT previous capture
+        // state (`None` if there was none), whether `main` succeeded or failed.
+        let captured = OUTPUT_CAPTURE.with(|c| std::mem::replace(&mut *c.borrow_mut(), prev));
+        let captured = captured.unwrap_or_default();
+        result.map(|v| (v, captured))
     }
 
     fn lookup<'a>(scope: &'a Scope, name: &str) -> Option<&'a Value> {
@@ -1305,28 +1356,28 @@ fn builtin(name: &str, args: &[Value]) -> Result<Option<Value>, String> {
     match name {
         "print_int" => match one(args)? {
             Value::Int(n) => {
-                println!("{}", n);
+                emit_line(&n.to_string());
                 Ok(Some(Value::Unit))
             }
             v => Err(format!("print_int expects Int, got {}", v.display())),
         },
         "print_float" => match one(args)? {
             Value::Float(f) => {
-                println!("{}", f);
+                emit_line(&format!("{}", f));
                 Ok(Some(Value::Unit))
             }
             v => Err(format!("print_float expects Float, got {}", v.display())),
         },
         "print_bool" => match one(args)? {
             Value::Bool(b) => {
-                println!("{}", b);
+                emit_line(&b.to_string());
                 Ok(Some(Value::Unit))
             }
             v => Err(format!("print_bool expects Bool, got {}", v.display())),
         },
         "print_str" => match one(args)? {
             Value::Str(s) => {
-                println!("{}", s);
+                emit_line(&s);
                 Ok(Some(Value::Unit))
             }
             v => Err(format!("print_str expects String, got {}", v.display())),
@@ -1887,6 +1938,63 @@ mod tests {
         typeck::check(&prog).expect("typeck");
         let interp = Interp::new(&prog).expect("interp::new");
         interp.run_main().expect("run")
+    }
+
+    // Lex -> parse -> typeck -> interp, returning (main's value, captured stdout).
+    fn run_capturing(src: &str) -> (Value, String) {
+        let toks = lexer::lex(src).expect("lex");
+        let prog = parser::parse(toks).expect("parse");
+        typeck::check(&prog).expect("typeck");
+        let interp = Interp::new(&prog).expect("interp::new");
+        interp.run_main_capturing().expect("run")
+    }
+
+    // ---- output capture (Part 1) --------------------------------------
+
+    #[test]
+    fn capture_collects_print_lines_with_formatting_and_newlines() {
+        // Each print_* appends ONE line (its formatted value + '\n'), in order.
+        let src = "fn main() -> Int = {\n\
+                     print_int(7);\n\
+                     print_bool(true);\n\
+                     print_str(\"hi\");\n\
+                     print_float(1.5);\n\
+                     42\n\
+                   }";
+        let (v, out) = run_capturing(src);
+        assert_eq!(v.display(), "42");
+        assert_eq!(out, "7\ntrue\nhi\n1.5\n");
+    }
+
+    #[test]
+    fn capture_of_program_with_no_prints_is_empty() {
+        let (v, out) = run_capturing("fn main() -> Int = 1 + 2");
+        assert_eq!(v.display(), "3");
+        assert_eq!(out, "");
+    }
+
+    #[test]
+    fn capture_does_not_leak_into_a_later_noncapturing_run() {
+        // After a capturing run, the thread-local sink must be back to `None` so
+        // the print builtins resume writing to stdout (default behavior). We
+        // can't observe stdout here, but we CAN prove a subsequent capturing run
+        // starts from an empty buffer (i.e. the prior capture didn't persist).
+        let _ = run_capturing("fn main() -> Int = { print_int(1); 0 }");
+        let (_v, out) = run_capturing("fn main() -> Int = { print_int(2); 0 }");
+        assert_eq!(out, "2\n", "each capturing run starts fresh");
+    }
+
+    #[test]
+    fn capture_str_value_is_byte_for_byte_with_trailing_newline() {
+        // print_str of a String main() returns: value and captured text agree on
+        // the content (capture adds exactly the println newline, nothing else).
+        let src = "fn main() -> String = {\n\
+                     print_str(concat(\"x = \", int_to_str(6 * 7)));\n\
+                     \"done\"\n\
+                   }";
+        let (v, out) = run_capturing(src);
+        assert_eq!(v.display(), "done");
+        assert_eq!(out, "x = 42\n");
     }
 
     #[test]

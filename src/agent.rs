@@ -209,6 +209,31 @@ impl Provider for MockProvider {
     }
 }
 
+/// A fixed-program provider: every `complete` call returns the SAME program,
+/// fenced so it also exercises the extractor. The benchmark constructs one of
+/// these per task from that task's `reference` solution, so `--provider
+/// reference` drives the whole agent loop + grader OFFLINE (no model) and must
+/// converge + grade-correct in a single iteration — the end-to-end self-test.
+pub struct FixedProvider {
+    program: String,
+    name: String,
+}
+
+impl FixedProvider {
+    pub fn new(program: impl Into<String>, name: impl Into<String>) -> FixedProvider {
+        FixedProvider { program: program.into(), name: name.into() }
+    }
+}
+
+impl Provider for FixedProvider {
+    fn complete(&self, _prompt: &str) -> Result<String, String> {
+        Ok(format!("```aria\n{}```", self.program))
+    }
+    fn label(&self) -> String {
+        self.name.clone()
+    }
+}
+
 /// A temp file whose path is exposed and which is removed on drop. Used to
 /// materialise the GBNF grammar for the `llama:` preset's `--grammar-file`.
 pub struct TempFile {
@@ -533,6 +558,10 @@ pub struct AgentOutcome {
     pub diagnostics: Vec<Diagnostic>,
     /// `main`'s rendered result value, if the program checked clean AND ran.
     pub result: Option<String>,
+    /// What the program PRINTED (captured `print_*` output) on a successful run.
+    /// `None` if the program never reached a clean+running state. This is the
+    /// program's observable OUTPUT, distinct from `main`'s return `result`.
+    pub output: Option<String>,
     /// A runtime error string, if the program checked clean but failed to run.
     pub runtime_error: Option<String>,
     /// How many provider iterations were used.
@@ -574,6 +603,7 @@ pub fn run_loop(
                     program: last_program,
                     diagnostics: last_diags,
                     result: None,
+                    output: None,
                     runtime_error: Some(format!("provider error: {}", e)),
                     iterations: iter,
                     transcript,
@@ -592,13 +622,16 @@ pub fn run_loop(
         last_diags = diags.clone();
 
         if diags.is_empty() {
-            // Clean: RUN it (safe by construction — no I/O/FFI/etc.).
-            let (result, runtime_error) = run_program(&program);
+            // Clean: RUN it CAPTURING its printed output (safe by construction —
+            // no I/O/FFI/etc.). We grade what the program PRINTS, so the loop
+            // carries the captured stdout alongside `main`'s return value.
+            let (result, output, runtime_error) = run_program(&program);
             return AgentOutcome {
                 success: runtime_error.is_none(),
                 program,
                 diagnostics: Vec::new(),
                 result,
+                output,
                 runtime_error,
                 iterations: iter,
                 transcript,
@@ -622,6 +655,7 @@ pub fn run_loop(
         program: last_program,
         diagnostics: last_diags,
         result: None,
+        output: None,
         runtime_error: None,
         iterations: iters,
         transcript,
@@ -641,22 +675,24 @@ pub fn check_program(program: &str) -> Vec<Diagnostic> {
     }
 }
 
-/// Run a program that has ALREADY been checked clean, returning
-/// `(Some(result), None)` on success or `(None, Some(error))` on a runtime
-/// error / construction failure. The program is re-lexed/parsed (cheap) so this
-/// is self-contained. `print_*` output flows to this process's stdout.
-fn run_program(program: &str) -> (Option<String>, Option<String>) {
+/// Run a program that has ALREADY been checked clean, CAPTURING its printed
+/// output. Returns `(Some(result), Some(printed_output), None)` on success or
+/// `(None, None, Some(error))` on a runtime error / construction failure. The
+/// program is re-lexed/parsed (cheap) so this is self-contained. Unlike a normal
+/// `aria run`, the `print_*` output is BUFFERED (not sent to stdout) so the loop
+/// can report — and the benchmark grade — what the program PRINTED.
+pub fn run_program(program: &str) -> (Option<String>, Option<String>, Option<String>) {
     let prog = match lexer::lex(&prelude::wrap(program)).and_then(parser::parse) {
         Ok(p) => p,
-        Err(e) => return (None, Some(e)),
+        Err(e) => return (None, None, Some(e)),
     };
     let interp = match interp::Interp::new(&prog) {
         Ok(i) => i,
-        Err(e) => return (None, Some(e)),
+        Err(e) => return (None, None, Some(e)),
     };
-    match interp.run_main() {
-        Ok(v) => (Some(v.display()), None),
-        Err(e) => (None, Some(e)),
+    match interp.run_main_capturing() {
+        Ok((v, out)) => (Some(v.display()), Some(out), None),
+        Err(e) => (None, None, Some(e)),
     }
 }
 
@@ -847,10 +883,12 @@ mod tests {
     fn mock_fixed_program_checks_clean_and_runs() {
         let diags = check_program(MockProvider::fixed_program());
         assert!(diags.is_empty(), "fixed program should check clean: {:?}", diags);
-        let (res, err) = run_program(MockProvider::fixed_program());
+        let (res, out, err) = run_program(MockProvider::fixed_program());
         assert!(err.is_none(), "fixed program should run: {:?}", err);
-        // sum_to(10) == 55.
+        // sum_to(10) == 55 (the return value).
         assert_eq!(res.as_deref(), Some("55"));
+        // The fixed program also PRINTS sum_to(10) == 55 via print_int.
+        assert_eq!(out.as_deref(), Some("55\n"));
     }
 
     #[test]
@@ -863,6 +901,8 @@ mod tests {
         assert_eq!(outcome.iterations, 2, "should take 2 iterations");
         assert!(outcome.diagnostics.is_empty());
         assert_eq!(outcome.result.as_deref(), Some("55"));
+        // The loop CAPTURED what the program printed (print_int(sum_to(10))).
+        assert_eq!(outcome.output.as_deref(), Some("55\n"));
         assert!(outcome.program.contains("fn main"));
 
         // The transcript (feedback that drove the fix) must contain the

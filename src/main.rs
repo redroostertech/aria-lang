@@ -16,11 +16,15 @@
 //!   aria lsp                        run a stdio LSP server (live diagnostics)
 //!   aria agent [opts] "<task>"      AI authoring loop: an LLM writes Aria, the
 //!                                   compiler checks+runs it, diagnostics feed back
+//!   aria agent-bench [opts]         MEASURE a provider's author-correctness
+//!                                   (pass-rate) + iterations-to-green over a suite
 
 // Many runtime modules expose library-style APIs not all wired into the CLI yet.
 #![allow(dead_code)]
 
 mod agent;
+mod agent_bench;
+mod agent_tasks;
 mod arith;
 mod ast;
 mod builtins;
@@ -75,7 +79,7 @@ fn main() -> ExitCode {
 fn real_main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: aria <run|check|ast|pack|unpack|npack|nunpack|bench|demo|mem|wasm|wasm-run|native|native-run|gbnf|lsp|agent> [args...]");
+        eprintln!("usage: aria <run|check|ast|pack|unpack|npack|nunpack|bench|demo|mem|wasm|wasm-run|native|native-run|gbnf|lsp|agent|agent-bench> [args...]");
         return ExitCode::from(2);
     }
 
@@ -98,6 +102,7 @@ fn real_main() -> ExitCode {
         "gbnf" => run_gbnf(&args),
         "lsp" => ExitCode::from(lsp::run() as u8),
         "agent" => run_agent(&args),
+        "agent-bench" => run_agent_bench(&args),
         other => {
             eprintln!("unknown command `{}`", other);
             ExitCode::from(2)
@@ -594,6 +599,22 @@ fn run_agent(args: &[String]) -> ExitCode {
         );
         eprintln!("--- final program ---");
         eprintln!("{}", outcome.program);
+        if let Some(o) = &outcome.output {
+            // What the program PRINTED (captured `print_*` output). Shown even
+            // when empty so the report is unambiguous about a program that
+            // printed nothing.
+            eprintln!("--- output ---");
+            if o.is_empty() {
+                eprintln!("(no output)");
+            } else {
+                // Already ends in a newline per print_*; trim one to avoid a
+                // double blank line in the report.
+                eprint!("{}", o);
+                if !o.ends_with('\n') {
+                    eprintln!();
+                }
+            }
+        }
         if let Some(r) = &outcome.result {
             eprintln!("--- result ---");
             eprintln!("{}", r);
@@ -627,6 +648,112 @@ fn run_agent(args: &[String]) -> ExitCode {
                 eprintln!("[feedback {}] {}", n + 1, msg);
             }
         }
+        ExitCode::FAILURE
+    }
+}
+
+/// `aria agent-bench [--provider <spec>] [--max-iters N] [--task <name>]
+/// [--verbose]`: MEASURE a provider's author-correctness over the task suite.
+/// For each task, drive the agent loop with the provider, then GRADE the
+/// converged program against the task's out-of-band oracle (the expected answer
+/// is never in the prompt). Reports per-task lines and an aggregate: convergence
+/// rate, the headline CORRECTNESS pass-rate, and iterations-to-green.
+///
+/// `--provider reference` feeds each task its own reference solution and runs the
+/// whole harness OFFLINE (no model) — the end-to-end self-test (~100%/100%/1).
+/// Defaults: `--provider reference`, `--max-iters 5`.
+fn run_agent_bench(args: &[String]) -> ExitCode {
+    let mut provider_spec = "reference".to_string();
+    let mut max_iters: usize = 5;
+    let mut only_task: Option<String> = None;
+    let mut verbose = false;
+
+    let mut i = 2;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--provider" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => provider_spec = v.clone(),
+                    None => {
+                        eprintln!("error: --provider needs a value");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            "--max-iters" => {
+                i += 1;
+                match args.get(i).and_then(|v| v.parse::<usize>().ok()) {
+                    Some(n) if n >= 1 => max_iters = n,
+                    _ => {
+                        eprintln!("error: --max-iters needs a positive integer");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            "--task" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => only_task = Some(v.clone()),
+                    None => {
+                        eprintln!("error: --task needs a task name");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            "--verbose" => verbose = true,
+            other => {
+                eprintln!("error: unknown option `{}`", other);
+                eprintln!(
+                    "usage: aria agent-bench [--provider <spec>] [--max-iters N] [--task <name>] [--verbose]"
+                );
+                return ExitCode::from(2);
+            }
+        }
+        i += 1;
+    }
+
+    // Select the task(s): all, or the single named one.
+    let tasks: Vec<agent_tasks::Task> = match &only_task {
+        Some(name) => match agent_tasks::task_by_name(name) {
+            Some(t) => vec![t],
+            None => {
+                eprintln!("error: unknown task `{}`", name);
+                eprintln!("available tasks:");
+                for t in agent_tasks::tasks() {
+                    eprintln!("  {}", t.name);
+                }
+                return ExitCode::from(2);
+            }
+        },
+        None => agent_tasks::tasks(),
+    };
+
+    eprintln!(
+        "aria agent-bench: provider `{}`, {} task(s), up to {} iteration(s) each",
+        provider_spec,
+        tasks.len(),
+        max_iters
+    );
+
+    // Run the sweep on a large-stack thread (it executes model-generated Aria via
+    // the interpreter, which uses native stack per Aria call — like `run`/`agent`).
+    let spec = provider_spec.clone();
+    let (results, agg) = std::thread::Builder::new()
+        .stack_size(1 << 30)
+        .spawn(move || agent_bench::run(&spec, &tasks, max_iters, verbose))
+        .expect("spawn bench thread")
+        .join()
+        .expect("bench thread panicked");
+
+    // The report goes to STDOUT so it can be captured/grepped; progress is on
+    // stderr (above), matching the rest of the CLI.
+    print!("{}", agent_bench::render_report(&provider_spec, &results, &agg));
+
+    // Exit success iff every task graded correct (a clean signal for CI).
+    if agg.correct == agg.total {
+        ExitCode::SUCCESS
+    } else {
         ExitCode::FAILURE
     }
 }

@@ -160,6 +160,89 @@ a liveness one.
 out, and is exactly as trusted as the command you supply. The safety claim is
 about executing the *generated Aria program*, not about the provider you choose.)
 
+## Measuring a provider — `aria agent-bench`
+
+The loop converges a model to code that **checks clean and runs**. But "runs" is
+not "right": a program can check clean, run, and still print the **wrong answer**
+("converged but incorrect"). `aria agent-bench` turns *"does this provider write
+Aria correctly?"* into a **measured number** — a pass-rate per provider.
+
+```sh
+aria agent-bench [--provider <spec>] [--max-iters N] [--task <name>] [--verbose]
+```
+
+For each task in a fixed **authoring suite** (`src/agent_tasks.rs`), the runner:
+
+1. drives the agent loop (write → check → fix → run) with the chosen provider,
+   recording whether it **converged** and how many **iterations** it took, then
+2. **grades** the converged program against the task's **out-of-band oracle**
+   (`src/agent_bench.rs`) — running it *capturing* its printed output and
+   comparing the observed output and/or `main` return value to the expected one.
+
+It then prints a per-task table and an aggregate summary to **stdout** (progress
+on stderr). Defaults: `--provider reference`, `--max-iters 5`. Exit code is `0`
+iff every task graded correct.
+
+### The metrics
+
+| Metric | Meaning |
+| --- | --- |
+| **convergence rate** | fraction of tasks the loop got to *check clean + run* within budget. Measures the loop, not correctness. |
+| **correctness pass-rate** | **the headline number** — fraction of tasks whose produced program actually printed/returned the *right* answer. This is the real "writes Aria correctly" score. |
+| **iterations-to-green** | mean / median iterations used over the converged tasks — how many compiler-feedback rounds the provider needed. Lower is better. |
+
+A high convergence with a low correctness rate is the **converged-but-incorrect**
+signal: the provider reliably produces *runnable* Aria that computes the *wrong*
+thing. The two numbers are reported separately so this is visible.
+
+The report is greppable: every per-task line starts `TASK `, every aggregate
+line starts `BENCH ` (e.g. `BENCH correctness 100.0% (15/15)`).
+
+### Grading is external — no leak
+
+The expected answer is **never** placed in the prompt the provider sees — the
+loop only ever gets the task's natural-language `prompt`. The grader applies the
+oracle **out of band** after the program is written and run. So the pass-rate
+measures genuine author-correctness, not the model's ability to echo a test.
+
+### `--provider reference` — the offline self-test
+
+The suite ships a **known-correct reference solution** per task (never shown to a
+real provider). With `--provider reference`, the runner feeds each task its *own*
+reference (via `agent::FixedProvider`), driving the **entire** harness — output
+capture, loop, grader, runner, report — **offline with no model**. It must report
+**~100% converged + 100% correct in 1 iteration each**, proving the machinery end
+to end:
+
+```text
+== aria authoring benchmark :: provider `reference` ==
+TASK name               converged  iters  correct  note
+TASK constant                 yes      1      yes
+TASK sum_1_to_100             yes      1      yes
+...
+TASK string_build             yes      1      yes
+---
+BENCH convergence 100.0% (15/15)
+BENCH correctness 100.0% (15/15)  <- author-correctness pass-rate
+BENCH iters-to-green mean 1.00 median 1.0 (over 15 converged)
+BENCH counts total=15 converged=15 correct=15 incorrect=0 nonconverged=0
+```
+
+To measure a *real* provider, swap the spec — e.g. `aria agent-bench --provider
+claude` or `--provider 'cmd:my-llm --stdin'`. The same suite + grader then yield
+that provider's pass-rate and iterations-to-green. That is how we turn "LLMs
+write Aria correctly" into a number **per provider**.
+
+### Output capture
+
+Grading needs to see what a program **prints**, not just what `main` returns. The
+interpreter has an opt-in capture mode (`Interp::run_main_capturing`): when on,
+the `print_*` builtins append their formatted line to a buffer instead of writing
+to stdout (identical formatting + trailing newline). Normal `aria run` is
+unaffected — only the loop/benchmark use the capturing path, and the `AgentOutcome`
+now carries the program's printed **output** alongside `main`'s return value
+(shown under `--- output ---` in `aria agent --verbose`).
+
 ## Limitations
 
 - **Cloud providers are best-effort**: they assume `curl` + `jq` and a current
@@ -174,9 +257,15 @@ about executing the *generated Aria program*, not about the provider you choose.
 
 ## Implementation
 
-- `src/agent.rs` — the `Provider` trait, the `mock`/`cmd`/preset providers, the
-  prompt assembly, the program extractor, and `run_loop`.
-- Wired into the CLI in `src/main.rs` (`aria agent`).
+- `src/agent.rs` — the `Provider` trait, the `mock`/`cmd`/preset/`FixedProvider`
+  providers, the prompt assembly, the program extractor, `run_loop`, and
+  `run_program` (the capturing run).
+- `src/agent_tasks.rs` — the authoring task suite (prompt + oracle + reference
+  per task) and the external `grade` function.
+- `src/agent_bench.rs` — the benchmark runner: drive the loop per task, grade,
+  aggregate, and render the report.
+- `src/interp.rs` — `Interp::run_main_capturing` (output capture for grading).
+- Wired into the CLI in `src/main.rs` (`aria agent`, `aria agent-bench`).
 - The check path reuses `typeck::check_structured` (see `docs/DIAGNOSTICS.md`);
   the grammar reuses `src/gbnf.rs` (see `aria gbnf`).
 - Tested entirely **offline**: command *construction* for every preset, the
