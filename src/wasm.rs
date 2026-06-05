@@ -113,9 +113,8 @@ impl ElemKind {
             WType::I64 | WType::I32 => ElemKind::Int,
             WType::F64 => ElemKind::Float,
             WType::Str => ElemKind::Str,
-            WType::Ref | WType::Array(_) | WType::Tensor | WType::Bytes | WType::Vector => {
-                ElemKind::Ref
-            }
+            WType::Ref | WType::Array(_) | WType::Tensor | WType::Bytes | WType::Vector
+            | WType::Map(..) | WType::Set(_) => ElemKind::Ref,
             WType::F32 => ElemKind::Float,
         }
     }
@@ -157,6 +156,11 @@ enum WType {
     Vector, // pointer into linear memory (i32 address) — a dense f64 Vector /
             // embedding buffer { rc, len, cap, elems[f64] }, modeled on the Tensor
             // heap object but reusing the shared free-list allocator + __live.
+    Map(SlotKind, SlotKind), // pointer into linear memory — an ordered Map[K,V]
+            // (sorted-by-key association buffer). Carries the key + value slot
+            // kinds so each op knows how to compare / dup / drop / render slots.
+    Set(SlotKind), // pointer into linear memory — an ordered Set[T] (sorted
+            // element buffer). Carries the element slot kind.
     F32, // INTERNAL ONLY: a scalar f32 used for Tensor-helper locals/scratch.
          // No Aria value ever has this type (Tensor data is f32 but is read out
          // as f64); it exists purely so helper bodies can declare f32 locals.
@@ -171,7 +175,7 @@ impl WType {
             WType::F64 => 0x7C,
             WType::F32 => 0x7D,
             WType::I32 | WType::Ref | WType::Str | WType::Tensor | WType::Array(_) | WType::Bytes
-            | WType::Vector => 0x7F,
+            | WType::Vector | WType::Map(..) | WType::Set(_) => 0x7F,
         }
     }
 
@@ -216,14 +220,59 @@ impl WType {
             // heap object, so it reuses the array runtime; distinguished here so it
             // gets its own ==/display and the bytes builtins.
             Ty::Named(n, _) if n == "Bytes" => Ok(WType::Bytes),
-            // Maps and Sets are supported by the interpreter and the native (C)
-            // backend, but NOT the wasm backend — gate with a clean error.
-            Ty::Named(n, _) if n == "Map" || n == "Set" => Err(format!(
-                "maps/sets are not yet supported in the wasm backend \
-                 (use the interpreter `aria run` or the native backend \
-                 `aria native-run`): type `{}`",
-                n
-            )),
+            // An ordered Map[K,V]: a sorted-by-key association buffer (its own
+            // heap object kind). Keys are Int/Str (typeck enforces); values are
+            // Int/Float/Bool/Str/Bytes (flat, like native). A non-flat value
+            // (Array, nested Map/Set, ADT/tuple Ref) cannot be faithfully stored
+            // in the coarse slot buffer — reject cleanly (the interpreter still
+            // supports it), mirroring the native backend.
+            Ty::Named(n, args) if n == "Map" && args.len() == 2 => {
+                let k = WType::from_ty(&args[0])?;
+                let v = WType::from_ty(&args[1])?;
+                let kk = match k {
+                    WType::I64 => SlotKind::Int,
+                    WType::Str => SlotKind::Str,
+                    _ => {
+                        return Err(format!(
+                            "wasm backend: a Map key of type `{}` is not supported \
+                             (keys must be Int or Str)",
+                            crate::typeck::show(&args[0])
+                        ))
+                    }
+                };
+                let vk = match v {
+                    WType::I64 => SlotKind::Int,
+                    WType::F64 => SlotKind::Float,
+                    WType::I32 => SlotKind::Bool,
+                    WType::Str => SlotKind::Str,
+                    WType::Bytes => SlotKind::Bytes,
+                    _ => {
+                        return Err(format!(
+                            "wasm backend: a Map value of type `{}` is not supported \
+                             (values must be Int, Float, Bool, Str, or Bytes); \
+                             use the interpreter `aria run` for richer value types",
+                            crate::typeck::show(&args[1])
+                        ))
+                    }
+                };
+                Ok(WType::Map(kk, vk))
+            }
+            // An ordered Set[T]: a sorted element buffer. Elements are Int/Str.
+            Ty::Named(n, args) if n == "Set" && args.len() == 1 => {
+                let e = WType::from_ty(&args[0])?;
+                let ek = match e {
+                    WType::I64 => SlotKind::Int,
+                    WType::Str => SlotKind::Str,
+                    _ => {
+                        return Err(format!(
+                            "wasm backend: a Set element of type `{}` is not supported \
+                             (elements must be Int or Str)",
+                            crate::typeck::show(&args[0])
+                        ))
+                    }
+                };
+                Ok(WType::Set(ek))
+            }
             // The dense f64 Vector / embedding buffer. A distinct heap object
             // kind (its own ==/display and the vec_* builtins), modeled on the
             // Tensor heap object but reusing the shared free-list allocator.
@@ -366,6 +415,18 @@ impl CtorTable {
         self.by_name
             .values()
             .any(|info| !info.array_fields().is_empty())
+    }
+
+    /// True if any constructor has a Map or Set field. Like Array fields, the
+    /// recursive ADT `==` cannot compare ordered Map/Set contents inline, so the
+    /// backend gates ADT `==`/`!=` when such a ctor exists (storage/projection/
+    /// drop of a Map/Set-in-ADT is fully supported).
+    fn any_map_set_field(&self) -> bool {
+        self.by_name.values().any(|info| {
+            info.field_types
+                .iter()
+                .any(|t| matches!(t, WType::Map(..) | WType::Set(_)))
+        })
     }
 }
 
@@ -510,6 +571,93 @@ const VEC_MIN_CAP: i64 = 4;
 /// backend's `cap==0 -> 4`, avoiding the native bug of growing to cap 1).
 const ARRAY_MIN_CAP: i64 = 4;
 
+// ---- Map / Set heap objects ----------------------------------------------
+//
+// An ordered `Map[K,V]` / `Set[T]` is a reference-counted, INSERTION-SORTED
+// association buffer — the byte-for-byte analogue of the native `AriaMap` /
+// `AriaSet`. It is sorted by key (Map) / element (Set) ascending so iteration,
+// equality, and display are deterministic and identical across backends (NOT a
+// hash table). It reuses the SAME segregated free-list `__alloc`/`__free` and
+// the SAME `__live` counter (no allocator constant changes). Layouts:
+//
+//   Map at p:                            Set at p:
+//     [p+0]   rc    (i64)                  [p+0]   rc    (i64)
+//     [p+8]   kkind (i64) — key SlotKind   [p+8]   ekind (i64) — elem SlotKind
+//     [p+16]  vkind (i64) — val SlotKind   [p+16]  len   (i64)
+//     [p+24]  len   (i64)                  [p+24]  cap   (i64)
+//     [p+32]  cap   (i64)                  [p+32 ..]  elems, one i64 per slot
+//     [p+40 ..] slots: interleaved [k0,v0,k1,v1,..], 2 i64 per entry
+//
+// Keys / set elements are Int(0) or Str(2) only. Values are Int(0)/Float(1)/
+// Bool(8)/Str(2)/Bytes(4). A slot holds the value directly (Int/Bool), the
+// f64 BITS (Float), or a heap pointer (Str/Bytes). FBIP: insert/add/remove
+// mutate in place when rc==1, else copy-on-write.
+//
+// MAP size class: `40 + 16*cap` is 8-aligned, so cls = (40 + 16*cap -
+// CELL_HEADER)/SLOT = 2*cap + 3, clamped to TENSOR_MAX_CLASS.
+// SET size class: `32 + 8*cap` is 8-aligned, so cls = cap + 2, clamped.
+const MAP_HEADER: u64 = 40; // rc(8) + kkind(8) + vkind(8) + len(8) + cap(8)
+const SET_HEADER: u64 = 32; // rc(8) + ekind(8) + len(8) + cap(8)
+
+/// A coarse slot-kind tag for a Map key/value or Set element. The numeric
+/// `code()` values MIRROR the native backend's `SlotKind` EXACTLY (Int=0,
+/// Float=1, Str=2, Bytes=4, Bool=8) so the in-wasm runtime's kind-aware
+/// dup/drop, key comparison, and rendering match native byte-for-byte. Only the
+/// kinds a Map/Set can actually hold are represented (keys: Int/Str; values:
+/// Int/Float/Bool/Str/Bytes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum SlotKind {
+    Int,   // 0
+    Float, // 1
+    Str,   // 2
+    Bytes, // 4
+    Bool,  // 8
+}
+
+impl SlotKind {
+    /// The runtime kind code (matches native `SlotKind::code`).
+    fn code(self) -> i64 {
+        match self {
+            SlotKind::Int => 0,
+            SlotKind::Float => 1,
+            SlotKind::Str => 2,
+            SlotKind::Bytes => 4,
+            SlotKind::Bool => 8,
+        }
+    }
+    /// The slot kind that holds a value of the given wasm value type.
+    fn from_wtype(t: WType) -> SlotKind {
+        match t {
+            WType::I64 => SlotKind::Int,
+            WType::I32 => SlotKind::Bool,
+            WType::F64 => SlotKind::Float,
+            WType::Str => SlotKind::Str,
+            WType::Bytes => SlotKind::Bytes,
+            _ => SlotKind::Int,
+        }
+    }
+    /// The wasm value type a slot of this kind occupies on the operand stack.
+    fn wtype(self) -> WType {
+        match self {
+            SlotKind::Int => WType::I64,
+            SlotKind::Bool => WType::I32,
+            SlotKind::Float => WType::F64,
+            SlotKind::Str => WType::Str,
+            SlotKind::Bytes => WType::Bytes,
+        }
+    }
+    /// The Array element kind that holds the same value (Bool collapses to the
+    /// Int slot — a no-op for dup/drop — matching the native enumeration result).
+    fn elem_kind(self) -> ElemKind {
+        match self {
+            SlotKind::Int | SlotKind::Bool => ElemKind::Int,
+            SlotKind::Float => ElemKind::Float,
+            SlotKind::Str => ElemKind::Str,
+            SlotKind::Bytes => ElemKind::Ref, // a Bytes element is a heap ptr (Ref drop)
+        }
+    }
+}
+
 /// The emitted checked-arithmetic helper functions. Each detects signed-i64
 /// overflow and executes `unreachable` (a wasm trap) on overflow; otherwise it
 /// returns the wrapped result. They are appended to the module after all user
@@ -612,10 +760,40 @@ enum HeapHelper {
     VecAdd,     // (a:i32, b:i32) -> ptr:i32  elementwise add (FBIP, traps on mismatch); CONSUMES both
     VecScale,   // (a:i32, s:f64) -> ptr:i32  scale by s (FBIP); CONSUMES a
     VecEq,      // (a:i32, b:i32) -> i32  structural equality (len+elems); does NOT consume operands
+    // ---- ordered Map / Set runtime (sorted association / element buffer) ----
+    // Shared slot primitives (kind = SlotKind code: 0 Int/1 Float/2 Str/4 Bytes/8 Bool):
+    KeyCmp,   // (kind:i64, a:i64, b:i64) -> i32  total order on Int/Str keys (<0/0/>0)
+    SlotDupK, // (kind:i64, slot:i64) -> i32  kind-aware dup of one slot (Str/Bytes heap)
+    SlotDropK,// (kind:i64, slot:i64) -> i32  kind-aware drop of one slot
+    SlotEqK,  // (kind:i64, a:i64, b:i64) -> i32  kind-aware value equality
+    // Map object:
+    AllocMap, // (kkind:i64, vkind:i64, cap:i32) -> ptr:i32  alloc (rc=1, len=0)
+    DupMap,   // (ptr:i32) -> i32  rc++
+    DropMap,  // (ptr:i32) -> i32  rc--; at 0 drop slots then free
+    MapInsert,// (ptr:i32, key:i64, val:i64) -> ptr:i32  sorted insert/replace (FBIP/COW); CONSUMES map+key+val
+    MapGetOr, // (ptr:i32, key:i64, dflt:i64) -> i64  value (dup'd) or dflt; CONSUMES map+key, one of val/dflt
+    MapHas,   // (ptr:i32, key:i64) -> i32  membership; CONSUMES map+key
+    MapLen,   // (ptr:i32) -> i64  len; CONSUMES map
+    MapRemove,// (ptr:i32, key:i64) -> ptr:i32  remove key (FBIP/COW); CONSUMES map+key
+    MapKeys,  // (ptr:i32, out_kind:i32) -> arr:i32  Array of keys ascending; CONSUMES map
+    MapValues,// (ptr:i32, out_kind:i32) -> arr:i32  Array of values; CONSUMES map
+    MapEq,    // (a:i32, b:i32) -> i32  sorted-content equality; does NOT consume operands
+    MapShow,  // (ptr:i32) -> i32  canonical `Map[..]` String (Int/Str/Bool slots); CONSUMES map
+    // Set object:
+    AllocSet, // (ekind:i64, cap:i32) -> ptr:i32  alloc (rc=1, len=0)
+    DupSet,   // (ptr:i32) -> i32  rc++
+    DropSet,  // (ptr:i32) -> i32  rc--; at 0 drop slots then free
+    SetAdd,   // (ptr:i32, e:i64) -> ptr:i32  sorted insert, dedup (FBIP/COW); CONSUMES set+elem
+    SetHas,   // (ptr:i32, e:i64) -> i32  membership; CONSUMES set+elem
+    SetLen,   // (ptr:i32) -> i64  len; CONSUMES set
+    SetRemove,// (ptr:i32, e:i64) -> ptr:i32  remove (FBIP/COW); CONSUMES set+elem
+    SetToArr, // (ptr:i32, out_kind:i32) -> arr:i32  Array of elements ascending; CONSUMES set
+    SetEq,    // (a:i32, b:i32) -> i32  sorted-content equality; does NOT consume operands
+    SetShow,  // (ptr:i32) -> i32  canonical `Set[..]` String (Int/Str/Bool slots); CONSUMES set
 }
 
 impl HeapHelper {
-    const ALL: [HeapHelper; 53] = [
+    const ALL: [HeapHelper; 79] = [
         HeapHelper::Alloc,
         HeapHelper::Free,
         HeapHelper::Dup,
@@ -669,6 +847,32 @@ impl HeapHelper {
         HeapHelper::VecAdd,
         HeapHelper::VecScale,
         HeapHelper::VecEq,
+        HeapHelper::KeyCmp,
+        HeapHelper::SlotDupK,
+        HeapHelper::SlotDropK,
+        HeapHelper::SlotEqK,
+        HeapHelper::AllocMap,
+        HeapHelper::DupMap,
+        HeapHelper::DropMap,
+        HeapHelper::MapInsert,
+        HeapHelper::MapGetOr,
+        HeapHelper::MapHas,
+        HeapHelper::MapLen,
+        HeapHelper::MapRemove,
+        HeapHelper::MapKeys,
+        HeapHelper::MapValues,
+        HeapHelper::MapEq,
+        HeapHelper::MapShow,
+        HeapHelper::AllocSet,
+        HeapHelper::DupSet,
+        HeapHelper::DropSet,
+        HeapHelper::SetAdd,
+        HeapHelper::SetHas,
+        HeapHelper::SetLen,
+        HeapHelper::SetRemove,
+        HeapHelper::SetToArr,
+        HeapHelper::SetEq,
+        HeapHelper::SetShow,
     ];
 
     fn offset(self) -> u32 {
@@ -726,6 +930,32 @@ impl HeapHelper {
             HeapHelper::VecAdd => 50,
             HeapHelper::VecScale => 51,
             HeapHelper::VecEq => 52,
+            HeapHelper::KeyCmp => 53,
+            HeapHelper::SlotDupK => 54,
+            HeapHelper::SlotDropK => 55,
+            HeapHelper::SlotEqK => 56,
+            HeapHelper::AllocMap => 57,
+            HeapHelper::DupMap => 58,
+            HeapHelper::DropMap => 59,
+            HeapHelper::MapInsert => 60,
+            HeapHelper::MapGetOr => 61,
+            HeapHelper::MapHas => 62,
+            HeapHelper::MapLen => 63,
+            HeapHelper::MapRemove => 64,
+            HeapHelper::MapKeys => 65,
+            HeapHelper::MapValues => 66,
+            HeapHelper::MapEq => 67,
+            HeapHelper::MapShow => 68,
+            HeapHelper::AllocSet => 69,
+            HeapHelper::DupSet => 70,
+            HeapHelper::DropSet => 71,
+            HeapHelper::SetAdd => 72,
+            HeapHelper::SetHas => 73,
+            HeapHelper::SetLen => 74,
+            HeapHelper::SetRemove => 75,
+            HeapHelper::SetToArr => 76,
+            HeapHelper::SetEq => 77,
+            HeapHelper::SetShow => 78,
         }
     }
 
@@ -789,6 +1019,34 @@ impl HeapHelper {
             HeapHelper::VecAdd => (vec![WType::I32, WType::I32], WType::I32),
             HeapHelper::VecScale => (vec![WType::I32, WType::F64], WType::I32),
             HeapHelper::VecEq => (vec![WType::I32, WType::I32], WType::I32),
+            HeapHelper::KeyCmp => (vec![WType::I64, WType::I64, WType::I64], WType::I32),
+            HeapHelper::SlotDupK => (vec![WType::I64, WType::I64], WType::I32),
+            HeapHelper::SlotDropK => (vec![WType::I64, WType::I64], WType::I32),
+            HeapHelper::SlotEqK => (vec![WType::I64, WType::I64, WType::I64], WType::I32),
+            HeapHelper::AllocMap => (vec![WType::I64, WType::I64, WType::I32], WType::I32),
+            HeapHelper::DupMap => (vec![WType::I32], WType::I32),
+            HeapHelper::DropMap => (vec![WType::I32], WType::I32),
+            HeapHelper::MapInsert => {
+                (vec![WType::I32, WType::I64, WType::I64, WType::I64, WType::I64], WType::I32)
+            }
+            HeapHelper::MapGetOr => (vec![WType::I32, WType::I64, WType::I64], WType::I64),
+            HeapHelper::MapHas => (vec![WType::I32, WType::I64], WType::I32),
+            HeapHelper::MapLen => (vec![WType::I32], WType::I64),
+            HeapHelper::MapRemove => (vec![WType::I32, WType::I64], WType::I32),
+            HeapHelper::MapKeys => (vec![WType::I32, WType::I32], WType::I32),
+            HeapHelper::MapValues => (vec![WType::I32, WType::I32], WType::I32),
+            HeapHelper::MapEq => (vec![WType::I32, WType::I32], WType::I32),
+            HeapHelper::MapShow => (vec![WType::I32], WType::I32),
+            HeapHelper::AllocSet => (vec![WType::I64, WType::I32], WType::I32),
+            HeapHelper::DupSet => (vec![WType::I32], WType::I32),
+            HeapHelper::DropSet => (vec![WType::I32], WType::I32),
+            HeapHelper::SetAdd => (vec![WType::I32, WType::I64, WType::I64], WType::I32),
+            HeapHelper::SetHas => (vec![WType::I32, WType::I64], WType::I32),
+            HeapHelper::SetLen => (vec![WType::I32], WType::I64),
+            HeapHelper::SetRemove => (vec![WType::I32, WType::I64], WType::I32),
+            HeapHelper::SetToArr => (vec![WType::I32, WType::I32], WType::I32),
+            HeapHelper::SetEq => (vec![WType::I32, WType::I32], WType::I32),
+            HeapHelper::SetShow => (vec![WType::I32], WType::I32),
         }
     }
 }
@@ -1099,7 +1357,7 @@ fn bind_type(bind: &Bind, env: &LocalEnv) -> Result<WType, String> {
             UnOp::Neg => atom_type(a, env), // numeric negation keeps the operand type
             UnOp::Not => Ok(WType::I32),    // Bool Not
         },
-        Bind::Call(name, _) => {
+        Bind::Call(name, args) => {
             if is_str_builtin(name) {
                 return Ok(str_builtin_ret(name));
             }
@@ -1112,13 +1370,8 @@ fn bind_type(bind: &Bind, env: &LocalEnv) -> Result<WType, String> {
             if let Some(ret) = bytes_builtin_ret(name) {
                 return Ok(ret);
             }
-            if is_map_set_builtin(name) {
-                return Err(format!(
-                    "maps/sets are not yet supported in the wasm backend \
-                     (use the interpreter `aria run` or the native backend \
-                     `aria native-run`): builtin `{}`",
-                    name
-                ));
+            if let Some(base) = parse_map_set_builtin(name) {
+                return map_set_builtin_ret(base, name, args, env);
             }
             if let Some(ret) = vec_builtin_ret(name) {
                 return Ok(ret);
@@ -1448,6 +1701,21 @@ fn emit_bind(bind: &Bind, env: &mut LocalEnv, code: &mut Vec<u8>) -> Result<WTyp
                 }
                 return emit_vec_eq(*op, l, r, env, code);
             }
+            // Map `==`/`!=`: sorted-content compare via `__map_eq`, then consume
+            // both operands (`__drop_map`).
+            if matches!(op, BinOp::Eq | BinOp::Ne) && matches!(atom_type(l, env)?, WType::Map(..)) {
+                if !matches!(atom_type(r, env)?, WType::Map(..)) {
+                    return Err("wasm backend: == / != on mismatched types".into());
+                }
+                return emit_map_set_eq(*op, l, r, true, env, code);
+            }
+            // Set `==`/`!=`.
+            if matches!(op, BinOp::Eq | BinOp::Ne) && matches!(atom_type(l, env)?, WType::Set(_)) {
+                if !matches!(atom_type(r, env)?, WType::Set(_)) {
+                    return Err("wasm backend: == / != on mismatched types".into());
+                }
+                return emit_map_set_eq(*op, l, r, false, env, code);
+            }
             let lt = emit_atom(l, env, code)?;
             let rt = emit_atom(r, env, code)?;
             // Add/Sub/Mul on Int are checked: route through an emitted helper
@@ -1493,7 +1761,8 @@ fn emit_bind(bind: &Bind, env: &mut LocalEnv, code: &mut Vec<u8>) -> Result<WTyp
                         Ok(WType::F64)
                     }
                     WType::I32 | WType::Ref | WType::Str | WType::Tensor | WType::Array(_)
-                    | WType::Bytes | WType::Vector | WType::F32 => {
+                    | WType::Bytes | WType::Vector | WType::Map(..) | WType::Set(_)
+                    | WType::F32 => {
                         Err("wasm backend: numeric negation requires an Int or Float".into())
                     }
                 }
@@ -1526,13 +1795,8 @@ fn emit_bind(bind: &Bind, env: &mut LocalEnv, code: &mut Vec<u8>) -> Result<WTyp
             if is_bytes_builtin(name) {
                 return emit_bytes_builtin(name, args, env, code);
             }
-            if is_map_set_builtin(name) {
-                return Err(format!(
-                    "maps/sets are not yet supported in the wasm backend \
-                     (use the interpreter `aria run` or the native backend \
-                     `aria native-run`): builtin `{}`",
-                    name
-                ));
+            if let Some(base) = parse_map_set_builtin(name) {
+                return emit_map_set_builtin(base, name, args, env, code);
             }
             if is_vec_builtin(name) {
                 return emit_vec_builtin(name, args, env, code);
@@ -1645,7 +1909,7 @@ fn emit_store_cell_fields(
             WType::F64 => f64_store(off, code),
             WType::I64 => i64_store(off, code),
             WType::I32 | WType::Ref | WType::Str | WType::Tensor | WType::Array(_) | WType::Bytes
-            | WType::Vector => {
+            | WType::Vector | WType::Map(..) | WType::Set(_) => {
                 code.push(0xAD); // i64.extend_i32_u
                 i64_store(off, code);
             }
@@ -1807,12 +2071,111 @@ fn is_bytes_builtin(name: &str) -> bool {
     )
 }
 
-/// True for any map/set builtin (suffixed by monomorphization, e.g.
-/// `map_insert$i_i`, or the bare interpreter name). The wasm backend does not
-/// support maps/sets; recognizing them lets it emit a clean, specific error.
-fn is_map_set_builtin(name: &str) -> bool {
-    let base = name.rsplit_once('$').map(|(b, _)| b).unwrap_or(name);
-    base.starts_with("map_") || base.starts_with("set_")
+/// Parse a suffixed map/set builtin name (`map_insert$i_i`, `set_add$s`, …) into
+/// its base operation, or `None` if not a recognized map/set builtin. The
+/// precise key/value/element kinds are recovered from the operand's static
+/// `WType::Map`/`WType::Set` at emit time (the empty constructors `map_new`/
+/// `set_new` instead use the name suffix, like the native backend).
+fn parse_map_set_builtin(name: &str) -> Option<&'static str> {
+    let (base, _suffix) = name.rsplit_once('$')?;
+    match base {
+        "map_new" => Some("map_new"),
+        "map_insert" => Some("map_insert"),
+        "map_get_or" => Some("map_get_or"),
+        "map_has" => Some("map_has"),
+        "map_len" => Some("map_len"),
+        "map_remove" => Some("map_remove"),
+        "map_show" => Some("map_show"),
+        "map_keys" => Some("map_keys"),
+        "map_values" => Some("map_values"),
+        "set_new" => Some("set_new"),
+        "set_add" => Some("set_add"),
+        "set_has" => Some("set_has"),
+        "set_len" => Some("set_len"),
+        "set_remove" => Some("set_remove"),
+        "set_show" => Some("set_show"),
+        "set_to_array" => Some("set_to_array"),
+        _ => None,
+    }
+}
+
+/// Parse the monomorphizer's one-char kind suffix for the empty constructors.
+/// `map_new$<k>_<v>` -> (key, value); `set_new$<e>` -> (elem, Int). Mirrors the
+/// native `slot_kind_from_tag` collapse (only Int/Float/Str/Bytes/Bool occur in
+/// a Map/Set; anything else is rejected earlier at the type level).
+fn map_set_suffix_kinds(name: &str) -> (SlotKind, SlotKind) {
+    let tag = |c: char| match c {
+        'f' => SlotKind::Float,
+        's' => SlotKind::Str,
+        'b' => SlotKind::Bytes,
+        'o' => SlotKind::Bool,
+        _ => SlotKind::Int,
+    };
+    if let Some((_base, suffix)) = name.rsplit_once('$') {
+        if let Some((k, v)) = suffix.split_once('_') {
+            return (
+                tag(k.chars().next().unwrap_or('i')),
+                tag(v.chars().next().unwrap_or('i')),
+            );
+        }
+        return (tag(suffix.chars().next().unwrap_or('i')), SlotKind::Int);
+    }
+    (SlotKind::Int, SlotKind::Int)
+}
+
+/// The wasm result type of a map/set builtin. For ops with a Map/Set operand the
+/// precise kinds come from that operand's `WType`; the empty constructors use
+/// the name suffix. `args`'s first element (when present) carries the operand.
+fn map_set_builtin_ret(
+    base: &str,
+    name: &str,
+    args: &[Atom],
+    env: &LocalEnv,
+) -> Result<WType, String> {
+    let (sk, sv) = map_set_suffix_kinds(name);
+    // Recover the operand Map/Set kinds where available.
+    let operand_kinds = || -> Option<(SlotKind, Option<SlotKind>)> {
+        let a = args.first()?;
+        match atom_type(a, env).ok()? {
+            WType::Map(kk, vk) => Some((kk, Some(vk))),
+            WType::Set(ek) => Some((ek, None)),
+            _ => None,
+        }
+    };
+    Ok(match base {
+        "map_new" => WType::Map(sk, sv),
+        "set_new" => WType::Set(sk),
+        "map_insert" | "map_remove" => {
+            let (kk, vk) = operand_kinds()
+                .map(|(k, v)| (k, v.unwrap_or(sv)))
+                .unwrap_or((sk, sv));
+            WType::Map(kk, vk)
+        }
+        "set_add" | "set_remove" => {
+            let ek = operand_kinds().map(|(k, _)| k).unwrap_or(sk);
+            WType::Set(ek)
+        }
+        "map_get_or" => operand_kinds()
+            .and_then(|(_, v)| v)
+            .unwrap_or(sv)
+            .wtype(),
+        "map_has" | "set_has" => WType::I32,
+        "map_len" | "set_len" => WType::I64,
+        "map_show" | "set_show" => WType::Str,
+        "map_keys" => {
+            let kk = operand_kinds().map(|(k, _)| k).unwrap_or(sk);
+            WType::Array(kk.elem_kind())
+        }
+        "map_values" => {
+            let vk = operand_kinds().and_then(|(_, v)| v).unwrap_or(sv);
+            WType::Array(vk.elem_kind())
+        }
+        "set_to_array" => {
+            let ek = operand_kinds().map(|(k, _)| k).unwrap_or(sk);
+            WType::Array(ek.elem_kind())
+        }
+        _ => return Err(format!("wasm backend: unknown map/set builtin `{}`", base)),
+    })
 }
 
 /// The wasm result type of a Bytes builtin, or `None` if not a bytes builtin.
@@ -1851,6 +2214,269 @@ fn emit_byte_range_check(vlocal: u32, code: &mut Vec<u8>) {
 /// Emit a Bytes builtin. A Bytes is an Array(Int) heap object, so new/len/get/
 /// set/push delegate to the array helpers (kind = Int = 0). `set`/`push` first
 /// range-check the byte value (trap if outside 0..255). `from_str`/`to_str`/`==`
+/// Encode a value already on the stack (wasm type `got`) into the i64 slot
+/// representation a Map/Set buffer uses: Int stays i64; Bool zero-extends;
+/// Float reinterprets its bits; Str/Bytes pointers zero-extend.
+fn encode_slot(got: WType, code: &mut Vec<u8>) -> Result<(), String> {
+    match got {
+        WType::I64 => {}
+        WType::I32 => code.push(0xAD),                  // i64.extend_i32_u (Bool)
+        WType::F64 => code.push(0xBD),                  // i64.reinterpret_f64
+        WType::Str | WType::Bytes => code.push(0xAD),   // ptr zero-extend
+        other => {
+            return Err(format!(
+                "wasm backend: cannot store a value of type {:?} in a Map/Set slot",
+                other
+            ))
+        }
+    }
+    Ok(())
+}
+
+/// Decode a Map/Set i64 slot (on the stack) back to the wasm value type of
+/// `kind` (inverse of `encode_slot`).
+fn decode_slot(kind: SlotKind, code: &mut Vec<u8>) {
+    match kind {
+        SlotKind::Int | SlotKind::Bool => {} // Bool stays in the i64/i32 slot family
+        SlotKind::Float => code.push(0xBF),  // f64.reinterpret_i64
+        SlotKind::Str | SlotKind::Bytes => code.push(0xA7), // i32.wrap_i64 (ptr)
+    }
+}
+
+/// Emit a Map/Set builtin call. Each maps to the ordered Map/Set heap helpers,
+/// which CONSUME their heap arguments (matching the rc pass's "Call args are
+/// consumed" rule). `map_get_or` decodes its i64 result back to the value type;
+/// `map_keys`/`map_values`/`set_to_array` build an Array of the right kind. A
+/// Float/Bytes-VALUED `map_show`/`set_show` is GATED (the wasm backend has no
+/// in-wasm shortest-round-trip float / hex formatter — same gap that gates a
+/// Vector/Bytes-returning main); ALL other ops still work for those value kinds.
+fn emit_map_set_builtin(
+    base: &str,
+    name: &str,
+    args: &[Atom],
+    env: &mut LocalEnv,
+    code: &mut Vec<u8>,
+) -> Result<WType, String> {
+    let (sk, sv) = map_set_suffix_kinds(name);
+    // Recover precise operand kinds from the first heap argument when present.
+    let map_kinds = |env: &mut LocalEnv, code: &mut Vec<u8>| -> Result<(WType, SlotKind, SlotKind), String> {
+        let got = emit_atom(&args[0], env, code)?;
+        match got {
+            WType::Map(kk, vk) => Ok((got, kk, vk)),
+            other => Err(format!("wasm backend: `{}` expects a Map, got {:?}", base, other)),
+        }
+    };
+    let set_kinds = |env: &mut LocalEnv, code: &mut Vec<u8>| -> Result<(WType, SlotKind), String> {
+        let got = emit_atom(&args[0], env, code)?;
+        match got {
+            WType::Set(ek) => Ok((got, ek)),
+            other => Err(format!("wasm backend: `{}` expects a Set, got {:?}", base, other)),
+        }
+    };
+    match base {
+        "map_new" => {
+            if !args.is_empty() {
+                return Err("wasm backend: map_new expects no arguments".into());
+            }
+            code.push(0x42); // i64.const kkind
+            leb_s(sk.code(), code);
+            code.push(0x42);
+            leb_s(sv.code(), code);
+            code.push(0x41); // i32.const cap = 0
+            leb_s(0, code);
+            code.push(0x10);
+            leb_u(env.heap_index(HeapHelper::AllocMap) as u64, code);
+            Ok(WType::Map(sk, sv))
+        }
+        "set_new" => {
+            if !args.is_empty() {
+                return Err("wasm backend: set_new expects no arguments".into());
+            }
+            code.push(0x42);
+            leb_s(sk.code(), code);
+            code.push(0x41);
+            leb_s(0, code);
+            code.push(0x10);
+            leb_u(env.heap_index(HeapHelper::AllocSet) as u64, code);
+            Ok(WType::Set(sk))
+        }
+        "map_insert" => {
+            if args.len() != 3 {
+                return Err("wasm backend: map_insert expects (map, key, value)".into());
+            }
+            let (_mt, kk, vk) = map_kinds(env, code)?;
+            let kt = emit_atom(&args[1], env, code)?;
+            encode_slot(kt, code)?;
+            let vt = emit_atom(&args[2], env, code)?;
+            encode_slot(vt, code)?;
+            // precise kinds from the operands (override coarse header on empty map)
+            let kk2 = SlotKind::from_wtype(kt);
+            let vk2 = SlotKind::from_wtype(vt);
+            code.push(0x42);
+            leb_s(kk2.code(), code);
+            code.push(0x42);
+            leb_s(vk2.code(), code);
+            code.push(0x10);
+            leb_u(env.heap_index(HeapHelper::MapInsert) as u64, code);
+            Ok(WType::Map(kk, vk))
+        }
+        "map_get_or" => {
+            if args.len() != 3 {
+                return Err("wasm backend: map_get_or expects (map, key, default)".into());
+            }
+            let (_mt, _kk, vk) = map_kinds(env, code)?;
+            let kt = emit_atom(&args[1], env, code)?;
+            encode_slot(kt, code)?;
+            let vt = emit_atom(&args[2], env, code)?;
+            encode_slot(vt, code)?;
+            code.push(0x10);
+            leb_u(env.heap_index(HeapHelper::MapGetOr) as u64, code);
+            decode_slot(vk, code);
+            Ok(vk.wtype())
+        }
+        "map_has" => {
+            if args.len() != 2 {
+                return Err("wasm backend: map_has expects (map, key)".into());
+            }
+            let _ = map_kinds(env, code)?;
+            let kt = emit_atom(&args[1], env, code)?;
+            encode_slot(kt, code)?;
+            code.push(0x10);
+            leb_u(env.heap_index(HeapHelper::MapHas) as u64, code);
+            Ok(WType::I32)
+        }
+        "map_len" => {
+            if args.len() != 1 {
+                return Err("wasm backend: map_len expects (map)".into());
+            }
+            let _ = map_kinds(env, code)?;
+            code.push(0x10);
+            leb_u(env.heap_index(HeapHelper::MapLen) as u64, code);
+            Ok(WType::I64)
+        }
+        "map_remove" => {
+            if args.len() != 2 {
+                return Err("wasm backend: map_remove expects (map, key)".into());
+            }
+            let (_mt, kk, vk) = map_kinds(env, code)?;
+            let kt = emit_atom(&args[1], env, code)?;
+            encode_slot(kt, code)?;
+            code.push(0x10);
+            leb_u(env.heap_index(HeapHelper::MapRemove) as u64, code);
+            Ok(WType::Map(kk, vk))
+        }
+        "map_keys" | "map_values" => {
+            if args.len() != 1 {
+                return Err(format!("wasm backend: {} expects (map)", base));
+            }
+            let (_mt, kk, vk) = map_kinds(env, code)?;
+            let out = if base == "map_keys" { kk } else { vk }.elem_kind();
+            if matches!(out, ElemKind::Ref) {
+                return Err(format!(
+                    "wasm backend: `{}` producing an Array of Bytes is outside the wasm subset",
+                    base
+                ));
+            }
+            code.push(0x41); // i32.const out_kind
+            leb_s(out.code(), code);
+            let helper = if base == "map_keys" { HeapHelper::MapKeys } else { HeapHelper::MapValues };
+            code.push(0x10);
+            leb_u(env.heap_index(helper) as u64, code);
+            Ok(WType::Array(out))
+        }
+        "map_show" => {
+            if args.len() != 1 {
+                return Err("wasm backend: map_show expects (map)".into());
+            }
+            let (_mt, _kk, vk) = map_kinds(env, code)?;
+            if matches!(vk, SlotKind::Float | SlotKind::Bytes) {
+                return Err(
+                    "wasm backend: map_show of a Float- or Bytes-valued Map is gated (the wasm \
+                     backend lacks an in-wasm shortest-round-trip float / hex formatter); use \
+                     `aria run` or `aria native-run`. (All non-show Map ops work for these values.)"
+                        .into(),
+                );
+            }
+            code.push(0x10);
+            leb_u(env.heap_index(HeapHelper::MapShow) as u64, code);
+            Ok(WType::Str)
+        }
+        "set_add" => {
+            if args.len() != 2 {
+                return Err("wasm backend: set_add expects (set, elem)".into());
+            }
+            let (_st, ek) = set_kinds(env, code)?;
+            let et = emit_atom(&args[1], env, code)?;
+            encode_slot(et, code)?;
+            code.push(0x42); // arg_ekind
+            leb_s(SlotKind::from_wtype(et).code(), code);
+            code.push(0x10);
+            leb_u(env.heap_index(HeapHelper::SetAdd) as u64, code);
+            Ok(WType::Set(ek))
+        }
+        "set_has" => {
+            if args.len() != 2 {
+                return Err("wasm backend: set_has expects (set, elem)".into());
+            }
+            let _ = set_kinds(env, code)?;
+            let et = emit_atom(&args[1], env, code)?;
+            encode_slot(et, code)?;
+            code.push(0x10);
+            leb_u(env.heap_index(HeapHelper::SetHas) as u64, code);
+            Ok(WType::I32)
+        }
+        "set_len" => {
+            if args.len() != 1 {
+                return Err("wasm backend: set_len expects (set)".into());
+            }
+            let _ = set_kinds(env, code)?;
+            code.push(0x10);
+            leb_u(env.heap_index(HeapHelper::SetLen) as u64, code);
+            Ok(WType::I64)
+        }
+        "set_remove" => {
+            if args.len() != 2 {
+                return Err("wasm backend: set_remove expects (set, elem)".into());
+            }
+            let (_st, ek) = set_kinds(env, code)?;
+            let et = emit_atom(&args[1], env, code)?;
+            encode_slot(et, code)?;
+            code.push(0x10);
+            leb_u(env.heap_index(HeapHelper::SetRemove) as u64, code);
+            Ok(WType::Set(ek))
+        }
+        "set_to_array" => {
+            if args.len() != 1 {
+                return Err("wasm backend: set_to_array expects (set)".into());
+            }
+            let (_st, ek) = set_kinds(env, code)?;
+            let out = ek.elem_kind();
+            code.push(0x41);
+            leb_s(out.code(), code);
+            code.push(0x10);
+            leb_u(env.heap_index(HeapHelper::SetToArr) as u64, code);
+            Ok(WType::Array(out))
+        }
+        "set_show" => {
+            if args.len() != 1 {
+                return Err("wasm backend: set_show expects (set)".into());
+            }
+            let (_st, ek) = set_kinds(env, code)?;
+            if matches!(ek, SlotKind::Float | SlotKind::Bytes) {
+                return Err(
+                    "wasm backend: set_show of a Float/Bytes Set is gated (no in-wasm float/hex \
+                     formatter); use `aria run` or `aria native-run`."
+                        .into(),
+                );
+            }
+            code.push(0x10);
+            leb_u(env.heap_index(HeapHelper::SetShow) as u64, code);
+            Ok(WType::Str)
+        }
+        _ => Err(format!("wasm backend: unsupported map/set builtin `{}`", base)),
+    }
+}
+
 /// use dedicated helpers. Each consuming builtin consumes its Bytes argument,
 /// matching the rc pass.
 fn emit_bytes_builtin(
@@ -2486,6 +3112,52 @@ fn emit_vec_eq(
     Ok(WType::I32)
 }
 
+/// Emit a Map/Set `==`/`!=`. Both operands are evaluated into fresh i32 temps,
+/// `__map_eq`/`__set_eq` compares sorted contents (read-only), the result is
+/// negated for `!=`, and BOTH operands are then dropped (the rc pass marks
+/// Eq/Ne operands consumed). Mirrors `emit_vec_eq`.
+fn emit_map_set_eq(
+    op: BinOp,
+    l: &Atom,
+    r: &Atom,
+    is_map: bool,
+    env: &mut LocalEnv,
+    code: &mut Vec<u8>,
+) -> Result<WType, String> {
+    let lt = env.fresh_i32();
+    let rt = env.fresh_i32();
+    let (eq_h, drop_h) = if is_map {
+        (HeapHelper::MapEq, HeapHelper::DropMap)
+    } else {
+        (HeapHelper::SetEq, HeapHelper::DropSet)
+    };
+    let eq = env.heap_index(eq_h);
+    let drop_idx = env.heap_index(drop_h);
+    emit_atom(l, env, code)?;
+    code.push(0x21);
+    leb_u(lt as u64, code);
+    emit_atom(r, env, code)?;
+    code.push(0x21);
+    leb_u(rt as u64, code);
+    code.push(0x20);
+    leb_u(lt as u64, code);
+    code.push(0x20);
+    leb_u(rt as u64, code);
+    code.push(0x10); // call __map_eq / __set_eq
+    leb_u(eq as u64, code);
+    if op == BinOp::Ne {
+        code.push(0x45); // i32.eqz
+    }
+    for slot in [lt, rt] {
+        code.push(0x20);
+        leb_u(slot as u64, code);
+        code.push(0x10);
+        leb_u(drop_idx as u64, code);
+        code.push(0x1A);
+    }
+    Ok(WType::I32)
+}
+
 /// Emit an ADT `==` / `!=`. Both operands are evaluated into fresh i32 temps,
 /// `__eq` compares them structurally (recursively), the result is negated for
 /// `!=`, and BOTH operand pointers are then dropped via `__drop`. `__eq` only
@@ -2509,6 +3181,11 @@ fn emit_adt_eq(
     if env.ctors.any_array_field() {
         return Err(
             "wasm backend: `==`/`!=` on ADTs with Array fields is outside the wasm subset".into(),
+        );
+    }
+    if env.ctors.any_map_set_field() {
+        return Err(
+            "wasm backend: `==`/`!=` on ADTs with Map/Set fields is outside the wasm subset".into(),
         );
     }
     let lt = env.fresh_i32();
@@ -2611,7 +3288,7 @@ fn emit_make_closure(
             WType::F64 => f64_store(off, code),
             WType::I64 => i64_store(off, code),
             WType::I32 | WType::Ref | WType::Str | WType::Tensor | WType::Array(_) | WType::Bytes
-            | WType::Vector => {
+            | WType::Vector | WType::Map(..) | WType::Set(_) => {
                 code.push(0xAD); // i64.extend_i32_u
                 i64_store(off, code);
             }
@@ -2842,7 +3519,7 @@ fn emit_arm_body(
                     WType::F64 => f64_load(off, code),
                     WType::I64 => i64_load(off, code),
                     WType::I32 | WType::Ref | WType::Str | WType::Tensor | WType::Array(_) | WType::Bytes
-                    | WType::Vector => {
+                    | WType::Vector | WType::Map(..) | WType::Set(_) => {
                         i64_load(off, code);
                         code.push(0xA7); // i32.wrap_i64
                     }
@@ -2983,6 +3660,13 @@ fn emit_prim(op: BinOp, lt: WType, rt: WType, code: &mut Vec<u8>) -> Result<WTyp
                         "wasm backend: internal — Vector `==` should be routed earlier".into(),
                     )
                 }
+                // Map/Set `==` is handled in `emit_bind` (it needs `env` to call
+                // `__map_eq`/`__set_eq` + drop operands), so it never reaches here.
+                WType::Map(..) | WType::Set(_) => {
+                    return Err(
+                        "wasm backend: internal — Map/Set `==` should be routed earlier".into(),
+                    )
+                }
                 WType::F32 => unreachable!("F32 is not an Aria value type"),
             }
             Ok(WType::I32)
@@ -3050,6 +3734,8 @@ fn emit_iexpr(e: &IExpr, env: &mut LocalEnv, code: &mut Vec<u8>) -> Result<WType
                 // array helpers (kind-aware drop sees kind=Int -> no child refs).
                 WType::Bytes => Some(HeapHelper::DupArray),
                 WType::Vector => Some(HeapHelper::DupVec),
+                WType::Map(..) => Some(HeapHelper::DupMap),
+                WType::Set(_) => Some(HeapHelper::DupSet),
                 _ => None,
             };
             if let Some(h) = h {
@@ -3069,6 +3755,8 @@ fn emit_iexpr(e: &IExpr, env: &mut LocalEnv, code: &mut Vec<u8>) -> Result<WType
                 WType::Array(_) => Some(HeapHelper::DropArray),
                 WType::Bytes => Some(HeapHelper::DropArray),
                 WType::Vector => Some(HeapHelper::DropVec),
+                WType::Map(..) => Some(HeapHelper::DropMap),
+                WType::Set(_) => Some(HeapHelper::DropSet),
                 _ => None,
             };
             if let Some(h) = h {
@@ -3403,6 +4091,16 @@ fn emit_heap_helper(
     let alloc_vec_idx = heap_base + HeapHelper::AllocVec.offset();
     let drop_vec_idx = heap_base + HeapHelper::DropVec.offset();
     let array_push_idx = heap_base + HeapHelper::ArrayPush.offset();
+    let int_to_str_idx = heap_base + HeapHelper::IntToStr.offset();
+    // Map/Set helper indices.
+    let key_cmp_idx = heap_base + HeapHelper::KeyCmp.offset();
+    let slot_dup_idx = heap_base + HeapHelper::SlotDupK.offset();
+    let slot_drop_idx = heap_base + HeapHelper::SlotDropK.offset();
+    let slot_eq_idx = heap_base + HeapHelper::SlotEqK.offset();
+    let alloc_map_idx = heap_base + HeapHelper::AllocMap.offset();
+    let drop_map_idx = heap_base + HeapHelper::DropMap.offset();
+    let alloc_set_idx = heap_base + HeapHelper::AllocSet.offset();
+    let drop_set_idx = heap_base + HeapHelper::DropSet.offset();
 
     let mut body: Vec<u8> = Vec::new();
     match h {
@@ -3642,6 +4340,8 @@ fn emit_heap_helper(
                         WType::Str => drop_str_idx,
                         WType::Array(_) => drop_array_idx,
                         WType::Vector => drop_vec_idx,
+                        WType::Map(..) => heap_base + HeapHelper::DropMap.offset(),
+                        WType::Set(_) => heap_base + HeapHelper::DropSet.offset(),
                         _ => drop_idx,
                     };
                     leb_u(idx as u64, &mut body);
@@ -4346,7 +5046,11 @@ fn emit_heap_helper(
                         // Array field (emit_adt_eq guards on any_array_field), so
                         // these arms are never reached at runtime; emit a
                         // constant-true to keep the match exhaustive.
-                        WType::Tensor | WType::Array(_) | WType::Vector => {
+                        // Tensor/Array/Vector/Map/Set ADT fields: ADT `==` is
+                        // gated when any ctor carries one (emit_adt_eq), so these
+                        // arms are never reached; constant-true keeps it exhaustive.
+                        WType::Tensor | WType::Array(_) | WType::Vector
+                        | WType::Map(..) | WType::Set(_) => {
                             body.push(I32_CONST);
                             leb_s(1, &mut body);
                         }
@@ -7740,7 +8444,2810 @@ fn emit_heap_helper(
             leb_s(1, &mut body);
             helper_entry(&[WType::I32, WType::I32, WType::I32], body)
         }
+        HeapHelper::KeyCmp => {
+            // (kind:i64, a:i64, b:i64) -> i32 in {-1,0,1}. Mirrors aria_key_cmp:
+            // Str(2) = lexicographic unsigned-byte then length; Int(0)/else =
+            // signed i64 compare. Locals: xa(3,i32),xb(4,i32),na(5,i32),nb(6,i32),
+            // n(7,i32),i(8,i32),ca(9,i32),cb(10,i32).
+            // if kind == 2 (Str)
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(I64_CONST);
+            leb_s(2, &mut body);
+            body.push(I64_EQ);
+            body.push(IF);
+            body.push(BT_VOID); // body always `return`s; never falls through
+            // xa = (i32)a ; xb = (i32)b  (AriaStr pointers)
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body);
+            body.push(I32_WRAP_I64);
+            body.push(LOCAL_SET);
+            leb_u(3, &mut body); // xa
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body);
+            body.push(I32_WRAP_I64);
+            body.push(LOCAL_SET);
+            leb_u(4, &mut body); // xb
+            // na = [xa+8] (len) ; nb = [xb+8]
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            i64_load(8, &mut body);
+            body.push(I32_WRAP_I64);
+            body.push(LOCAL_SET);
+            leb_u(5, &mut body); // na
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body);
+            i64_load(8, &mut body);
+            body.push(I32_WRAP_I64);
+            body.push(LOCAL_SET);
+            leb_u(6, &mut body); // nb
+            // n = min(na, nb)
+            body.push(LOCAL_GET);
+            leb_u(5, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(6, &mut body);
+            body.push(0x48); // i32.lt_s
+            body.push(IF);
+            body.push(0x7F);
+            body.push(LOCAL_GET);
+            leb_u(5, &mut body);
+            body.push(ELSE);
+            body.push(LOCAL_GET);
+            leb_u(6, &mut body);
+            body.push(END);
+            body.push(LOCAL_SET);
+            leb_u(7, &mut body); // n
+            // i = 0; loop while i<n: ca=byte[xa+16+i], cb=byte[xb+16+i] (UNSIGNED)
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(8, &mut body); // i
+            body.push(0x03); // loop
+            body.push(BT_VOID);
+            body.push(LOCAL_GET);
+            leb_u(8, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(7, &mut body);
+            body.push(0x48); // i32.lt_s
+            body.push(IF);
+            body.push(BT_VOID);
+            // ca = load8_u[xa + STR_HEADER + i]
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            body.push(I32_CONST);
+            leb_s(STR_HEADER as i64, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_GET);
+            leb_u(8, &mut body);
+            body.push(I32_ADD);
+            i32_load8_u(0, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(9, &mut body); // ca
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body);
+            body.push(I32_CONST);
+            leb_s(STR_HEADER as i64, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_GET);
+            leb_u(8, &mut body);
+            body.push(I32_ADD);
+            i32_load8_u(0, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(10, &mut body); // cb
+            // if ca < cb return -1 ; if ca > cb return 1   (unsigned)
+            body.push(LOCAL_GET);
+            leb_u(9, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(10, &mut body);
+            body.push(0x49); // i32.lt_u
+            body.push(IF);
+            body.push(BT_VOID);
+            body.push(I32_CONST);
+            leb_s(-1, &mut body);
+            body.push(0x0F); // return
+            body.push(END);
+            body.push(LOCAL_GET);
+            leb_u(9, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(10, &mut body);
+            body.push(0x4B); // i32.gt_u
+            body.push(IF);
+            body.push(BT_VOID);
+            body.push(I32_CONST);
+            leb_s(1, &mut body);
+            body.push(0x0F); // return
+            body.push(END);
+            // i++ ; continue
+            body.push(LOCAL_GET);
+            leb_u(8, &mut body);
+            body.push(I32_CONST);
+            leb_s(1, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_SET);
+            leb_u(8, &mut body);
+            body.push(0x0C); // br loop
+            leb_u(1, &mut body);
+            body.push(END); // end if i<n
+            body.push(END); // end loop
+            // tie on prefix: compare lengths. na<nb -> -1 ; na>nb -> 1 ; else 0
+            body.push(LOCAL_GET);
+            leb_u(5, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(6, &mut body);
+            body.push(0x48); // i32.lt_s
+            body.push(IF);
+            body.push(0x7F);
+            body.push(I32_CONST);
+            leb_s(-1, &mut body);
+            body.push(ELSE);
+            body.push(LOCAL_GET);
+            leb_u(5, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(6, &mut body);
+            body.push(0x4A); // i32.gt_s
+            body.push(IF);
+            body.push(0x7F);
+            body.push(I32_CONST);
+            leb_s(1, &mut body);
+            body.push(ELSE);
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            body.push(END);
+            body.push(END);
+            body.push(0x0F); // return the Str result
+            body.push(END); // end if kind==2
+            // Int compare: a<b -> -1 ; a>b -> 1 ; else 0  (signed i64)
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body);
+            body.push(0x53); // i64.lt_s
+            body.push(IF);
+            body.push(0x7F);
+            body.push(I32_CONST);
+            leb_s(-1, &mut body);
+            body.push(ELSE);
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body);
+            body.push(0x55); // i64.gt_s
+            body.push(IF);
+            body.push(0x7F);
+            body.push(I32_CONST);
+            leb_s(1, &mut body);
+            body.push(ELSE);
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            body.push(END);
+            body.push(END);
+            helper_entry(
+                &[
+                    WType::I32, WType::I32, WType::I32, WType::I32, WType::I32,
+                    WType::I32, WType::I32, WType::I32,
+                ],
+                body,
+            )
+        }
+        HeapHelper::SlotDupK => {
+            // (kind:i64, slot:i64) -> i32. Str(2) -> __dup_str ; Bytes(4) ->
+            // __dup_array (a Bytes is an Array(Int) heap object). Else no-op.
+            let dup_array_idx = heap_base + HeapHelper::DupArray.offset();
+            emit_slot_kind_call(&mut body, dup_str_idx, dup_array_idx);
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            helper_entry(&[], body)
+        }
+        HeapHelper::SlotDropK => {
+            // (kind:i64, slot:i64) -> i32. Str(2) -> __drop_str ; Bytes(4) ->
+            // __drop_array. Else no-op.
+            emit_slot_kind_call(&mut body, drop_str_idx, drop_array_idx);
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            helper_entry(&[], body)
+        }
+        HeapHelper::SlotEqK => {
+            // (kind:i64, a:i64, b:i64) -> i32. Float(1): f64 bit-decode compare;
+            // Str(2): __streq; Bytes(4): __byteseq; else raw i64 eq.
+            let byteseq_idx = heap_base + HeapHelper::BytesEq.offset();
+            // if kind == 1 (Float): f64.reinterpret each, f64.eq
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(I64_CONST);
+            leb_s(1, &mut body);
+            body.push(I64_EQ);
+            body.push(IF);
+            body.push(0x7F);
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body);
+            body.push(0xBF); // f64.reinterpret_i64
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body);
+            body.push(0xBF);
+            body.push(0x61); // f64.eq
+            body.push(ELSE);
+            // if kind == 2 (Str): __streq((i32)a,(i32)b)
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(I64_CONST);
+            leb_s(2, &mut body);
+            body.push(I64_EQ);
+            body.push(IF);
+            body.push(0x7F);
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body);
+            body.push(I32_WRAP_I64);
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body);
+            body.push(I32_WRAP_I64);
+            body.push(CALL);
+            leb_u(streq_idx as u64, &mut body);
+            body.push(ELSE);
+            // if kind == 4 (Bytes): __byteseq((i32)a,(i32)b)
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(I64_CONST);
+            leb_s(4, &mut body);
+            body.push(I64_EQ);
+            body.push(IF);
+            body.push(0x7F);
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body);
+            body.push(I32_WRAP_I64);
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body);
+            body.push(I32_WRAP_I64);
+            body.push(CALL);
+            leb_u(byteseq_idx as u64, &mut body);
+            body.push(ELSE);
+            // else (Int/Bool): a == b
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body);
+            body.push(I64_EQ);
+            body.push(END);
+            body.push(END);
+            body.push(END);
+            helper_entry(&[], body)
+        }
+        HeapHelper::AllocMap => {
+            // (kkind:i64, vkind:i64, cap:i32) -> ptr:i32. cls = 2*cap + 3 (clamped).
+            // Locals: cls(3,i32), ptr(4,i32).
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body); // cap
+            body.push(I32_CONST);
+            leb_s(2, &mut body);
+            body.push(I32_MUL);
+            body.push(I32_CONST);
+            leb_s(3, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_TEE);
+            leb_u(3, &mut body); // cls
+            body.push(I32_CONST);
+            leb_s(TENSOR_MAX_CLASS as i64, &mut body);
+            body.push(0x4B); // i32.gt_u
+            body.push(IF);
+            body.push(BT_VOID);
+            body.push(I32_CONST);
+            leb_s(TENSOR_MAX_CLASS as i64, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(3, &mut body);
+            body.push(END);
+            // ptr = __alloc(cls)
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            body.push(CALL);
+            leb_u(alloc_idx as u64, &mut body);
+            body.push(LOCAL_TEE);
+            leb_u(4, &mut body); // ptr
+            // [ptr+8] = kkind
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_store(8, &mut body);
+            // [ptr+16] = vkind
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body);
+            i64_store(16, &mut body);
+            // [ptr+24] = len = 0
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body);
+            body.push(I64_CONST);
+            leb_s(0, &mut body);
+            i64_store(24, &mut body);
+            // [ptr+32] = cap
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body);
+            body.push(I64_EXTEND_I32_U);
+            i64_store(32, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body);
+            helper_entry(&[WType::I32, WType::I32], body)
+        }
+        HeapHelper::DupMap => {
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(0, &mut body);
+            body.push(I64_CONST);
+            leb_s(1, &mut body);
+            body.push(I64_ADD);
+            i64_store(0, &mut body);
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            helper_entry(&[], body)
+        }
+        HeapHelper::DropMap => {
+            // (ptr:i32) -> i32. rc--; at 0 drop each slot (kind-aware) then free.
+            // cls = 2*cap + 3 (clamped). Locals: rc(1,i64), kk(2,i64), vk(3,i64),
+            // n(4,i32), i(5,i32), cls(6,i32).
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(0, &mut body);
+            body.push(I64_CONST);
+            leb_s(1, &mut body);
+            body.push(I64_SUB);
+            body.push(LOCAL_TEE);
+            leb_u(1, &mut body);
+            i64_store(0, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body);
+            body.push(I64_EQZ);
+            body.push(IF);
+            body.push(BT_VOID);
+            // kk=[ptr+8], vk=[ptr+16], n=[ptr+24]
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(8, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(2, &mut body); // kk
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(16, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(3, &mut body); // vk
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(24, &mut body);
+            body.push(I32_WRAP_I64);
+            body.push(LOCAL_SET);
+            leb_u(4, &mut body); // n
+            // i=0; loop while i<n: drop key slot (kk), drop val slot (vk)
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(5, &mut body);
+            body.push(0x03); // loop
+            body.push(BT_VOID);
+            body.push(LOCAL_GET);
+            leb_u(5, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body);
+            body.push(0x48); // i32.lt_s
+            body.push(IF);
+            body.push(BT_VOID);
+            // __slot_drop(kk, key= map.slots[2*i])
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body);
+            map_slot_load(&mut body, 0, 5, 0);
+            body.push(CALL);
+            leb_u(slot_drop_idx as u64, &mut body);
+            body.push(DROP);
+            // __slot_drop(vk, val= map.slots[2*i+1])
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            map_slot_load(&mut body, 0, 5, 1);
+            body.push(CALL);
+            leb_u(slot_drop_idx as u64, &mut body);
+            body.push(DROP);
+            body.push(LOCAL_GET);
+            leb_u(5, &mut body);
+            body.push(I32_CONST);
+            leb_s(1, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_SET);
+            leb_u(5, &mut body);
+            body.push(0x0C);
+            leb_u(1, &mut body);
+            body.push(END); // if i<n
+            body.push(END); // loop
+            // cls = 2*cap+3 (clamped); cap=[ptr+32]
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(32, &mut body);
+            body.push(I32_WRAP_I64);
+            body.push(I32_CONST);
+            leb_s(2, &mut body);
+            body.push(I32_MUL);
+            body.push(I32_CONST);
+            leb_s(3, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_TEE);
+            leb_u(6, &mut body);
+            body.push(I32_CONST);
+            leb_s(TENSOR_MAX_CLASS as i64, &mut body);
+            body.push(0x4B);
+            body.push(IF);
+            body.push(BT_VOID);
+            body.push(I32_CONST);
+            leb_s(TENSOR_MAX_CLASS as i64, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(6, &mut body);
+            body.push(END);
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(6, &mut body);
+            body.push(CALL);
+            leb_u(free_idx as u64, &mut body);
+            body.push(DROP);
+            body.push(END); // if rc==0
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            helper_entry(
+                &[WType::I64, WType::I64, WType::I64, WType::I32, WType::I32, WType::I32],
+                body,
+            )
+        }
+        HeapHelper::MapLen => {
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(24, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(1, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(CALL);
+            leb_u(drop_map_idx as u64, &mut body);
+            body.push(DROP);
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body);
+            helper_entry(&[WType::I64], body)
+        }
+        HeapHelper::AllocSet => {
+            // (ekind:i64, cap:i32) -> ptr:i32. cls = cap + 2 (clamped).
+            // Locals: cls(2,i32), ptr(3,i32).
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body); // cap
+            body.push(I32_CONST);
+            leb_s(2, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_TEE);
+            leb_u(2, &mut body);
+            body.push(I32_CONST);
+            leb_s(TENSOR_MAX_CLASS as i64, &mut body);
+            body.push(0x4B);
+            body.push(IF);
+            body.push(BT_VOID);
+            body.push(I32_CONST);
+            leb_s(TENSOR_MAX_CLASS as i64, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(2, &mut body);
+            body.push(END);
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body);
+            body.push(CALL);
+            leb_u(alloc_idx as u64, &mut body);
+            body.push(LOCAL_TEE);
+            leb_u(3, &mut body);
+            // [ptr+8] = ekind
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_store(8, &mut body);
+            // [ptr+16] = len = 0
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            body.push(I64_CONST);
+            leb_s(0, &mut body);
+            i64_store(16, &mut body);
+            // [ptr+24] = cap
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body);
+            body.push(I64_EXTEND_I32_U);
+            i64_store(24, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            helper_entry(&[WType::I32, WType::I32], body)
+        }
+        HeapHelper::DupSet => {
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(0, &mut body);
+            body.push(I64_CONST);
+            leb_s(1, &mut body);
+            body.push(I64_ADD);
+            i64_store(0, &mut body);
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            helper_entry(&[], body)
+        }
+        HeapHelper::DropSet => {
+            // (ptr:i32) -> i32. rc--; at 0 drop each elem (kind-aware) then free.
+            // cls = cap + 2 (clamped). Locals: rc(1,i64), ek(2,i64), n(3,i32),
+            // i(4,i32), cls(5,i32).
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(0, &mut body);
+            body.push(I64_CONST);
+            leb_s(1, &mut body);
+            body.push(I64_SUB);
+            body.push(LOCAL_TEE);
+            leb_u(1, &mut body);
+            i64_store(0, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body);
+            body.push(I64_EQZ);
+            body.push(IF);
+            body.push(BT_VOID);
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(8, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(2, &mut body); // ek
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(16, &mut body);
+            body.push(I32_WRAP_I64);
+            body.push(LOCAL_SET);
+            leb_u(3, &mut body); // n
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(4, &mut body);
+            body.push(0x03);
+            body.push(BT_VOID);
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            body.push(0x48);
+            body.push(IF);
+            body.push(BT_VOID);
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body);
+            set_slot_load(&mut body, 0, 4);
+            body.push(CALL);
+            leb_u(slot_drop_idx as u64, &mut body);
+            body.push(DROP);
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body);
+            body.push(I32_CONST);
+            leb_s(1, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_SET);
+            leb_u(4, &mut body);
+            body.push(0x0C);
+            leb_u(1, &mut body);
+            body.push(END);
+            body.push(END);
+            // cls = cap+2 (clamped); cap=[ptr+24]
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(24, &mut body);
+            body.push(I32_WRAP_I64);
+            body.push(I32_CONST);
+            leb_s(2, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_TEE);
+            leb_u(5, &mut body);
+            body.push(I32_CONST);
+            leb_s(TENSOR_MAX_CLASS as i64, &mut body);
+            body.push(0x4B);
+            body.push(IF);
+            body.push(BT_VOID);
+            body.push(I32_CONST);
+            leb_s(TENSOR_MAX_CLASS as i64, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(5, &mut body);
+            body.push(END);
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(5, &mut body);
+            body.push(CALL);
+            leb_u(free_idx as u64, &mut body);
+            body.push(DROP);
+            body.push(END);
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            helper_entry(&[WType::I64, WType::I64, WType::I32, WType::I32, WType::I32], body)
+        }
+        HeapHelper::SetLen => {
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(16, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(1, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(CALL);
+            leb_u(drop_set_idx as u64, &mut body);
+            body.push(DROP);
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body);
+            helper_entry(&[WType::I64], body)
+        }
+        HeapHelper::MapInsert
+        | HeapHelper::MapGetOr
+        | HeapHelper::MapHas
+        | HeapHelper::MapRemove
+        | HeapHelper::MapKeys
+        | HeapHelper::MapValues
+        | HeapHelper::MapEq
+        | HeapHelper::MapShow
+        | HeapHelper::SetAdd
+        | HeapHelper::SetHas
+        | HeapHelper::SetRemove
+        | HeapHelper::SetToArr
+        | HeapHelper::SetEq
+        | HeapHelper::SetShow => emit_map_set_op(
+            h,
+            heap_base,
+            key_cmp_idx,
+            slot_dup_idx,
+            slot_drop_idx,
+            slot_eq_idx,
+            alloc_map_idx,
+            drop_map_idx,
+            alloc_set_idx,
+            drop_set_idx,
+            free_idx,
+            alloc_array_idx,
+            array_push_idx,
+            alloc_str_idx,
+            int_to_str_idx,
+        ),
     }
+}
+
+/// Emit one of the higher-level Map/Set operations (insert/get_or/has/remove/
+/// keys/values/eq/show and the Set analogues). Split out of `emit_heap_helper`
+/// to keep that match readable. The buffer stays sorted, so a LINEAR scan to the
+/// insertion point yields the SAME found-index / insertion-point as the native
+/// binary search — semantically identical and order-preserving.
+#[allow(clippy::too_many_arguments)]
+fn emit_map_set_op(
+    h: HeapHelper,
+    heap_base: u32,
+    key_cmp_idx: u32,
+    slot_dup_idx: u32,
+    slot_drop_idx: u32,
+    slot_eq_idx: u32,
+    alloc_map_idx: u32,
+    drop_map_idx: u32,
+    alloc_set_idx: u32,
+    drop_set_idx: u32,
+    free_idx: u32,
+    alloc_array_idx: u32,
+    array_push_idx: u32,
+    alloc_str_idx: u32,
+    int_to_str_idx: u32,
+) -> Vec<u8> {
+    let _ = (heap_base, free_idx);
+    match h {
+        HeapHelper::MapInsert => emit_map_insert(
+            key_cmp_idx, slot_drop_idx, alloc_map_idx, drop_map_idx, slot_dup_idx, free_idx,
+        ),
+        HeapHelper::MapGetOr => emit_map_get_or(key_cmp_idx, slot_dup_idx, slot_drop_idx, drop_map_idx),
+        HeapHelper::MapHas => emit_map_has(key_cmp_idx, slot_drop_idx, drop_map_idx),
+        HeapHelper::MapRemove => emit_map_remove(
+            key_cmp_idx, slot_drop_idx, alloc_map_idx, drop_map_idx, slot_dup_idx,
+        ),
+        HeapHelper::MapKeys | HeapHelper::MapValues => {
+            emit_map_enumerate(h, slot_dup_idx, drop_map_idx, alloc_array_idx, array_push_idx)
+        }
+        HeapHelper::MapEq => emit_map_eq(key_cmp_idx, slot_eq_idx),
+        HeapHelper::MapShow => emit_map_show(slot_drop_idx, drop_map_idx, alloc_str_idx, int_to_str_idx),
+        HeapHelper::SetAdd => emit_set_add(
+            key_cmp_idx, slot_drop_idx, alloc_set_idx, drop_set_idx, slot_dup_idx, free_idx,
+        ),
+        HeapHelper::SetHas => emit_set_has(key_cmp_idx, slot_drop_idx, drop_set_idx),
+        HeapHelper::SetRemove => emit_set_remove(
+            key_cmp_idx, slot_drop_idx, alloc_set_idx, drop_set_idx, slot_dup_idx,
+        ),
+        HeapHelper::SetToArr => {
+            emit_set_to_arr(slot_dup_idx, drop_set_idx, alloc_array_idx, array_push_idx)
+        }
+        HeapHelper::SetEq => emit_set_eq(key_cmp_idx),
+        HeapHelper::SetShow => emit_set_show(slot_drop_idx, drop_set_idx, alloc_str_idx, int_to_str_idx),
+        _ => unreachable!("emit_map_set_op: not a map/set op"),
+    }
+}
+
+// ---- Map / Set operation bodies ------------------------------------------
+//
+// Shared conventions across these emitters:
+//   * Opcodes are pushed as raw bytes (consistent with the rest of the file).
+//   * A LINEAR scan locates the insertion point `idx` and a `found` flag in a
+//     SORTED buffer (identical result to native's binary search).
+//   * FBIP: when rc==1 the buffer is mutated in place and `__reuses` is bumped;
+//     otherwise it is cloned (COW) and the original dropped.
+
+/// Bump the global `__reuses` counter by one (FBIP accounting).
+fn emit_reuses_inc(body: &mut Vec<u8>) {
+    body.push(0x41); // i32.const REUSES_ADDR
+    leb_s(REUSES_ADDR as i64, body);
+    body.push(0x41);
+    leb_s(REUSES_ADDR as i64, body);
+    i64_load(0, body);
+    body.push(0x42);
+    leb_s(1, body);
+    body.push(0x7C); // i64.add
+    i64_store(0, body);
+}
+
+/// Emit a linear scan over a Map's keys looking for `key` (in local `key_l`).
+/// Walks `i` (local `i_l`) from 0 while `key_cmp(kkind, slots[2*i], key) < 0`,
+/// stopping at the first key >= `key`. After the scan, `i_l` is the insertion
+/// point. Sets `found_l` to 1 iff `slots[2*i] == key` (cmp==0). Requires:
+/// `ptr_l` (Map ptr), `kk_l` (kkind i64), `n_l` (len i32), `cmp_l` (i32 scratch).
+fn emit_map_find(
+    body: &mut Vec<u8>,
+    key_cmp_idx: u32,
+    ptr_l: u32,
+    kk_l: u32,
+    key_l: u32,
+    n_l: u32,
+    i_l: u32,
+    found_l: u32,
+    cmp_l: u32,
+) {
+    // found = 0 ; i = 0
+    body.push(0x41);
+    leb_s(0, body);
+    body.push(0x21);
+    leb_u(found_l as u64, body);
+    body.push(0x41);
+    leb_s(0, body);
+    body.push(0x21);
+    leb_u(i_l as u64, body);
+    // block B { loop L { if i<n { ... } else { br B } } }
+    body.push(0x02); // block B
+    body.push(0x40);
+    body.push(0x03); // loop L
+    body.push(0x40);
+    // if i < n
+    body.push(0x20);
+    leb_u(i_l as u64, body);
+    body.push(0x20);
+    leb_u(n_l as u64, body);
+    body.push(0x48); // i32.lt_s
+    body.push(0x04); // if
+    body.push(0x40);
+    // cmp = key_cmp(kk, slots[2*i], key)
+    body.push(0x20);
+    leb_u(kk_l as u64, body);
+    map_slot_load(body, ptr_l, i_l, 0);
+    body.push(0x20);
+    leb_u(key_l as u64, body);
+    body.push(0x10);
+    leb_u(key_cmp_idx as u64, body);
+    body.push(0x21);
+    leb_u(cmp_l as u64, body);
+    // if cmp == 0 { found = 1; br B }
+    body.push(0x20);
+    leb_u(cmp_l as u64, body);
+    body.push(0x45); // i32.eqz
+    body.push(0x04);
+    body.push(0x40);
+    body.push(0x41);
+    leb_s(1, body);
+    body.push(0x21);
+    leb_u(found_l as u64, body);
+    body.push(0x0C); // br 3 -> block B (innermost..: ifcmp0=0,ifi<n=1,loop=2,block=3)
+    leb_u(3, body);
+    body.push(0x0B); // end if cmp==0
+    // if cmp < 0 { i++ ; br L } else { br B }  (cmp>0 -> insertion point)
+    body.push(0x20);
+    leb_u(cmp_l as u64, body);
+    body.push(0x41);
+    leb_s(0, body);
+    body.push(0x48); // i32.lt_s
+    body.push(0x04);
+    body.push(0x40);
+    body.push(0x20);
+    leb_u(i_l as u64, body);
+    body.push(0x41);
+    leb_s(1, body);
+    body.push(0x6A);
+    body.push(0x21);
+    leb_u(i_l as u64, body);
+    body.push(0x0C); // br 2 -> loop L (ifcmp<0=0,ifi<n=1,loop=2)
+    leb_u(2, body);
+    body.push(0x05); // else
+    body.push(0x0C); // br 3 -> block B
+    leb_u(3, body);
+    body.push(0x0B); // end if cmp<0
+    body.push(0x05); // else (i>=n)
+    body.push(0x0C); // br 2 -> block B (ifi<n=0,loop=1,block=2)
+    leb_u(2, body);
+    body.push(0x0B); // end if i<n
+    body.push(0x0B); // end loop L
+    body.push(0x0B); // end block B
+}
+
+/// Linear scan over a Set's elements (analogous to `emit_map_find`).
+fn emit_set_find(
+    body: &mut Vec<u8>,
+    key_cmp_idx: u32,
+    ptr_l: u32,
+    ek_l: u32,
+    e_l: u32,
+    n_l: u32,
+    i_l: u32,
+    found_l: u32,
+    cmp_l: u32,
+) {
+    body.push(0x41);
+    leb_s(0, body);
+    body.push(0x21);
+    leb_u(found_l as u64, body);
+    body.push(0x41);
+    leb_s(0, body);
+    body.push(0x21);
+    leb_u(i_l as u64, body);
+    body.push(0x02); // block B
+    body.push(0x40);
+    body.push(0x03); // loop L
+    body.push(0x40);
+    body.push(0x20);
+    leb_u(i_l as u64, body);
+    body.push(0x20);
+    leb_u(n_l as u64, body);
+    body.push(0x48);
+    body.push(0x04); // if i<n
+    body.push(0x40);
+    body.push(0x20);
+    leb_u(ek_l as u64, body);
+    set_slot_load(body, ptr_l, i_l);
+    body.push(0x20);
+    leb_u(e_l as u64, body);
+    body.push(0x10);
+    leb_u(key_cmp_idx as u64, body);
+    body.push(0x21);
+    leb_u(cmp_l as u64, body);
+    // if cmp == 0 { found = 1; br B }
+    body.push(0x20);
+    leb_u(cmp_l as u64, body);
+    body.push(0x45);
+    body.push(0x04);
+    body.push(0x40);
+    body.push(0x41);
+    leb_s(1, body);
+    body.push(0x21);
+    leb_u(found_l as u64, body);
+    body.push(0x0C);
+    leb_u(3, body);
+    body.push(0x0B);
+    // if cmp < 0 { i++ ; br L } else { br B }
+    body.push(0x20);
+    leb_u(cmp_l as u64, body);
+    body.push(0x41);
+    leb_s(0, body);
+    body.push(0x48);
+    body.push(0x04);
+    body.push(0x40);
+    body.push(0x20);
+    leb_u(i_l as u64, body);
+    body.push(0x41);
+    leb_s(1, body);
+    body.push(0x6A);
+    body.push(0x21);
+    leb_u(i_l as u64, body);
+    body.push(0x0C);
+    leb_u(2, body);
+    body.push(0x05); // else
+    body.push(0x0C);
+    leb_u(3, body);
+    body.push(0x0B);
+    body.push(0x05); // else (i>=n)
+    body.push(0x0C);
+    leb_u(2, body);
+    body.push(0x0B); // end if i<n
+    body.push(0x0B); // end loop
+    body.push(0x0B); // end block
+}
+
+/// Emit code that clones a Map `src_l` into a fresh Map `dst_l` of capacity =
+/// max(len,1), dup'ing each key/value slot kind-aware. Requires kk_l/vk_l hold
+/// the kkinds, n_l the len, and j_l a loop scratch. Leaves nothing on the stack.
+fn emit_map_clone(
+    body: &mut Vec<u8>,
+    alloc_map_idx: u32,
+    slot_dup_idx: u32,
+    src_l: u32,
+    dst_l: u32,
+    kk_l: u32,
+    vk_l: u32,
+    n_l: u32,
+    j_l: u32,
+) {
+    // cap = n>0 ? n : 1
+    // dst = __alloc_map(kk, vk, cap)
+    body.push(0x20);
+    leb_u(kk_l as u64, body);
+    body.push(0x20);
+    leb_u(vk_l as u64, body);
+    body.push(0x20);
+    leb_u(n_l as u64, body);
+    body.push(0x41);
+    leb_s(0, body);
+    body.push(0x4A); // i32.gt_s
+    body.push(0x04);
+    body.push(0x7F);
+    body.push(0x20);
+    leb_u(n_l as u64, body);
+    body.push(0x05);
+    body.push(0x41);
+    leb_s(1, body);
+    body.push(0x0B);
+    body.push(0x10);
+    leb_u(alloc_map_idx as u64, body);
+    body.push(0x21);
+    leb_u(dst_l as u64, body);
+    // dst.len = n
+    body.push(0x20);
+    leb_u(dst_l as u64, body);
+    body.push(0x20);
+    leb_u(n_l as u64, body);
+    body.push(0xAD);
+    i64_store(24, body);
+    // j=0; while j<n: dst.slots[2j]=src.slots[2j]; dup(kk); dst.slots[2j+1]=..; dup(vk)
+    body.push(0x41);
+    leb_s(0, body);
+    body.push(0x21);
+    leb_u(j_l as u64, body);
+    body.push(0x03);
+    body.push(0x40);
+    body.push(0x20);
+    leb_u(j_l as u64, body);
+    body.push(0x20);
+    leb_u(n_l as u64, body);
+    body.push(0x48);
+    body.push(0x04);
+    body.push(0x40);
+    // dst.slots[2j] = src.slots[2j]
+    map_slot_addr(body, dst_l, j_l, 0);
+    map_slot_load(body, src_l, j_l, 0);
+    i64_store(0, body);
+    // slot_dup(kk, src.slots[2j])
+    body.push(0x20);
+    leb_u(kk_l as u64, body);
+    map_slot_load(body, src_l, j_l, 0);
+    body.push(0x10);
+    leb_u(slot_dup_idx as u64, body);
+    body.push(0x1A);
+    // dst.slots[2j+1] = src.slots[2j+1]
+    map_slot_addr(body, dst_l, j_l, 1);
+    map_slot_load(body, src_l, j_l, 1);
+    i64_store(0, body);
+    body.push(0x20);
+    leb_u(vk_l as u64, body);
+    map_slot_load(body, src_l, j_l, 1);
+    body.push(0x10);
+    leb_u(slot_dup_idx as u64, body);
+    body.push(0x1A);
+    // j++
+    body.push(0x20);
+    leb_u(j_l as u64, body);
+    body.push(0x41);
+    leb_s(1, body);
+    body.push(0x6A);
+    body.push(0x21);
+    leb_u(j_l as u64, body);
+    body.push(0x0C);
+    leb_u(1, body);
+    body.push(0x0B);
+    body.push(0x0B);
+}
+
+/// Clone a Set `src_l` into a fresh Set `dst_l`, dup'ing each element.
+fn emit_set_clone(
+    body: &mut Vec<u8>,
+    alloc_set_idx: u32,
+    slot_dup_idx: u32,
+    src_l: u32,
+    dst_l: u32,
+    ek_l: u32,
+    n_l: u32,
+    j_l: u32,
+) {
+    body.push(0x20);
+    leb_u(ek_l as u64, body);
+    body.push(0x20);
+    leb_u(n_l as u64, body);
+    body.push(0x41);
+    leb_s(0, body);
+    body.push(0x4A);
+    body.push(0x04);
+    body.push(0x7F);
+    body.push(0x20);
+    leb_u(n_l as u64, body);
+    body.push(0x05);
+    body.push(0x41);
+    leb_s(1, body);
+    body.push(0x0B);
+    body.push(0x10);
+    leb_u(alloc_set_idx as u64, body);
+    body.push(0x21);
+    leb_u(dst_l as u64, body);
+    body.push(0x20);
+    leb_u(dst_l as u64, body);
+    body.push(0x20);
+    leb_u(n_l as u64, body);
+    body.push(0xAD);
+    i64_store(16, body);
+    body.push(0x41);
+    leb_s(0, body);
+    body.push(0x21);
+    leb_u(j_l as u64, body);
+    body.push(0x03);
+    body.push(0x40);
+    body.push(0x20);
+    leb_u(j_l as u64, body);
+    body.push(0x20);
+    leb_u(n_l as u64, body);
+    body.push(0x48);
+    body.push(0x04);
+    body.push(0x40);
+    set_slot_addr(body, dst_l, j_l);
+    set_slot_load(body, src_l, j_l);
+    i64_store(0, body);
+    body.push(0x20);
+    leb_u(ek_l as u64, body);
+    set_slot_load(body, src_l, j_l);
+    body.push(0x10);
+    leb_u(slot_dup_idx as u64, body);
+    body.push(0x1A);
+    body.push(0x20);
+    leb_u(j_l as u64, body);
+    body.push(0x41);
+    leb_s(1, body);
+    body.push(0x6A);
+    body.push(0x21);
+    leb_u(j_l as u64, body);
+    body.push(0x0C);
+    leb_u(1, body);
+    body.push(0x0B);
+    body.push(0x0B);
+}
+
+/// Ensure the uniquely-owned Map in `m_l` has room for one more entry. If
+/// len==cap, allocate a bigger Map (ncap = cap>0?cap*2:4), copy header + all
+/// slots RAW (ownership transfers, no rc change), free the old buffer shallow
+/// (no child drops), and update `m_l` to the new buffer. Locals: cap(cap_l,i32),
+/// nm(nm_l,i32), ncap(ncap_l,i32), j(j_l,i32), n(n_l,i32), kk(kk_l,i64),
+/// vk(vk_l,i64). All read from `m_l`'s header at call time.
+#[allow(clippy::too_many_arguments)]
+fn emit_map_grow(
+    body: &mut Vec<u8>,
+    alloc_map_idx: u32,
+    free_idx: u32,
+    m_l: u32,
+    n_l: u32,
+    cap_l: u32,
+    nm_l: u32,
+    ncap_l: u32,
+    j_l: u32,
+    kk_l: u32,
+    vk_l: u32,
+) {
+    // if len (n_l) >= cap { grow }
+    body.push(0x20);
+    leb_u(m_l as u64, body);
+    i64_load(32, body); // cap
+    body.push(0xA7);
+    body.push(0x21);
+    leb_u(cap_l as u64, body);
+    body.push(0x20);
+    leb_u(n_l as u64, body);
+    body.push(0x20);
+    leb_u(cap_l as u64, body);
+    body.push(0x4E); // i32.ge_s
+    body.push(0x04);
+    body.push(0x40);
+    // ncap = cap>0 ? cap*2 : 4
+    body.push(0x20);
+    leb_u(cap_l as u64, body);
+    body.push(0x41);
+    leb_s(0, body);
+    body.push(0x4A); // i32.gt_s
+    body.push(0x04);
+    body.push(0x7F);
+    body.push(0x20);
+    leb_u(cap_l as u64, body);
+    body.push(0x41);
+    leb_s(2, body);
+    body.push(0x6C);
+    body.push(0x05);
+    body.push(0x41);
+    leb_s(4, body);
+    body.push(0x0B);
+    body.push(0x21);
+    leb_u(ncap_l as u64, body);
+    // kk = m.kkind ; vk = m.vkind
+    body.push(0x20);
+    leb_u(m_l as u64, body);
+    i64_load(8, body);
+    body.push(0x21);
+    leb_u(kk_l as u64, body);
+    body.push(0x20);
+    leb_u(m_l as u64, body);
+    i64_load(16, body);
+    body.push(0x21);
+    leb_u(vk_l as u64, body);
+    // nm = __alloc_map(kk, vk, ncap)
+    body.push(0x20);
+    leb_u(kk_l as u64, body);
+    body.push(0x20);
+    leb_u(vk_l as u64, body);
+    body.push(0x20);
+    leb_u(ncap_l as u64, body);
+    body.push(0x10);
+    leb_u(alloc_map_idx as u64, body);
+    body.push(0x21);
+    leb_u(nm_l as u64, body);
+    // nm.len = n
+    body.push(0x20);
+    leb_u(nm_l as u64, body);
+    body.push(0x20);
+    leb_u(n_l as u64, body);
+    body.push(0xAD);
+    i64_store(24, body);
+    // copy slots raw: j=0; while j<n { nm[2j]=m[2j]; nm[2j+1]=m[2j+1] }
+    body.push(0x41);
+    leb_s(0, body);
+    body.push(0x21);
+    leb_u(j_l as u64, body);
+    body.push(0x03);
+    body.push(0x40);
+    body.push(0x20);
+    leb_u(j_l as u64, body);
+    body.push(0x20);
+    leb_u(n_l as u64, body);
+    body.push(0x48);
+    body.push(0x04);
+    body.push(0x40);
+    map_slot_addr(body, nm_l, j_l, 0);
+    map_slot_load(body, m_l, j_l, 0);
+    i64_store(0, body);
+    map_slot_addr(body, nm_l, j_l, 1);
+    map_slot_load(body, m_l, j_l, 1);
+    i64_store(0, body);
+    body.push(0x20);
+    leb_u(j_l as u64, body);
+    body.push(0x41);
+    leb_s(1, body);
+    body.push(0x6A);
+    body.push(0x21);
+    leb_u(j_l as u64, body);
+    body.push(0x0C);
+    leb_u(1, body);
+    body.push(0x0B);
+    body.push(0x0B);
+    // free old shallow: cls = 2*oldcap+3 (clamped); __free(m, cls)
+    body.push(0x20);
+    leb_u(m_l as u64, body);
+    body.push(0x20);
+    leb_u(cap_l as u64, body);
+    body.push(0x41);
+    leb_s(2, body);
+    body.push(0x6C);
+    body.push(0x41);
+    leb_s(3, body);
+    body.push(0x6A);
+    body.push(0x21);
+    leb_u(ncap_l as u64, body); // reuse ncap_l as cls scratch
+    body.push(0x20);
+    leb_u(ncap_l as u64, body);
+    body.push(0x41);
+    leb_s(TENSOR_MAX_CLASS as i64, body);
+    body.push(0x4B);
+    body.push(0x04);
+    body.push(0x40);
+    body.push(0x41);
+    leb_s(TENSOR_MAX_CLASS as i64, body);
+    body.push(0x21);
+    leb_u(ncap_l as u64, body);
+    body.push(0x0B);
+    body.push(0x20);
+    leb_u(ncap_l as u64, body);
+    body.push(0x10);
+    leb_u(free_idx as u64, body);
+    body.push(0x1A);
+    // m = nm
+    body.push(0x20);
+    leb_u(nm_l as u64, body);
+    body.push(0x21);
+    leb_u(m_l as u64, body);
+    body.push(0x0B); // end if grow
+}
+
+/// Ensure the uniquely-owned Set in `s_l` has room for one more element.
+#[allow(clippy::too_many_arguments)]
+fn emit_set_grow(
+    body: &mut Vec<u8>,
+    alloc_set_idx: u32,
+    free_idx: u32,
+    s_l: u32,
+    n_l: u32,
+    cap_l: u32,
+    ns_l: u32,
+    ncap_l: u32,
+    j_l: u32,
+    ek_l: u32,
+) {
+    body.push(0x20);
+    leb_u(s_l as u64, body);
+    i64_load(24, body); // cap
+    body.push(0xA7);
+    body.push(0x21);
+    leb_u(cap_l as u64, body);
+    body.push(0x20);
+    leb_u(n_l as u64, body);
+    body.push(0x20);
+    leb_u(cap_l as u64, body);
+    body.push(0x4E);
+    body.push(0x04);
+    body.push(0x40);
+    body.push(0x20);
+    leb_u(cap_l as u64, body);
+    body.push(0x41);
+    leb_s(0, body);
+    body.push(0x4A);
+    body.push(0x04);
+    body.push(0x7F);
+    body.push(0x20);
+    leb_u(cap_l as u64, body);
+    body.push(0x41);
+    leb_s(2, body);
+    body.push(0x6C);
+    body.push(0x05);
+    body.push(0x41);
+    leb_s(4, body);
+    body.push(0x0B);
+    body.push(0x21);
+    leb_u(ncap_l as u64, body);
+    body.push(0x20);
+    leb_u(s_l as u64, body);
+    i64_load(8, body);
+    body.push(0x21);
+    leb_u(ek_l as u64, body);
+    body.push(0x20);
+    leb_u(ek_l as u64, body);
+    body.push(0x20);
+    leb_u(ncap_l as u64, body);
+    body.push(0x10);
+    leb_u(alloc_set_idx as u64, body);
+    body.push(0x21);
+    leb_u(ns_l as u64, body);
+    body.push(0x20);
+    leb_u(ns_l as u64, body);
+    body.push(0x20);
+    leb_u(n_l as u64, body);
+    body.push(0xAD);
+    i64_store(16, body);
+    body.push(0x41);
+    leb_s(0, body);
+    body.push(0x21);
+    leb_u(j_l as u64, body);
+    body.push(0x03);
+    body.push(0x40);
+    body.push(0x20);
+    leb_u(j_l as u64, body);
+    body.push(0x20);
+    leb_u(n_l as u64, body);
+    body.push(0x48);
+    body.push(0x04);
+    body.push(0x40);
+    set_slot_addr(body, ns_l, j_l);
+    set_slot_load(body, s_l, j_l);
+    i64_store(0, body);
+    body.push(0x20);
+    leb_u(j_l as u64, body);
+    body.push(0x41);
+    leb_s(1, body);
+    body.push(0x6A);
+    body.push(0x21);
+    leb_u(j_l as u64, body);
+    body.push(0x0C);
+    leb_u(1, body);
+    body.push(0x0B);
+    body.push(0x0B);
+    // free old shallow: cls = oldcap+2 (clamped)
+    body.push(0x20);
+    leb_u(s_l as u64, body);
+    body.push(0x20);
+    leb_u(cap_l as u64, body);
+    body.push(0x41);
+    leb_s(2, body);
+    body.push(0x6A);
+    body.push(0x21);
+    leb_u(ncap_l as u64, body);
+    body.push(0x20);
+    leb_u(ncap_l as u64, body);
+    body.push(0x41);
+    leb_s(TENSOR_MAX_CLASS as i64, body);
+    body.push(0x4B);
+    body.push(0x04);
+    body.push(0x40);
+    body.push(0x41);
+    leb_s(TENSOR_MAX_CLASS as i64, body);
+    body.push(0x21);
+    leb_u(ncap_l as u64, body);
+    body.push(0x0B);
+    body.push(0x20);
+    leb_u(ncap_l as u64, body);
+    body.push(0x10);
+    leb_u(free_idx as u64, body);
+    body.push(0x1A);
+    body.push(0x20);
+    leb_u(ns_l as u64, body);
+    body.push(0x21);
+    leb_u(s_l as u64, body);
+    body.push(0x0B);
+}
+
+/// `map_insert(map:i32=0, key:i64=1, val:i64=2) -> map:i32`. Sorted insert or
+/// replace; FBIP in place when rc==1 else copy-on-write. CONSUMES map+key+val.
+fn emit_map_insert(
+    key_cmp_idx: u32,
+    slot_drop_idx: u32,
+    alloc_map_idx: u32,
+    drop_map_idx: u32,
+    slot_dup_idx: u32,
+    free_idx: u32,
+) -> Vec<u8> {
+    // Params: map(0,i32), key(1,i64), val(2,i64), arg_kkind(3,i64), arg_vkind(4,i64).
+    // Extra locals: n(5,i32), i(6,i32), found(7,i32), cmp(8,i32), k(9,i32),
+    //   cap(10,i32), nm(11,i32), ncap(12,i32). Locals 3,4 are reused after the
+    //   empty-map fixup to hold the HEADER kkind/vkind.
+    let mut b = Vec::new();
+    // Empty-map fixup (matches native): if len==0, set header kkind/vkind from
+    // the precise inserted key/value kinds (the suffix-derived map_new kinds may
+    // be coarse, e.g. Bool collapsed to Int).
+    b.push(0x20);
+    leb_u(0, &mut b);
+    i64_load(24, &mut b);
+    b.push(0x50); // i64.eqz (len==0)
+    b.push(0x04);
+    b.push(0x40);
+    b.push(0x20);
+    leb_u(0, &mut b);
+    b.push(0x20);
+    leb_u(3, &mut b); // arg_kkind
+    i64_store(8, &mut b);
+    b.push(0x20);
+    leb_u(0, &mut b);
+    b.push(0x20);
+    leb_u(4, &mut b); // arg_vkind
+    i64_store(16, &mut b);
+    b.push(0x0B);
+    // if rc != 1 { clone into nm; drop original; m(param0)=nm } else reuses++
+    b.push(0x20);
+    leb_u(0, &mut b);
+    i64_load(0, &mut b);
+    b.push(0x42);
+    leb_s(1, &mut b);
+    b.push(0x51); // i64.eq (rc==1)
+    b.push(0x04);
+    b.push(0x40);
+    emit_reuses_inc(&mut b);
+    b.push(0x05); // else: COW
+    // kk/vk/n from original
+    b.push(0x20);
+    leb_u(0, &mut b);
+    i64_load(8, &mut b);
+    b.push(0x21);
+    leb_u(3, &mut b);
+    b.push(0x20);
+    leb_u(0, &mut b);
+    i64_load(16, &mut b);
+    b.push(0x21);
+    leb_u(4, &mut b);
+    b.push(0x20);
+    leb_u(0, &mut b);
+    i64_load(24, &mut b);
+    b.push(0xA7);
+    b.push(0x21);
+    leb_u(5, &mut b);
+    emit_map_clone(&mut b, alloc_map_idx, slot_dup_idx, 0, 11, 3, 4, 5, 9);
+    // drop original
+    b.push(0x20);
+    leb_u(0, &mut b);
+    b.push(0x10);
+    leb_u(drop_map_idx as u64, &mut b);
+    b.push(0x1A);
+    // m = nm
+    b.push(0x20);
+    leb_u(11, &mut b);
+    b.push(0x21);
+    leb_u(0, &mut b);
+    b.push(0x0B); // end if rc==1
+    // kk/vk/n from working map
+    b.push(0x20);
+    leb_u(0, &mut b);
+    i64_load(8, &mut b);
+    b.push(0x21);
+    leb_u(3, &mut b);
+    b.push(0x20);
+    leb_u(0, &mut b);
+    i64_load(16, &mut b);
+    b.push(0x21);
+    leb_u(4, &mut b);
+    b.push(0x20);
+    leb_u(0, &mut b);
+    i64_load(24, &mut b);
+    b.push(0xA7);
+    b.push(0x21);
+    leb_u(5, &mut b);
+    // find key
+    emit_map_find(&mut b, key_cmp_idx, 0, 3, 1, 5, 6, 7, 8);
+    // if found { drop old value; slots[2i+1]=val; drop key; return m }
+    b.push(0x20);
+    leb_u(7, &mut b);
+    b.push(0x04);
+    b.push(0x40);
+    // slot_drop(vk, slots[2i+1])
+    b.push(0x20);
+    leb_u(4, &mut b);
+    map_slot_load(&mut b, 0, 6, 1);
+    b.push(0x10);
+    leb_u(slot_drop_idx as u64, &mut b);
+    b.push(0x1A);
+    // slots[2i+1] = val
+    map_slot_addr(&mut b, 0, 6, 1);
+    b.push(0x20);
+    leb_u(2, &mut b);
+    i64_store(0, &mut b);
+    // slot_drop(kk, key)  (duplicate key not stored)
+    b.push(0x20);
+    leb_u(3, &mut b);
+    b.push(0x20);
+    leb_u(1, &mut b);
+    b.push(0x10);
+    leb_u(slot_drop_idx as u64, &mut b);
+    b.push(0x1A);
+    b.push(0x20);
+    leb_u(0, &mut b);
+    b.push(0x0F); // return m
+    b.push(0x0B); // end if found
+    // not found: grow if needed
+    emit_map_grow(&mut b, alloc_map_idx, free_idx, 0, 5, 10, 11, 12, 9, 3, 4);
+    // shift entries [i..n) right by one: for k=n; k>i; k-- copy slot k-1 -> k
+    b.push(0x20);
+    leb_u(5, &mut b);
+    b.push(0x21);
+    leb_u(9, &mut b); // k = n
+    b.push(0x03);
+    b.push(0x40);
+    b.push(0x20);
+    leb_u(9, &mut b);
+    b.push(0x20);
+    leb_u(6, &mut b);
+    b.push(0x4A); // k > i (i32.gt_s)
+    b.push(0x04);
+    b.push(0x40);
+    // slots[2k] = slots[2(k-1)] ; slots[2k+1] = slots[2(k-1)+1]
+    // compute k-1 into a transient: we need slot at index k-1. Use map_slot_load
+    // with a temp index? Reuse local 8 (cmp) as km1.
+    b.push(0x20);
+    leb_u(9, &mut b);
+    b.push(0x41);
+    leb_s(1, &mut b);
+    b.push(0x6B); // k-1
+    b.push(0x21);
+    leb_u(8, &mut b); // km1
+    map_slot_addr(&mut b, 0, 9, 0);
+    map_slot_load(&mut b, 0, 8, 0);
+    i64_store(0, &mut b);
+    map_slot_addr(&mut b, 0, 9, 1);
+    map_slot_load(&mut b, 0, 8, 1);
+    i64_store(0, &mut b);
+    b.push(0x20);
+    leb_u(9, &mut b);
+    b.push(0x41);
+    leb_s(1, &mut b);
+    b.push(0x6B);
+    b.push(0x21);
+    leb_u(9, &mut b);
+    b.push(0x0C);
+    leb_u(1, &mut b);
+    b.push(0x0B);
+    b.push(0x0B);
+    // slots[2i]=key ; slots[2i+1]=val
+    map_slot_addr(&mut b, 0, 6, 0);
+    b.push(0x20);
+    leb_u(1, &mut b);
+    i64_store(0, &mut b);
+    map_slot_addr(&mut b, 0, 6, 1);
+    b.push(0x20);
+    leb_u(2, &mut b);
+    i64_store(0, &mut b);
+    // len = n + 1
+    b.push(0x20);
+    leb_u(0, &mut b);
+    b.push(0x20);
+    leb_u(5, &mut b);
+    b.push(0x41);
+    leb_s(1, &mut b);
+    b.push(0x6A);
+    b.push(0xAD);
+    i64_store(24, &mut b);
+    b.push(0x20);
+    leb_u(0, &mut b);
+    helper_entry(
+        &[
+            WType::I32, WType::I32, WType::I32, WType::I32,
+            WType::I32, WType::I32, WType::I32, WType::I32,
+        ],
+        b,
+    )
+}
+
+/// `map_get_or(map:i32=0, key:i64=1, dflt:i64=2) -> i64`. Returns the stored
+/// value (dup'd) if present, else `dflt`; drops the not-taken slot. CONSUMES
+/// map+key, and exactly one of value/dflt.
+fn emit_map_get_or(
+    key_cmp_idx: u32,
+    slot_dup_idx: u32,
+    slot_drop_idx: u32,
+    drop_map_idx: u32,
+) -> Vec<u8> {
+    // Locals: kk(3,i64), vk(4,i64), n(5,i32), i(6,i32), found(7,i32), cmp(8,i32),
+    //         result(9,i64).
+    let mut b = Vec::new();
+    b.push(0x20);
+    leb_u(0, &mut b);
+    i64_load(8, &mut b);
+    b.push(0x21);
+    leb_u(3, &mut b);
+    b.push(0x20);
+    leb_u(0, &mut b);
+    i64_load(16, &mut b);
+    b.push(0x21);
+    leb_u(4, &mut b);
+    b.push(0x20);
+    leb_u(0, &mut b);
+    i64_load(24, &mut b);
+    b.push(0xA7);
+    b.push(0x21);
+    leb_u(5, &mut b);
+    emit_map_find(&mut b, key_cmp_idx, 0, 3, 1, 5, 6, 7, 8);
+    // if found { result = slots[2i+1]; slot_dup(vk,result); slot_drop(vk,dflt) }
+    //   else { result = dflt }
+    b.push(0x20);
+    leb_u(7, &mut b);
+    b.push(0x04);
+    b.push(0x40);
+    map_slot_load(&mut b, 0, 6, 1);
+    b.push(0x21);
+    leb_u(9, &mut b);
+    b.push(0x20);
+    leb_u(4, &mut b);
+    b.push(0x20);
+    leb_u(9, &mut b);
+    b.push(0x10);
+    leb_u(slot_dup_idx as u64, &mut b);
+    b.push(0x1A);
+    b.push(0x20);
+    leb_u(4, &mut b);
+    b.push(0x20);
+    leb_u(2, &mut b);
+    b.push(0x10);
+    leb_u(slot_drop_idx as u64, &mut b);
+    b.push(0x1A);
+    b.push(0x05);
+    b.push(0x20);
+    leb_u(2, &mut b);
+    b.push(0x21);
+    leb_u(9, &mut b);
+    b.push(0x0B);
+    // slot_drop(kk, key) ; drop_map(map)
+    b.push(0x20);
+    leb_u(3, &mut b);
+    b.push(0x20);
+    leb_u(1, &mut b);
+    b.push(0x10);
+    leb_u(slot_drop_idx as u64, &mut b);
+    b.push(0x1A);
+    b.push(0x20);
+    leb_u(0, &mut b);
+    b.push(0x10);
+    leb_u(drop_map_idx as u64, &mut b);
+    b.push(0x1A);
+    b.push(0x20);
+    leb_u(9, &mut b);
+    helper_entry(
+        &[WType::I64, WType::I64, WType::I32, WType::I32, WType::I32, WType::I32, WType::I64],
+        b,
+    )
+}
+
+/// `map_has(map:i32=0, key:i64=1) -> i32`. CONSUMES map+key.
+fn emit_map_has(key_cmp_idx: u32, slot_drop_idx: u32, drop_map_idx: u32) -> Vec<u8> {
+    // Locals: kk(2,i64), n(3,i32), i(4,i32), found(5,i32), cmp(6,i32).
+    let mut b = Vec::new();
+    b.push(0x20);
+    leb_u(0, &mut b);
+    i64_load(8, &mut b);
+    b.push(0x21);
+    leb_u(2, &mut b);
+    b.push(0x20);
+    leb_u(0, &mut b);
+    i64_load(24, &mut b);
+    b.push(0xA7);
+    b.push(0x21);
+    leb_u(3, &mut b);
+    emit_map_find(&mut b, key_cmp_idx, 0, 2, 1, 3, 4, 5, 6);
+    // slot_drop(kk,key); drop_map(map)
+    b.push(0x20);
+    leb_u(2, &mut b);
+    b.push(0x20);
+    leb_u(1, &mut b);
+    b.push(0x10);
+    leb_u(slot_drop_idx as u64, &mut b);
+    b.push(0x1A);
+    b.push(0x20);
+    leb_u(0, &mut b);
+    b.push(0x10);
+    leb_u(drop_map_idx as u64, &mut b);
+    b.push(0x1A);
+    b.push(0x20);
+    leb_u(5, &mut b); // found
+    helper_entry(&[WType::I64, WType::I32, WType::I32, WType::I32, WType::I32], b)
+}
+
+/// `map_remove(map:i32=0, key:i64=1) -> map:i32`. FBIP/COW. CONSUMES map+key.
+fn emit_map_remove(
+    key_cmp_idx: u32,
+    slot_drop_idx: u32,
+    alloc_map_idx: u32,
+    drop_map_idx: u32,
+    slot_dup_idx: u32,
+) -> Vec<u8> {
+    // Locals: kk(2,i64), vk(3,i64), n(4,i32), i(5,i32), found(6,i32), cmp(7,i32),
+    //         k(8,i32), nm(9,i32).
+    let mut b = Vec::new();
+    // rc==1 ? reuses++ : clone+drop
+    b.push(0x20);
+    leb_u(0, &mut b);
+    i64_load(0, &mut b);
+    b.push(0x42);
+    leb_s(1, &mut b);
+    b.push(0x51);
+    b.push(0x04);
+    b.push(0x40);
+    emit_reuses_inc(&mut b);
+    b.push(0x05);
+    // kk/vk/n
+    b.push(0x20);
+    leb_u(0, &mut b);
+    i64_load(8, &mut b);
+    b.push(0x21);
+    leb_u(2, &mut b);
+    b.push(0x20);
+    leb_u(0, &mut b);
+    i64_load(16, &mut b);
+    b.push(0x21);
+    leb_u(3, &mut b);
+    b.push(0x20);
+    leb_u(0, &mut b);
+    i64_load(24, &mut b);
+    b.push(0xA7);
+    b.push(0x21);
+    leb_u(4, &mut b);
+    emit_map_clone(&mut b, alloc_map_idx, slot_dup_idx, 0, 9, 2, 3, 4, 8);
+    b.push(0x20);
+    leb_u(0, &mut b);
+    b.push(0x10);
+    leb_u(drop_map_idx as u64, &mut b);
+    b.push(0x1A);
+    b.push(0x20);
+    leb_u(9, &mut b);
+    b.push(0x21);
+    leb_u(0, &mut b);
+    b.push(0x0B);
+    // kk/vk/n from working map
+    b.push(0x20);
+    leb_u(0, &mut b);
+    i64_load(8, &mut b);
+    b.push(0x21);
+    leb_u(2, &mut b);
+    b.push(0x20);
+    leb_u(0, &mut b);
+    i64_load(16, &mut b);
+    b.push(0x21);
+    leb_u(3, &mut b);
+    b.push(0x20);
+    leb_u(0, &mut b);
+    i64_load(24, &mut b);
+    b.push(0xA7);
+    b.push(0x21);
+    leb_u(4, &mut b);
+    emit_map_find(&mut b, key_cmp_idx, 0, 2, 1, 4, 5, 6, 7);
+    // if found { drop key slot + value slot; shift left; len-- }
+    b.push(0x20);
+    leb_u(6, &mut b);
+    b.push(0x04);
+    b.push(0x40);
+    b.push(0x20);
+    leb_u(2, &mut b);
+    map_slot_load(&mut b, 0, 5, 0);
+    b.push(0x10);
+    leb_u(slot_drop_idx as u64, &mut b);
+    b.push(0x1A);
+    b.push(0x20);
+    leb_u(3, &mut b);
+    map_slot_load(&mut b, 0, 5, 1);
+    b.push(0x10);
+    leb_u(slot_drop_idx as u64, &mut b);
+    b.push(0x1A);
+    // shift left: for k=i; k+1<n; k++ slots[k]=slots[k+1]
+    b.push(0x20);
+    leb_u(5, &mut b);
+    b.push(0x21);
+    leb_u(8, &mut b); // k=i
+    b.push(0x03);
+    b.push(0x40);
+    // if k+1 < n
+    b.push(0x20);
+    leb_u(8, &mut b);
+    b.push(0x41);
+    leb_s(1, &mut b);
+    b.push(0x6A);
+    b.push(0x20);
+    leb_u(4, &mut b);
+    b.push(0x48);
+    b.push(0x04);
+    b.push(0x40);
+    // slots[2k]=slots[2(k+1)] ; slots[2k+1]=slots[2(k+1)+1]
+    // use local 7 (cmp) as k+1
+    b.push(0x20);
+    leb_u(8, &mut b);
+    b.push(0x41);
+    leb_s(1, &mut b);
+    b.push(0x6A);
+    b.push(0x21);
+    leb_u(7, &mut b);
+    map_slot_addr(&mut b, 0, 8, 0);
+    map_slot_load(&mut b, 0, 7, 0);
+    i64_store(0, &mut b);
+    map_slot_addr(&mut b, 0, 8, 1);
+    map_slot_load(&mut b, 0, 7, 1);
+    i64_store(0, &mut b);
+    b.push(0x20);
+    leb_u(8, &mut b);
+    b.push(0x41);
+    leb_s(1, &mut b);
+    b.push(0x6A);
+    b.push(0x21);
+    leb_u(8, &mut b);
+    b.push(0x0C);
+    leb_u(1, &mut b);
+    b.push(0x0B);
+    b.push(0x0B);
+    // len = n - 1
+    b.push(0x20);
+    leb_u(0, &mut b);
+    b.push(0x20);
+    leb_u(4, &mut b);
+    b.push(0x41);
+    leb_s(1, &mut b);
+    b.push(0x6B);
+    b.push(0xAD);
+    i64_store(24, &mut b);
+    b.push(0x0B); // end if found
+    // slot_drop(kk, key)
+    b.push(0x20);
+    leb_u(2, &mut b);
+    b.push(0x20);
+    leb_u(1, &mut b);
+    b.push(0x10);
+    leb_u(slot_drop_idx as u64, &mut b);
+    b.push(0x1A);
+    b.push(0x20);
+    leb_u(0, &mut b);
+    helper_entry(
+        &[
+            WType::I64, WType::I64, WType::I32, WType::I32, WType::I32,
+            WType::I32, WType::I32, WType::I32,
+        ],
+        b,
+    )
+}
+
+/// `map_keys`/`map_values(map:i32=0, out_kind:i32=1) -> arr:i32`. Build a fresh
+/// Array of the keys (`which`=0) or values (`which`=1) in ascending order,
+/// dup'ing each into the array kind-aware. CONSUMES the map.
+fn emit_map_enumerate(
+    h: HeapHelper,
+    slot_dup_idx: u32,
+    drop_map_idx: u32,
+    alloc_array_idx: u32,
+    array_push_idx: u32,
+) -> Vec<u8> {
+    let which: u32 = if h == HeapHelper::MapKeys { 0 } else { 1 };
+    // src_kind header offset: keys -> [ptr+8] (kkind), values -> [ptr+16] (vkind).
+    let src_off: u64 = if which == 0 { 8 } else { 16 };
+    // Locals: a(2,i32), n(3,i32), i(4,i32), src(5,i64), slot(6,i64).
+    let mut b = Vec::new();
+    // src = header kind
+    b.push(0x20);
+    leb_u(0, &mut b);
+    i64_load(src_off, &mut b);
+    b.push(0x21);
+    leb_u(5, &mut b);
+    // a = __array_new(out_kind, 0)
+    b.push(0x20);
+    leb_u(1, &mut b);
+    b.push(0x41);
+    leb_s(0, &mut b);
+    b.push(0x10);
+    leb_u(alloc_array_idx as u64, &mut b);
+    b.push(0x21);
+    leb_u(2, &mut b);
+    // n = len
+    b.push(0x20);
+    leb_u(0, &mut b);
+    i64_load(24, &mut b);
+    b.push(0xA7);
+    b.push(0x21);
+    leb_u(3, &mut b);
+    // i=0; while i<n
+    b.push(0x41);
+    leb_s(0, &mut b);
+    b.push(0x21);
+    leb_u(4, &mut b);
+    b.push(0x03);
+    b.push(0x40);
+    b.push(0x20);
+    leb_u(4, &mut b);
+    b.push(0x20);
+    leb_u(3, &mut b);
+    b.push(0x48);
+    b.push(0x04);
+    b.push(0x40);
+    // slot = map.slots[2i+which]
+    map_slot_load(&mut b, 0, 4, which);
+    b.push(0x21);
+    leb_u(6, &mut b);
+    // slot_dup(src, slot)
+    b.push(0x20);
+    leb_u(5, &mut b);
+    b.push(0x20);
+    leb_u(6, &mut b);
+    b.push(0x10);
+    leb_u(slot_dup_idx as u64, &mut b);
+    b.push(0x1A);
+    // a = __array_push(a, slot, out_kind)
+    b.push(0x20);
+    leb_u(2, &mut b);
+    b.push(0x20);
+    leb_u(6, &mut b);
+    b.push(0x20);
+    leb_u(1, &mut b);
+    b.push(0x10);
+    leb_u(array_push_idx as u64, &mut b);
+    b.push(0x21);
+    leb_u(2, &mut b);
+    b.push(0x20);
+    leb_u(4, &mut b);
+    b.push(0x41);
+    leb_s(1, &mut b);
+    b.push(0x6A);
+    b.push(0x21);
+    leb_u(4, &mut b);
+    b.push(0x0C);
+    leb_u(1, &mut b);
+    b.push(0x0B);
+    b.push(0x0B);
+    // drop_map(map) ; return a
+    b.push(0x20);
+    leb_u(0, &mut b);
+    b.push(0x10);
+    leb_u(drop_map_idx as u64, &mut b);
+    b.push(0x1A);
+    b.push(0x20);
+    leb_u(2, &mut b);
+    helper_entry(&[WType::I32, WType::I32, WType::I32, WType::I64, WType::I64], b)
+}
+
+/// `set_to_array(set:i32=0, out_kind:i32=1) -> arr:i32`. CONSUMES the set.
+fn emit_set_to_arr(
+    slot_dup_idx: u32,
+    drop_set_idx: u32,
+    alloc_array_idx: u32,
+    array_push_idx: u32,
+) -> Vec<u8> {
+    // Locals: a(2,i32), n(3,i32), i(4,i32), ek(5,i64), slot(6,i64).
+    let mut b = Vec::new();
+    b.push(0x20);
+    leb_u(0, &mut b);
+    i64_load(8, &mut b); // ekind
+    b.push(0x21);
+    leb_u(5, &mut b);
+    b.push(0x20);
+    leb_u(1, &mut b);
+    b.push(0x41);
+    leb_s(0, &mut b);
+    b.push(0x10);
+    leb_u(alloc_array_idx as u64, &mut b);
+    b.push(0x21);
+    leb_u(2, &mut b);
+    b.push(0x20);
+    leb_u(0, &mut b);
+    i64_load(16, &mut b); // len
+    b.push(0xA7);
+    b.push(0x21);
+    leb_u(3, &mut b);
+    b.push(0x41);
+    leb_s(0, &mut b);
+    b.push(0x21);
+    leb_u(4, &mut b);
+    b.push(0x03);
+    b.push(0x40);
+    b.push(0x20);
+    leb_u(4, &mut b);
+    b.push(0x20);
+    leb_u(3, &mut b);
+    b.push(0x48);
+    b.push(0x04);
+    b.push(0x40);
+    set_slot_load(&mut b, 0, 4);
+    b.push(0x21);
+    leb_u(6, &mut b);
+    b.push(0x20);
+    leb_u(5, &mut b);
+    b.push(0x20);
+    leb_u(6, &mut b);
+    b.push(0x10);
+    leb_u(slot_dup_idx as u64, &mut b);
+    b.push(0x1A);
+    b.push(0x20);
+    leb_u(2, &mut b);
+    b.push(0x20);
+    leb_u(6, &mut b);
+    b.push(0x20);
+    leb_u(1, &mut b);
+    b.push(0x10);
+    leb_u(array_push_idx as u64, &mut b);
+    b.push(0x21);
+    leb_u(2, &mut b);
+    b.push(0x20);
+    leb_u(4, &mut b);
+    b.push(0x41);
+    leb_s(1, &mut b);
+    b.push(0x6A);
+    b.push(0x21);
+    leb_u(4, &mut b);
+    b.push(0x0C);
+    leb_u(1, &mut b);
+    b.push(0x0B);
+    b.push(0x0B);
+    b.push(0x20);
+    leb_u(0, &mut b);
+    b.push(0x10);
+    leb_u(drop_set_idx as u64, &mut b);
+    b.push(0x1A);
+    b.push(0x20);
+    leb_u(2, &mut b);
+    helper_entry(&[WType::I32, WType::I32, WType::I32, WType::I64, WType::I64], b)
+}
+
+/// `map_eq(a:i32=0, b:i32=1) -> i32`. Sorted-content equality; does NOT consume
+/// operands (the call site drops both, mirroring `emit_vec_eq`).
+fn emit_map_eq(key_cmp_idx: u32, slot_eq_idx: u32) -> Vec<u8> {
+    // Locals: na(2,i32), i(3,i32), kk(4,i64), vk(5,i64).
+    let mut b = Vec::new();
+    // if a.len != b.len return 0
+    b.push(0x20);
+    leb_u(0, &mut b);
+    i64_load(24, &mut b);
+    b.push(0x20);
+    leb_u(1, &mut b);
+    i64_load(24, &mut b);
+    b.push(0x52); // i64.ne
+    b.push(0x04);
+    b.push(0x40);
+    b.push(0x41);
+    leb_s(0, &mut b);
+    b.push(0x0F);
+    b.push(0x0B);
+    // na = a.len ; kk = a.kkind ; vk = a.vkind
+    b.push(0x20);
+    leb_u(0, &mut b);
+    i64_load(24, &mut b);
+    b.push(0xA7);
+    b.push(0x21);
+    leb_u(2, &mut b);
+    b.push(0x20);
+    leb_u(0, &mut b);
+    i64_load(8, &mut b);
+    b.push(0x21);
+    leb_u(4, &mut b);
+    b.push(0x20);
+    leb_u(0, &mut b);
+    i64_load(16, &mut b);
+    b.push(0x21);
+    leb_u(5, &mut b);
+    // i=0; while i<na: if key_cmp(kk,a[2i],b[2i])!=0 return 0;
+    //   if !slot_eq(vk,a[2i+1],b[2i+1]) return 0
+    b.push(0x41);
+    leb_s(0, &mut b);
+    b.push(0x21);
+    leb_u(3, &mut b);
+    b.push(0x03);
+    b.push(0x40);
+    b.push(0x20);
+    leb_u(3, &mut b);
+    b.push(0x20);
+    leb_u(2, &mut b);
+    b.push(0x48);
+    b.push(0x04);
+    b.push(0x40);
+    // key compare
+    b.push(0x20);
+    leb_u(4, &mut b);
+    map_slot_load(&mut b, 0, 3, 0);
+    map_slot_load(&mut b, 1, 3, 0);
+    b.push(0x10);
+    leb_u(key_cmp_idx as u64, &mut b);
+    b.push(0x04);
+    b.push(0x40); // if cmp != 0 (nonzero is true)
+    b.push(0x41);
+    leb_s(0, &mut b);
+    b.push(0x0F);
+    b.push(0x0B);
+    // value compare
+    b.push(0x20);
+    leb_u(5, &mut b);
+    map_slot_load(&mut b, 0, 3, 1);
+    map_slot_load(&mut b, 1, 3, 1);
+    b.push(0x10);
+    leb_u(slot_eq_idx as u64, &mut b);
+    b.push(0x45); // i32.eqz -> true if NOT equal
+    b.push(0x04);
+    b.push(0x40);
+    b.push(0x41);
+    leb_s(0, &mut b);
+    b.push(0x0F);
+    b.push(0x0B);
+    b.push(0x20);
+    leb_u(3, &mut b);
+    b.push(0x41);
+    leb_s(1, &mut b);
+    b.push(0x6A);
+    b.push(0x21);
+    leb_u(3, &mut b);
+    b.push(0x0C);
+    leb_u(1, &mut b);
+    b.push(0x0B);
+    b.push(0x0B);
+    b.push(0x41);
+    leb_s(1, &mut b);
+    helper_entry(&[WType::I32, WType::I32, WType::I64, WType::I64], b)
+}
+
+/// `set_eq(a:i32=0, b:i32=1) -> i32`. Sorted-content equality; does NOT consume.
+fn emit_set_eq(key_cmp_idx: u32) -> Vec<u8> {
+    // Locals: na(2,i32), i(3,i32), ek(4,i64).
+    let mut b = Vec::new();
+    b.push(0x20);
+    leb_u(0, &mut b);
+    i64_load(16, &mut b);
+    b.push(0x20);
+    leb_u(1, &mut b);
+    i64_load(16, &mut b);
+    b.push(0x52);
+    b.push(0x04);
+    b.push(0x40);
+    b.push(0x41);
+    leb_s(0, &mut b);
+    b.push(0x0F);
+    b.push(0x0B);
+    b.push(0x20);
+    leb_u(0, &mut b);
+    i64_load(16, &mut b);
+    b.push(0xA7);
+    b.push(0x21);
+    leb_u(2, &mut b);
+    b.push(0x20);
+    leb_u(0, &mut b);
+    i64_load(8, &mut b);
+    b.push(0x21);
+    leb_u(4, &mut b);
+    b.push(0x41);
+    leb_s(0, &mut b);
+    b.push(0x21);
+    leb_u(3, &mut b);
+    b.push(0x03);
+    b.push(0x40);
+    b.push(0x20);
+    leb_u(3, &mut b);
+    b.push(0x20);
+    leb_u(2, &mut b);
+    b.push(0x48);
+    b.push(0x04);
+    b.push(0x40);
+    b.push(0x20);
+    leb_u(4, &mut b);
+    set_slot_load(&mut b, 0, 3);
+    set_slot_load(&mut b, 1, 3);
+    b.push(0x10);
+    leb_u(key_cmp_idx as u64, &mut b);
+    b.push(0x04);
+    b.push(0x40);
+    b.push(0x41);
+    leb_s(0, &mut b);
+    b.push(0x0F);
+    b.push(0x0B);
+    b.push(0x20);
+    leb_u(3, &mut b);
+    b.push(0x41);
+    leb_s(1, &mut b);
+    b.push(0x6A);
+    b.push(0x21);
+    leb_u(3, &mut b);
+    b.push(0x0C);
+    leb_u(1, &mut b);
+    b.push(0x0B);
+    b.push(0x0B);
+    b.push(0x41);
+    leb_s(1, &mut b);
+    helper_entry(&[WType::I32, WType::I32, WType::I64], b)
+}
+
+/// `set_add(set:i32=0, e:i64=1) -> set:i32`. Sorted insert, dedup; FBIP/COW.
+/// CONSUMES set+elem.
+fn emit_set_add(
+    key_cmp_idx: u32,
+    slot_drop_idx: u32,
+    alloc_set_idx: u32,
+    drop_set_idx: u32,
+    slot_dup_idx: u32,
+    free_idx: u32,
+) -> Vec<u8> {
+    // Params: set(0,i32), e(1,i64), arg_ekind(2,i64). Extra locals: n(3,i32),
+    //   i(4,i32), found(5,i32), cmp(6,i32), k(7,i32), cap(8,i32), ns(9,i32),
+    //   ncap(10,i32). Local 2 is reused (after the empty-set fixup) as ekind.
+    let mut b = Vec::new();
+    // Empty-set fixup: if len==0, set header ekind from the precise inserted kind.
+    b.push(0x20);
+    leb_u(0, &mut b);
+    i64_load(16, &mut b);
+    b.push(0x50); // i64.eqz (len==0)
+    b.push(0x04);
+    b.push(0x40);
+    b.push(0x20);
+    leb_u(0, &mut b);
+    b.push(0x20);
+    leb_u(2, &mut b); // arg_ekind
+    i64_store(8, &mut b);
+    b.push(0x0B);
+    b.push(0x20);
+    leb_u(0, &mut b);
+    i64_load(0, &mut b);
+    b.push(0x42);
+    leb_s(1, &mut b);
+    b.push(0x51);
+    b.push(0x04);
+    b.push(0x40);
+    emit_reuses_inc(&mut b);
+    b.push(0x05);
+    b.push(0x20);
+    leb_u(0, &mut b);
+    i64_load(8, &mut b);
+    b.push(0x21);
+    leb_u(2, &mut b);
+    b.push(0x20);
+    leb_u(0, &mut b);
+    i64_load(16, &mut b);
+    b.push(0xA7);
+    b.push(0x21);
+    leb_u(3, &mut b);
+    emit_set_clone(&mut b, alloc_set_idx, slot_dup_idx, 0, 9, 2, 3, 7);
+    b.push(0x20);
+    leb_u(0, &mut b);
+    b.push(0x10);
+    leb_u(drop_set_idx as u64, &mut b);
+    b.push(0x1A);
+    b.push(0x20);
+    leb_u(9, &mut b);
+    b.push(0x21);
+    leb_u(0, &mut b);
+    b.push(0x0B);
+    // ek/n from working set
+    b.push(0x20);
+    leb_u(0, &mut b);
+    i64_load(8, &mut b);
+    b.push(0x21);
+    leb_u(2, &mut b);
+    b.push(0x20);
+    leb_u(0, &mut b);
+    i64_load(16, &mut b);
+    b.push(0xA7);
+    b.push(0x21);
+    leb_u(3, &mut b);
+    emit_set_find(&mut b, key_cmp_idx, 0, 2, 1, 3, 4, 5, 6);
+    // if found { slot_drop(ek,e); return set }
+    b.push(0x20);
+    leb_u(5, &mut b);
+    b.push(0x04);
+    b.push(0x40);
+    b.push(0x20);
+    leb_u(2, &mut b);
+    b.push(0x20);
+    leb_u(1, &mut b);
+    b.push(0x10);
+    leb_u(slot_drop_idx as u64, &mut b);
+    b.push(0x1A);
+    b.push(0x20);
+    leb_u(0, &mut b);
+    b.push(0x0F);
+    b.push(0x0B);
+    // grow if needed
+    emit_set_grow(&mut b, alloc_set_idx, free_idx, 0, 3, 8, 9, 10, 7, 2);
+    // shift right: for k=n; k>i; k-- slots[k]=slots[k-1]
+    b.push(0x20);
+    leb_u(3, &mut b);
+    b.push(0x21);
+    leb_u(7, &mut b);
+    b.push(0x03);
+    b.push(0x40);
+    b.push(0x20);
+    leb_u(7, &mut b);
+    b.push(0x20);
+    leb_u(4, &mut b);
+    b.push(0x4A);
+    b.push(0x04);
+    b.push(0x40);
+    // slots[k] = slots[k-1]  (use local 6 as k-1)
+    b.push(0x20);
+    leb_u(7, &mut b);
+    b.push(0x41);
+    leb_s(1, &mut b);
+    b.push(0x6B);
+    b.push(0x21);
+    leb_u(6, &mut b);
+    set_slot_addr(&mut b, 0, 7);
+    set_slot_load(&mut b, 0, 6);
+    i64_store(0, &mut b);
+    b.push(0x20);
+    leb_u(7, &mut b);
+    b.push(0x41);
+    leb_s(1, &mut b);
+    b.push(0x6B);
+    b.push(0x21);
+    leb_u(7, &mut b);
+    b.push(0x0C);
+    leb_u(1, &mut b);
+    b.push(0x0B);
+    b.push(0x0B);
+    // slots[i] = e ; len = n+1
+    set_slot_addr(&mut b, 0, 4);
+    b.push(0x20);
+    leb_u(1, &mut b);
+    i64_store(0, &mut b);
+    b.push(0x20);
+    leb_u(0, &mut b);
+    b.push(0x20);
+    leb_u(3, &mut b);
+    b.push(0x41);
+    leb_s(1, &mut b);
+    b.push(0x6A);
+    b.push(0xAD);
+    i64_store(16, &mut b);
+    b.push(0x20);
+    leb_u(0, &mut b);
+    helper_entry(
+        &[
+            WType::I32, WType::I32, WType::I32, WType::I32,
+            WType::I32, WType::I32, WType::I32, WType::I32,
+        ],
+        b,
+    )
+}
+
+/// `set_has(set:i32=0, e:i64=1) -> i32`. CONSUMES set+elem.
+fn emit_set_has(key_cmp_idx: u32, slot_drop_idx: u32, drop_set_idx: u32) -> Vec<u8> {
+    // Locals: ek(2,i64), n(3,i32), i(4,i32), found(5,i32), cmp(6,i32).
+    let mut b = Vec::new();
+    b.push(0x20);
+    leb_u(0, &mut b);
+    i64_load(8, &mut b);
+    b.push(0x21);
+    leb_u(2, &mut b);
+    b.push(0x20);
+    leb_u(0, &mut b);
+    i64_load(16, &mut b);
+    b.push(0xA7);
+    b.push(0x21);
+    leb_u(3, &mut b);
+    emit_set_find(&mut b, key_cmp_idx, 0, 2, 1, 3, 4, 5, 6);
+    b.push(0x20);
+    leb_u(2, &mut b);
+    b.push(0x20);
+    leb_u(1, &mut b);
+    b.push(0x10);
+    leb_u(slot_drop_idx as u64, &mut b);
+    b.push(0x1A);
+    b.push(0x20);
+    leb_u(0, &mut b);
+    b.push(0x10);
+    leb_u(drop_set_idx as u64, &mut b);
+    b.push(0x1A);
+    b.push(0x20);
+    leb_u(5, &mut b);
+    helper_entry(&[WType::I64, WType::I32, WType::I32, WType::I32, WType::I32], b)
+}
+
+/// `set_remove(set:i32=0, e:i64=1) -> set:i32`. FBIP/COW. CONSUMES set+elem.
+fn emit_set_remove(
+    key_cmp_idx: u32,
+    slot_drop_idx: u32,
+    alloc_set_idx: u32,
+    drop_set_idx: u32,
+    slot_dup_idx: u32,
+) -> Vec<u8> {
+    // Locals: ek(2,i64), n(3,i32), i(4,i32), found(5,i32), cmp(6,i32), k(7,i32),
+    //         ns(8,i32).
+    let mut b = Vec::new();
+    b.push(0x20);
+    leb_u(0, &mut b);
+    i64_load(0, &mut b);
+    b.push(0x42);
+    leb_s(1, &mut b);
+    b.push(0x51);
+    b.push(0x04);
+    b.push(0x40);
+    emit_reuses_inc(&mut b);
+    b.push(0x05);
+    b.push(0x20);
+    leb_u(0, &mut b);
+    i64_load(8, &mut b);
+    b.push(0x21);
+    leb_u(2, &mut b);
+    b.push(0x20);
+    leb_u(0, &mut b);
+    i64_load(16, &mut b);
+    b.push(0xA7);
+    b.push(0x21);
+    leb_u(3, &mut b);
+    emit_set_clone(&mut b, alloc_set_idx, slot_dup_idx, 0, 8, 2, 3, 7);
+    b.push(0x20);
+    leb_u(0, &mut b);
+    b.push(0x10);
+    leb_u(drop_set_idx as u64, &mut b);
+    b.push(0x1A);
+    b.push(0x20);
+    leb_u(8, &mut b);
+    b.push(0x21);
+    leb_u(0, &mut b);
+    b.push(0x0B);
+    b.push(0x20);
+    leb_u(0, &mut b);
+    i64_load(8, &mut b);
+    b.push(0x21);
+    leb_u(2, &mut b);
+    b.push(0x20);
+    leb_u(0, &mut b);
+    i64_load(16, &mut b);
+    b.push(0xA7);
+    b.push(0x21);
+    leb_u(3, &mut b);
+    emit_set_find(&mut b, key_cmp_idx, 0, 2, 1, 3, 4, 5, 6);
+    b.push(0x20);
+    leb_u(5, &mut b);
+    b.push(0x04);
+    b.push(0x40);
+    // slot_drop(ek, slots[i])
+    b.push(0x20);
+    leb_u(2, &mut b);
+    set_slot_load(&mut b, 0, 4);
+    b.push(0x10);
+    leb_u(slot_drop_idx as u64, &mut b);
+    b.push(0x1A);
+    // shift left: for k=i; k+1<n; k++ slots[k]=slots[k+1]
+    b.push(0x20);
+    leb_u(4, &mut b);
+    b.push(0x21);
+    leb_u(7, &mut b);
+    b.push(0x03);
+    b.push(0x40);
+    b.push(0x20);
+    leb_u(7, &mut b);
+    b.push(0x41);
+    leb_s(1, &mut b);
+    b.push(0x6A);
+    b.push(0x20);
+    leb_u(3, &mut b);
+    b.push(0x48);
+    b.push(0x04);
+    b.push(0x40);
+    b.push(0x20);
+    leb_u(7, &mut b);
+    b.push(0x41);
+    leb_s(1, &mut b);
+    b.push(0x6A);
+    b.push(0x21);
+    leb_u(6, &mut b);
+    set_slot_addr(&mut b, 0, 7);
+    set_slot_load(&mut b, 0, 6);
+    i64_store(0, &mut b);
+    b.push(0x20);
+    leb_u(7, &mut b);
+    b.push(0x41);
+    leb_s(1, &mut b);
+    b.push(0x6A);
+    b.push(0x21);
+    leb_u(7, &mut b);
+    b.push(0x0C);
+    leb_u(1, &mut b);
+    b.push(0x0B);
+    b.push(0x0B);
+    // len = n-1
+    b.push(0x20);
+    leb_u(0, &mut b);
+    b.push(0x20);
+    leb_u(3, &mut b);
+    b.push(0x41);
+    leb_s(1, &mut b);
+    b.push(0x6B);
+    b.push(0xAD);
+    i64_store(16, &mut b);
+    b.push(0x0B); // end if found
+    // slot_drop(ek, e)
+    b.push(0x20);
+    leb_u(2, &mut b);
+    b.push(0x20);
+    leb_u(1, &mut b);
+    b.push(0x10);
+    leb_u(slot_drop_idx as u64, &mut b);
+    b.push(0x1A);
+    b.push(0x20);
+    leb_u(0, &mut b);
+    helper_entry(
+        &[
+            WType::I64, WType::I32, WType::I32, WType::I32, WType::I32,
+            WType::I32, WType::I32,
+        ],
+        b,
+    )
+}
+
+/// Emit code that allocates a fresh String holding the literal bytes `s` and
+/// leaves its pointer (i32) on the operand stack. Self-contained (no data
+/// segment needed): `__alloc_str(len)` then a byte-at-a-time `i32.store8`.
+/// `tmp_l` is an i32 scratch local to hold the String pointer.
+fn emit_lit_str_push(body: &mut Vec<u8>, s: &[u8], alloc_str_idx: u32, tmp_l: u32) {
+    body.push(0x41); // i32.const len
+    leb_s(s.len() as i64, body);
+    body.push(0x10);
+    leb_u(alloc_str_idx as u64, body);
+    body.push(0x22); // local.tee tmp
+    leb_u(tmp_l as u64, body);
+    body.push(0x1A); // drop the tee's value off the stack (we keep it in tmp)
+    for (i, &byte) in s.iter().enumerate() {
+        body.push(0x20); // local.get tmp (address base)
+        leb_u(tmp_l as u64, body);
+        body.push(0x41);
+        leb_s(byte as i64, body);
+        i32_store8(STR_HEADER + i as u64, body);
+    }
+    body.push(0x20); // local.get tmp -> leave ptr on stack
+    leb_u(tmp_l as u64, body);
+}
+
+/// Emit code that pushes a fresh String rendering of one Map/Set slot onto the
+/// stack, dispatching on `kind_l` (i64 SlotKind): Int(0) -> decimal via
+/// `__int_to_str`; Bool(8) -> "true"/"false"; Str(2) -> a dup of the stored
+/// String (so the subsequent `__concat` can consume it). Float(1)/Bytes(4) are
+/// gated at compile time and never reach here; they fall through to the Int
+/// path (dead code). `slot_l` holds the i64 slot; `tmp_l` is an i32 scratch.
+fn emit_slot_to_str_push(
+    body: &mut Vec<u8>,
+    kind_l: u32,
+    slot_l: u32,
+    int_to_str_idx: u32,
+    dup_str_idx: u32,
+    alloc_str_idx: u32,
+    tmp_l: u32,
+) {
+    // if kind == 2 (Str): dup the String and push it
+    body.push(0x20);
+    leb_u(kind_l as u64, body);
+    body.push(0x42);
+    leb_s(2, body);
+    body.push(0x51); // i64.eq
+    body.push(0x04);
+    body.push(0x7F); // result i32
+    // __dup_str((i32)slot) ; push slot
+    body.push(0x20);
+    leb_u(slot_l as u64, body);
+    body.push(0xA7);
+    body.push(0x10);
+    leb_u(dup_str_idx as u64, body);
+    body.push(0x1A);
+    body.push(0x20);
+    leb_u(slot_l as u64, body);
+    body.push(0xA7);
+    body.push(0x05); // else
+    // if kind == 8 (Bool)
+    body.push(0x20);
+    leb_u(kind_l as u64, body);
+    body.push(0x42);
+    leb_s(8, body);
+    body.push(0x51);
+    body.push(0x04);
+    body.push(0x7F);
+    // slot != 0 ? "true" : "false"
+    body.push(0x20);
+    leb_u(slot_l as u64, body);
+    body.push(0x50); // i64.eqz -> 1 if false
+    body.push(0x04);
+    body.push(0x7F);
+    emit_lit_str_push(body, b"false", alloc_str_idx, tmp_l);
+    body.push(0x05);
+    emit_lit_str_push(body, b"true", alloc_str_idx, tmp_l);
+    body.push(0x0B);
+    body.push(0x05); // else (Int / dead Float/Bytes)
+    // __int_to_str(slot)
+    body.push(0x20);
+    leb_u(slot_l as u64, body);
+    body.push(0x10);
+    leb_u(int_to_str_idx as u64, body);
+    body.push(0x0B);
+    body.push(0x0B);
+}
+
+/// `map_show(map:i32=0) -> str:i32`. Build the canonical `Map[k: v, ..]` String
+/// (ascending) by concatenating fresh String pieces. CONSUMES the map. Only
+/// Int/Str/Bool slots reach here (Float/Bytes-valued show is gated at compile
+/// time). Locals: acc(1,i32), n(2,i32), i(3,i32), kk(4,i64), vk(5,i64),
+/// kslot(6,i64), vslot(7,i64), tmp(8,i32).
+fn emit_map_show(
+    slot_drop_idx: u32,
+    drop_map_idx: u32,
+    alloc_str_idx: u32,
+    int_to_str_idx: u32,
+) -> Vec<u8> {
+    let _ = slot_drop_idx;
+    // We need __concat and __dup_str: compute via fixed offsets from this fn's
+    // heap_base is not available here; instead these are passed implicitly — but
+    // we only have alloc_str_idx/int_to_str_idx. Derive concat/dup_str/drop_str
+    // relative to int_to_str (IntToStr offset 11, Concat 10, DupStr 8, DropStr 9,
+    // AllocStr 7). heap_base = int_to_str_idx - 11.
+    let heap_base = int_to_str_idx - HeapHelper::IntToStr.offset();
+    let concat_idx = heap_base + HeapHelper::Concat.offset();
+    let dup_str_idx = heap_base + HeapHelper::DupStr.offset();
+    let mut b = Vec::new();
+    // acc = "Map["
+    emit_lit_str_push(&mut b, b"Map[", alloc_str_idx, 8);
+    b.push(0x21);
+    leb_u(1, &mut b);
+    // n = len ; kk ; vk
+    b.push(0x20);
+    leb_u(0, &mut b);
+    i64_load(24, &mut b);
+    b.push(0xA7);
+    b.push(0x21);
+    leb_u(2, &mut b);
+    b.push(0x20);
+    leb_u(0, &mut b);
+    i64_load(8, &mut b);
+    b.push(0x21);
+    leb_u(4, &mut b);
+    b.push(0x20);
+    leb_u(0, &mut b);
+    i64_load(16, &mut b);
+    b.push(0x21);
+    leb_u(5, &mut b);
+    // i=0; while i<n
+    b.push(0x41);
+    leb_s(0, &mut b);
+    b.push(0x21);
+    leb_u(3, &mut b);
+    b.push(0x03);
+    b.push(0x40);
+    b.push(0x20);
+    leb_u(3, &mut b);
+    b.push(0x20);
+    leb_u(2, &mut b);
+    b.push(0x48);
+    b.push(0x04);
+    b.push(0x40);
+    // if i>0: acc = concat(acc, ", ")
+    b.push(0x20);
+    leb_u(3, &mut b);
+    b.push(0x41);
+    leb_s(0, &mut b);
+    b.push(0x4A); // i>0
+    b.push(0x04);
+    b.push(0x40);
+    b.push(0x20);
+    leb_u(1, &mut b);
+    emit_lit_str_push(&mut b, b", ", alloc_str_idx, 8);
+    b.push(0x10);
+    leb_u(concat_idx as u64, &mut b);
+    b.push(0x21);
+    leb_u(1, &mut b);
+    b.push(0x0B);
+    // kslot ; acc = concat(acc, str(kslot))
+    map_slot_load(&mut b, 0, 3, 0);
+    b.push(0x21);
+    leb_u(6, &mut b);
+    b.push(0x20);
+    leb_u(1, &mut b);
+    emit_slot_to_str_push(&mut b, 4, 6, int_to_str_idx, dup_str_idx, alloc_str_idx, 8);
+    b.push(0x10);
+    leb_u(concat_idx as u64, &mut b);
+    b.push(0x21);
+    leb_u(1, &mut b);
+    // acc = concat(acc, ": ")
+    b.push(0x20);
+    leb_u(1, &mut b);
+    emit_lit_str_push(&mut b, b": ", alloc_str_idx, 8);
+    b.push(0x10);
+    leb_u(concat_idx as u64, &mut b);
+    b.push(0x21);
+    leb_u(1, &mut b);
+    // vslot ; acc = concat(acc, str(vslot))
+    map_slot_load(&mut b, 0, 3, 1);
+    b.push(0x21);
+    leb_u(7, &mut b);
+    b.push(0x20);
+    leb_u(1, &mut b);
+    emit_slot_to_str_push(&mut b, 5, 7, int_to_str_idx, dup_str_idx, alloc_str_idx, 8);
+    b.push(0x10);
+    leb_u(concat_idx as u64, &mut b);
+    b.push(0x21);
+    leb_u(1, &mut b);
+    // i++
+    b.push(0x20);
+    leb_u(3, &mut b);
+    b.push(0x41);
+    leb_s(1, &mut b);
+    b.push(0x6A);
+    b.push(0x21);
+    leb_u(3, &mut b);
+    b.push(0x0C);
+    leb_u(1, &mut b);
+    b.push(0x0B);
+    b.push(0x0B);
+    // acc = concat(acc, "]")
+    b.push(0x20);
+    leb_u(1, &mut b);
+    emit_lit_str_push(&mut b, b"]", alloc_str_idx, 8);
+    b.push(0x10);
+    leb_u(concat_idx as u64, &mut b);
+    b.push(0x21);
+    leb_u(1, &mut b);
+    // drop_map(map) ; return acc
+    b.push(0x20);
+    leb_u(0, &mut b);
+    b.push(0x10);
+    leb_u(drop_map_idx as u64, &mut b);
+    b.push(0x1A);
+    b.push(0x20);
+    leb_u(1, &mut b);
+    helper_entry(
+        &[
+            WType::I32, WType::I32, WType::I32, WType::I64, WType::I64,
+            WType::I64, WType::I64, WType::I32,
+        ],
+        b,
+    )
+}
+
+/// `set_show(set:i32=0) -> str:i32`. Canonical `Set[a, ..]` String (ascending).
+/// CONSUMES the set. Locals: acc(1,i32), n(2,i32), i(3,i32), ek(4,i64),
+/// slot(5,i64), tmp(6,i32).
+fn emit_set_show(
+    slot_drop_idx: u32,
+    drop_set_idx: u32,
+    alloc_str_idx: u32,
+    int_to_str_idx: u32,
+) -> Vec<u8> {
+    let _ = slot_drop_idx;
+    let heap_base = int_to_str_idx - HeapHelper::IntToStr.offset();
+    let concat_idx = heap_base + HeapHelper::Concat.offset();
+    let dup_str_idx = heap_base + HeapHelper::DupStr.offset();
+    let mut b = Vec::new();
+    emit_lit_str_push(&mut b, b"Set[", alloc_str_idx, 6);
+    b.push(0x21);
+    leb_u(1, &mut b);
+    b.push(0x20);
+    leb_u(0, &mut b);
+    i64_load(16, &mut b);
+    b.push(0xA7);
+    b.push(0x21);
+    leb_u(2, &mut b);
+    b.push(0x20);
+    leb_u(0, &mut b);
+    i64_load(8, &mut b);
+    b.push(0x21);
+    leb_u(4, &mut b);
+    b.push(0x41);
+    leb_s(0, &mut b);
+    b.push(0x21);
+    leb_u(3, &mut b);
+    b.push(0x03);
+    b.push(0x40);
+    b.push(0x20);
+    leb_u(3, &mut b);
+    b.push(0x20);
+    leb_u(2, &mut b);
+    b.push(0x48);
+    b.push(0x04);
+    b.push(0x40);
+    b.push(0x20);
+    leb_u(3, &mut b);
+    b.push(0x41);
+    leb_s(0, &mut b);
+    b.push(0x4A);
+    b.push(0x04);
+    b.push(0x40);
+    b.push(0x20);
+    leb_u(1, &mut b);
+    emit_lit_str_push(&mut b, b", ", alloc_str_idx, 6);
+    b.push(0x10);
+    leb_u(concat_idx as u64, &mut b);
+    b.push(0x21);
+    leb_u(1, &mut b);
+    b.push(0x0B);
+    set_slot_load(&mut b, 0, 3);
+    b.push(0x21);
+    leb_u(5, &mut b);
+    b.push(0x20);
+    leb_u(1, &mut b);
+    emit_slot_to_str_push(&mut b, 4, 5, int_to_str_idx, dup_str_idx, alloc_str_idx, 6);
+    b.push(0x10);
+    leb_u(concat_idx as u64, &mut b);
+    b.push(0x21);
+    leb_u(1, &mut b);
+    b.push(0x20);
+    leb_u(3, &mut b);
+    b.push(0x41);
+    leb_s(1, &mut b);
+    b.push(0x6A);
+    b.push(0x21);
+    leb_u(3, &mut b);
+    b.push(0x0C);
+    leb_u(1, &mut b);
+    b.push(0x0B);
+    b.push(0x0B);
+    b.push(0x20);
+    leb_u(1, &mut b);
+    emit_lit_str_push(&mut b, b"]", alloc_str_idx, 6);
+    b.push(0x10);
+    leb_u(concat_idx as u64, &mut b);
+    b.push(0x21);
+    leb_u(1, &mut b);
+    b.push(0x20);
+    leb_u(0, &mut b);
+    b.push(0x10);
+    leb_u(drop_set_idx as u64, &mut b);
+    b.push(0x1A);
+    b.push(0x20);
+    leb_u(1, &mut b);
+    helper_entry(
+        &[WType::I32, WType::I32, WType::I32, WType::I64, WType::I64, WType::I32],
+        b,
+    )
 }
 
 /// Emit code that loads byte `arr.elems[idx_local]` (an Array(Int) slot, stored
@@ -7763,6 +11270,124 @@ fn emit_bytes_slot_load(body: &mut Vec<u8>, ptr_local: u32, idx_local: u32, dst_
     body.push(0xA7); // i32.wrap_i64
     body.push(0x21); // local.set dst
     leb_u(dst_local as u64, body);
+}
+
+// ---- Map / Set slot-access + kind-dispatch helpers -----------------------
+
+/// Push the i64 value of `map.slots[2*idx + which]` onto the stack. The slot
+/// base address is `ptr + MAP_HEADER + 8*(2*idx + which)`. `ptr_local` holds the
+/// Map pointer, `idx_local` the entry index. (Caller has already pushed any
+/// preceding stack operands, e.g. a kind argument.)
+fn map_slot_load(body: &mut Vec<u8>, ptr_local: u32, idx_local: u32, which: u32) {
+    body.push(0x20); // local.get ptr
+    leb_u(ptr_local as u64, body);
+    body.push(0x41); // i32.const MAP_HEADER
+    leb_s(MAP_HEADER as i64, body);
+    body.push(0x6A); // i32.add
+    // offset within slots = 8 * (2*idx + which)
+    body.push(0x20); // local.get idx
+    leb_u(idx_local as u64, body);
+    body.push(0x41);
+    leb_s(2, body);
+    body.push(0x6C); // i32.mul -> 2*idx
+    body.push(0x41);
+    leb_s(which as i64, body);
+    body.push(0x6A); // + which
+    body.push(0x41);
+    leb_s(SLOT as i64, body);
+    body.push(0x6C); // * 8
+    body.push(0x6A); // i32.add -> addr
+    i64_load(0, body);
+}
+
+/// Push the byte ADDRESS of `map.slots[2*idx + which]` onto the stack (for a
+/// subsequent store). Leaves an i32 address.
+fn map_slot_addr(body: &mut Vec<u8>, ptr_local: u32, idx_local: u32, which: u32) {
+    body.push(0x20);
+    leb_u(ptr_local as u64, body);
+    body.push(0x41);
+    leb_s(MAP_HEADER as i64, body);
+    body.push(0x6A);
+    body.push(0x20);
+    leb_u(idx_local as u64, body);
+    body.push(0x41);
+    leb_s(2, body);
+    body.push(0x6C);
+    body.push(0x41);
+    leb_s(which as i64, body);
+    body.push(0x6A);
+    body.push(0x41);
+    leb_s(SLOT as i64, body);
+    body.push(0x6C);
+    body.push(0x6A);
+}
+
+/// Push the i64 value of `set.slots[idx]` (base `ptr + SET_HEADER + 8*idx`).
+fn set_slot_load(body: &mut Vec<u8>, ptr_local: u32, idx_local: u32) {
+    body.push(0x20);
+    leb_u(ptr_local as u64, body);
+    body.push(0x41);
+    leb_s(SET_HEADER as i64, body);
+    body.push(0x6A);
+    body.push(0x20);
+    leb_u(idx_local as u64, body);
+    body.push(0x41);
+    leb_s(SLOT as i64, body);
+    body.push(0x6C);
+    body.push(0x6A);
+    i64_load(0, body);
+}
+
+/// Push the byte ADDRESS of `set.slots[idx]`.
+fn set_slot_addr(body: &mut Vec<u8>, ptr_local: u32, idx_local: u32) {
+    body.push(0x20);
+    leb_u(ptr_local as u64, body);
+    body.push(0x41);
+    leb_s(SET_HEADER as i64, body);
+    body.push(0x6A);
+    body.push(0x20);
+    leb_u(idx_local as u64, body);
+    body.push(0x41);
+    leb_s(SLOT as i64, body);
+    body.push(0x6C);
+    body.push(0x6A);
+}
+
+/// Emit the body of `__slot_dup`/`__slot_drop`: given params `kind`(0,i64) and
+/// `slot`(1,i64), call `str_idx((i32)slot)` if kind==2 (Str), or
+/// `bytes_idx((i32)slot)` if kind==4 (Bytes); otherwise no-op. Leaves nothing
+/// on the stack (the caller pushes the i32 dummy return).
+fn emit_slot_kind_call(body: &mut Vec<u8>, str_idx: u32, bytes_idx: u32) {
+    // if kind == 2 (Str)
+    body.push(0x20);
+    leb_u(0, body);
+    body.push(0x42);
+    leb_s(2, body);
+    body.push(0x51); // i64.eq
+    body.push(0x04); // if
+    body.push(0x40);
+    body.push(0x20);
+    leb_u(1, body);
+    body.push(0xA7); // i32.wrap_i64
+    body.push(0x10);
+    leb_u(str_idx as u64, body);
+    body.push(0x1A); // drop dummy
+    body.push(0x0B); // end if
+    // if kind == 4 (Bytes)
+    body.push(0x20);
+    leb_u(0, body);
+    body.push(0x42);
+    leb_s(4, body);
+    body.push(0x51);
+    body.push(0x04);
+    body.push(0x40);
+    body.push(0x20);
+    leb_u(1, body);
+    body.push(0xA7);
+    body.push(0x10);
+    leb_u(bytes_idx as u64, body);
+    body.push(0x1A);
+    body.push(0x0B);
 }
 
 /// Emit the UTF-8 lead-byte classification: given byte `c` in `c_local`, set
@@ -9328,7 +12953,7 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
                 WType::F64 => f64_load(off, &mut body_code),
                 WType::I64 => i64_load(off, &mut body_code),
                 WType::I32 | WType::Ref | WType::Str | WType::Tensor | WType::Array(_) | WType::Bytes
-                | WType::Vector => {
+                | WType::Vector | WType::Map(..) | WType::Set(_) => {
                     i64_load(off, &mut body_code);
                     body_code.push(0xA7); // i32.wrap_i64
                 }
@@ -9363,6 +12988,20 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
                     leb_u(slot as u64, &mut body_code);
                     body_code.push(0x10);
                     leb_u(dup_vec_idx as u64, &mut body_code);
+                    body_code.push(0x1A); // drop dummy
+                }
+                WType::Map(..) => {
+                    body_code.push(0x20);
+                    leb_u(slot as u64, &mut body_code);
+                    body_code.push(0x10);
+                    leb_u(env.heap_index(HeapHelper::DupMap) as u64, &mut body_code);
+                    body_code.push(0x1A); // drop dummy
+                }
+                WType::Set(_) => {
+                    body_code.push(0x20);
+                    leb_u(slot as u64, &mut body_code);
+                    body_code.push(0x10);
+                    leb_u(env.heap_index(HeapHelper::DupSet) as u64, &mut body_code);
                     body_code.push(0x1A); // drop dummy
                 }
                 _ => {}
@@ -9414,7 +13053,15 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
                 .iter()
                 .enumerate()
                 .filter(|(_, t)| {
-                    matches!(t, WType::Ref | WType::Str | WType::Array(_) | WType::Vector)
+                    matches!(
+                        t,
+                        WType::Ref
+                            | WType::Str
+                            | WType::Array(_)
+                            | WType::Vector
+                            | WType::Map(..)
+                            | WType::Set(_)
+                    )
                 })
                 .map(|(i, t)| (i, *t))
                 .collect(),
@@ -9568,31 +13215,32 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
         section(5, &content, &mut out);
     }
 
-    // Export section (id 7): `main`, `__live`, `__reuses`, and `memory`.
+    // Export section (id 7): `main`, `__live`, `__reuses`, `memory`, and the
+    // result-releasing helpers `__drop_str`/`__drop_map`/`__drop_set` (so a host
+    // harness can free a heap-typed `main` result and then observe `__live==0`,
+    // exactly as the native backend drops its printed result before reporting
+    // `aria_live`).
     {
         let main_idx = fn_index["main"];
         let live_idx = heap_base + HeapHelper::Live.offset();
         let reuses_idx = heap_base + HeapHelper::Reuses.offset();
+        let drop_str_idx = heap_base + HeapHelper::DropStr.offset();
+        let drop_map_idx = heap_base + HeapHelper::DropMap.offset();
+        let drop_set_idx = heap_base + HeapHelper::DropSet.offset();
         let mut content = Vec::new();
-        leb_u(4, &mut content); // four exports
-        // main (func)
-        let n = b"main";
-        leb_u(n.len() as u64, &mut content);
-        content.extend_from_slice(n);
-        content.push(0x00);
-        leb_u(main_idx as u64, &mut content);
-        // __live (func)
-        let n = b"__live";
-        leb_u(n.len() as u64, &mut content);
-        content.extend_from_slice(n);
-        content.push(0x00);
-        leb_u(live_idx as u64, &mut content);
-        // __reuses (func)
-        let n = b"__reuses";
-        leb_u(n.len() as u64, &mut content);
-        content.extend_from_slice(n);
-        content.push(0x00);
-        leb_u(reuses_idx as u64, &mut content);
+        leb_u(7, &mut content); // seven exports
+        let func_export = |content: &mut Vec<u8>, name: &[u8], idx: u32| {
+            leb_u(name.len() as u64, content);
+            content.extend_from_slice(name);
+            content.push(0x00);
+            leb_u(idx as u64, content);
+        };
+        func_export(&mut content, b"main", main_idx);
+        func_export(&mut content, b"__live", live_idx);
+        func_export(&mut content, b"__reuses", reuses_idx);
+        func_export(&mut content, b"__drop_str", drop_str_idx);
+        func_export(&mut content, b"__drop_map", drop_map_idx);
+        func_export(&mut content, b"__drop_set", drop_set_idx);
         // memory (mem index 0)
         let n = b"memory";
         leb_u(n.len() as u64, &mut content);

@@ -182,6 +182,26 @@ fn compile_to_wasm(path: &str) -> Result<Vec<u8>, String> {
     wasm::compile(&prog)
 }
 
+/// Coarsely classify `main`'s declared return type for the wasm-run harness:
+/// `"str"` for a heap String result (which is an i32 pointer the harness must
+/// decode + free), `"scalar"` otherwise (Int/Float come back as a JS
+/// bigint/number directly). Best-effort: any parse hiccup falls back to scalar.
+fn main_return_kind(path: &str) -> String {
+    let kind = (|| -> Option<String> {
+        let src = std::fs::read_to_string(path).ok()?;
+        let prog = lexer::lex(&prelude::wrap(&src)).and_then(parser::parse).ok()?;
+        let main = prog.items.iter().find_map(|it| match it {
+            ast::Item::Fn(f) if f.name == "main" => Some(f),
+            _ => None,
+        })?;
+        Some(match &main.ret {
+            ast::Ty::Str => "str".to_string(),
+            _ => "scalar".to_string(),
+        })
+    })();
+    kind.unwrap_or_else(|| "scalar".to_string())
+}
+
 /// `aria wasm <file.aria> <out.wasm>`: compile and write the wasm binary.
 fn run_wasm_compile(args: &[String]) -> ExitCode {
     if args.len() < 4 {
@@ -217,6 +237,12 @@ fn run_wasm_run(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // Determine `main`'s return kind so the Node harness decodes the result
+    // correctly (Int/Float come back as JS bigint/number; a String/Map/Set is an
+    // i32 heap pointer — also a JS number, so they cannot be told apart by JS
+    // type alone). `"str"` => decode the heap String and free it (so `__live`
+    // reaches 0, matching native dropping its printed result).
+    let main_ret = main_return_kind(&args[2]);
     let path = std::env::temp_dir().join(format!("aria_{}.wasm", std::process::id()));
     if let Err(e) = std::fs::write(&path, &bytes) {
         eprintln!("error: cannot write temp wasm: {}", e);
@@ -247,16 +273,19 @@ fn run_wasm_run(args: &[String]) -> ExitCode {
          try{{const b=fs.readFileSync({:?});\
          WebAssembly.instantiate(b,imp).then(r=>{{\
          try{{const ex=r.instance.exports;memref=ex.memory;\
+         const isStr={};\
          const v=ex.main();\
-         if(typeof v==='bigint'){{process.stdout.write(String(v));}}\
-         else if(typeof v==='number'){{process.stdout.write(String(v));}}\
-         else{{process.stdout.write(decodeStr(v));}}\
+         if(isStr){{process.stdout.write(decodeStr(v));\
+         if(ex.__drop_str){{ex.__drop_str(v);}}}}\
+         else if(typeof v==='bigint'){{process.stdout.write(String(v));}}\
+         else{{process.stdout.write(String(v));}}\
          if(ex.__live){{process.stderr.write('__live='+String(ex.__live()));}}\
          if(ex.__reuses){{process.stderr.write(' __reuses='+String(ex.__reuses()));}}}}\
          catch(e){{process.stdout.write('TRAP');process.exitCode=1;}}\
          }}).catch(e=>{{process.stdout.write('TRAP');process.exitCode=1;}});}}\
          catch(e){{process.stdout.write('TRAP');process.exitCode=1;}}",
-        path.to_string_lossy()
+        path.to_string_lossy(),
+        if main_ret == "str" { "true" } else { "false" }
     );
     // `--stack-size` raises V8's stack so compiled wasm can recurse as deeply as
     // the interpreter / native backend (wasm under Node's default stack traps on

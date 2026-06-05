@@ -767,6 +767,57 @@ fn node_available() -> bool {
         .unwrap_or(false)
 }
 
+/// Run compiled wasm under Node where `main` returns an Int or a heap String,
+/// returning `(rendered_result, live_cells)`. An i64 (bigint) result is an Int;
+/// any other (an i32 String pointer) is decoded from the String object. Used by
+/// the maps/sets differential (whose programs return an Int or the canonical
+/// ordered-display String — never a Float, so the bigint/else split is
+/// unambiguous). Mirrors the `wasm.rs` `differential_gc` harness.
+fn run_wasm_live_str(bytes: &[u8]) -> Result<(String, i64), String> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let path = std::env::temp_dir().join(format!(
+        "aria_proptest_wasm_str_{}_{}.wasm",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
+    let script = format!(
+        "const fs=require('fs');\
+         const dec=new TextDecoder();\
+         let memref=null;\
+         const imp={{env:{{print_str:(p,n)=>{{\
+         process.stdout.write(dec.decode(new Uint8Array(memref.buffer).subarray(p,p+n)));\
+         process.stdout.write('\\n');}},\
+         print_float:(x)=>{{process.stdout.write(String(x));process.stdout.write('\\n');}},\
+         print_int:(n)=>{{process.stdout.write(String(n));process.stdout.write('\\n');}},\
+         print_bool:(b)=>{{process.stdout.write(b?'true':'false');process.stdout.write('\\n');}},\
+         exp:Math.exp}}}};\
+         const b=fs.readFileSync({:?});\
+         WebAssembly.instantiate(b,imp).then(r=>{{\
+         const ex=r.instance.exports;memref=ex.memory;\
+         const v=ex.main();\
+         let m;if(typeof v==='bigint'){{m=String(v);}}\
+         else{{const dv=new DataView(ex.memory.buffer);\
+         const len=Number(dv.getBigInt64(v+8,true));\
+         m=dec.decode(new Uint8Array(ex.memory.buffer).subarray(v+16,v+16+len));\
+         ex.__drop_str(v);}}\
+         const l=String(ex.__live());\
+         process.stdout.write(m+'|'+l);\
+         }}).catch(e=>process.stdout.write('TRAP|0'));",
+        path.to_string_lossy()
+    );
+    let out = std::process::Command::new("node")
+        .arg("-e")
+        .arg(&script)
+        .output()
+        .map_err(|e| e.to_string())?;
+    let _ = std::fs::remove_file(&path);
+    let s = String::from_utf8_lossy(&out.stdout).to_string();
+    let (res, live) = s.split_once('|').ok_or("bad harness output")?;
+    Ok((res.to_string(), live.parse::<i64>().unwrap_or(-1)))
+}
+
 /// Run compiled wasm under Node, returning `(main_result, live_cells)`.
 /// `live` is the value of the exported `__live()` after `main` returns; a TRAP
 /// (e.g. an overflow `unreachable`) surfaces as `("TRAP", _)`. Mirrors the
@@ -1354,7 +1405,9 @@ fn map_set_diff_programs() -> Vec<(String, &'static str)> {
 fn maps_sets_interp_matches_compiled() {
     let progs = map_set_diff_programs();
     let cc = cc_available();
+    let node = node_available();
     let mut native_checked = 0u64;
+    let mut wasm_ran = 0u64;
 
     for (src, expected) in &progs {
         // Oracle: tree-walking interpreter.
@@ -1379,25 +1432,72 @@ fn maps_sets_interp_matches_compiled() {
             native_checked += 1;
         }
 
-        // The wasm backend must cleanly REJECT maps/sets (never compile/panic).
-        let bytes = wasm::compile(&prog);
-        assert!(
-            bytes.is_err(),
-            "wasm backend unexpectedly accepted a map/set program\n{}",
-            src
-        );
-        assert!(
-            bytes.unwrap_err().contains("maps/sets are not yet supported"),
-            "wasm rejection message should mention maps/sets\n{}",
-            src
-        );
+        // The wasm backend now RUNS ordered maps/sets fully: every map_*/set_* op
+        // is real hand-emitted wasm. These programs return an Int or the canonical
+        // ordered-display String (Int/Str keys, Int values, map_show/set_show) —
+        // all supported. The result must match the interpreter and the heap must
+        // be garbage-free (`__live == 0`, the returned String released by the
+        // harness, exactly as native drops its printed result).
+        let bytes = wasm::compile(&prog)
+            .unwrap_or_else(|e| panic!("wasm compile failed (should run): {}\n{}", e, src));
+        if node {
+            let (w, live) = run_wasm_live_str(&bytes)
+                .unwrap_or_else(|e| panic!("wasm runner failed: {}\n{}", e, src));
+            assert_eq!(w, *expected, "wasm != expected\n{}\n wasm={}", src, w);
+            assert_eq!(live, 0, "wasm leaked {} cell(s)\n{}", live, src);
+            wasm_ran += 1;
+        }
     }
 
     eprintln!(
-        "maps_sets_interp_matches_compiled: {} programs ({} native)",
+        "maps_sets_interp_matches_compiled: {} programs ({} native, {} wasm ran)",
         progs.len(),
-        native_checked
+        native_checked,
+        wasm_ran
     );
+}
+
+/// A Float- or Bytes-VALUED `map_show`/`set_show` is the one gated wasm case:
+/// the wasm backend has no in-wasm shortest-round-trip float / hex formatter
+/// (the same gap that gates a Vector/Bytes-returning main). The gate is a CLEAN
+/// compile error — never a panic or a wrong number — while every NON-show op on
+/// the same Float/Bytes-valued map still compiles and runs.
+#[test]
+fn wasm_gates_float_valued_map_show() {
+    // Float-valued map_show: gated cleanly under wasm.
+    let show_src = "fn main() -> String = map_show(map_insert(map_new(), 1, 1.5))\n";
+    let prog = parser::parse(lexer::lex(show_src).expect("lex")).expect("parse");
+    assert!(typeck::check(&prog).is_ok(), "type error\n{}", show_src);
+    // The interpreter renders it fine (the oracle); wasm gates the rendering.
+    assert!(ast_run(show_src).is_ok(), "interpreter should run map_show\n{}", show_src);
+    let err = wasm::compile(&prog)
+        .err()
+        .unwrap_or_else(|| panic!("wasm should gate a Float-valued map_show\n{}", show_src));
+    assert!(
+        err.contains("map_show") && err.contains("Float"),
+        "expected a clean Float-show gate, got: {}\n{}",
+        err,
+        show_src
+    );
+
+    // ...but the NON-show ops on a Float-valued map compile + run under wasm and
+    // match the interpreter, garbage-free.
+    let ops_src = "fn main() -> Int = {\n\
+                     let m = map_insert(map_insert(map_new(), 2, 2.5), 1, 1.5);\n\
+                     let v = map_get_or(m, 1, 0.0);\n\
+                     (if v == 1.5 { 100 } else { 0 }) + (if map_has(m, 2) { 10 } else { 0 }) + map_len(m)\n\
+                   }\n";
+    let oprog = parser::parse(lexer::lex(ops_src).expect("lex")).expect("parse");
+    assert!(typeck::check(&oprog).is_ok(), "type error\n{}", ops_src);
+    let expected = ast_run(ops_src).expect("interp float ops");
+    assert_eq!(expected, "112");
+    let bytes = wasm::compile(&oprog)
+        .unwrap_or_else(|e| panic!("wasm should compile Float-valued non-show ops: {}\n{}", e, ops_src));
+    if node_available() {
+        let (w, live) = run_wasm_live_str(&bytes).expect("wasm run float ops");
+        assert_eq!(w, expected, "wasm float-ops != interp\n{}", ops_src);
+        assert_eq!(live, 0, "wasm leaked on float ops\n{}", ops_src);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1406,9 +1506,9 @@ fn maps_sets_interp_matches_compiled() {
 //     deterministic order used for display/equality) so it can be iterated with
 //     the prelude array HOFs (`array_fold`/`array_map`). Each program is wrapped
 //     with the real prelude (so the HOFs are in scope) and run through interp
-//     (oracle) vs native (cc-gated); results must be IDENTICAL and the native
-//     heap garbage-free (live == 0). Wasm/IR reject these (covered by the gate
-//     tests above), so they are intentionally excluded here.
+//     (oracle) vs native (cc-gated) vs wasm (node-gated); results must be
+//     IDENTICAL and both compiled heaps garbage-free (live == 0). (The `aria mem`
+//     IR path still rejects maps/sets — covered elsewhere.)
 // ---------------------------------------------------------------------------
 
 /// User programs (prelude appended at run time) combining the enumeration
@@ -1514,7 +1614,9 @@ fn enum_hof_diff_programs() -> Vec<(String, &'static str)> {
 fn enum_hofs_match_across_backends() {
     let progs = enum_hof_diff_programs();
     let cc = cc_available();
+    let node = node_available();
     let mut native_checked = 0u64;
+    let mut wasm_ran = 0u64;
 
     for (user_src, expected) in &progs {
         // Wrap with the real prelude (exactly as the CLI does) so the array HOFs
@@ -1543,12 +1645,27 @@ fn enum_hofs_match_across_backends() {
             assert_eq!(live, 0, "native leaked {} cell(s)\n{}", live, user_src);
             native_checked += 1;
         }
+
+        // Wasm backend: `map_keys`/`map_values`/`set_to_array` build a real wasm
+        // Array enumerated in ascending order, folded by the prelude HOFs. Each
+        // program returns an Int or a String (never a Float/Bytes show), so wasm
+        // runs them and must match the interpreter, garbage-free.
+        let bytes = wasm::compile(&prog)
+            .unwrap_or_else(|e| panic!("wasm compile failed (should run): {}\n{}", e, user_src));
+        if node {
+            let (w, live) = run_wasm_live_str(&bytes)
+                .unwrap_or_else(|e| panic!("wasm runner failed: {}\n{}", e, user_src));
+            assert_eq!(w, *expected, "wasm != expected\n{}\n wasm={}", user_src, w);
+            assert_eq!(live, 0, "wasm leaked {} cell(s)\n{}", live, user_src);
+            wasm_ran += 1;
+        }
     }
 
     eprintln!(
-        "enum_hofs_match_across_backends: {} programs ({} native)",
+        "enum_hofs_match_across_backends: {} programs ({} native, {} wasm ran)",
         progs.len(),
-        native_checked
+        native_checked,
+        wasm_ran
     );
 }
 
