@@ -3163,3 +3163,119 @@ fn tensors_run_in_native_and_wasm_match_interp() {
         nat, wasm_n
     );
 }
+
+// ---------------------------------------------------------------------------
+// Forward-mode automatic differentiation (dual numbers) — correctness.
+//
+// Proves the AD-computed derivative is *actually correct*, not merely that the
+// program runs: for several functions, the dual-number gradient `grad1(f, x)`
+// (run through the interpreter oracle, and the native C backend when `cc` is
+// available) must match a central finite-difference approximation of the same
+// function within tolerance. Also asserts the (x-3)^2 gradient descent converges
+// near 3. This is the dual-number "oracle" the VISION-ROADMAP recommends as the
+// correctness check for any future reverse-mode `grad`.
+// ---------------------------------------------------------------------------
+
+/// The pure-Aria dual-number library (mirrors examples/autodiff.aria). Kept as a
+/// string so the test is self-contained and independent of example-file edits.
+const DUAL_LIB: &str = r#"
+type Dual = { v: Float, d: Float }
+fn dconst(c: Float) -> Dual = Dual { v: c, d: 0.0 }
+fn dvar(x: Float) -> Dual = Dual { v: x, d: 1.0 }
+fn dadd(a: Dual, b: Dual) -> Dual = Dual { v: a.v + b.v, d: a.d + b.d }
+fn dsub(a: Dual, b: Dual) -> Dual = Dual { v: a.v - b.v, d: a.d - b.d }
+fn dmul(a: Dual, b: Dual) -> Dual = Dual { v: a.v * b.v, d: a.d * b.v + a.v * b.d }
+fn grad1(f: (Dual) -> Dual, x: Float) -> Float = (f(dvar(x))).d
+"#;
+
+/// Parse a rendered Aria Float value (the interpreter prints with Rust's `{}`).
+fn parse_float_result(s: &str) -> f64 {
+    s.trim().parse::<f64>().unwrap_or_else(|_| panic!("not a float: {:?}", s))
+}
+
+#[test]
+fn autodiff_dual_matches_finite_difference() {
+    // Each case: an Aria function body of a `Dual -> Dual` named `fcase`, the
+    // point x, and the equivalent plain-f64 closure for the finite-difference
+    // reference. The dual rules above cover +, -, * which is enough for these.
+    struct Case {
+        body: &'static str,           // body of `fn fcase(x: Dual) -> Dual = ...`
+        f: fn(f64) -> f64,            // same function on plain f64
+        x: f64,
+    }
+    let cases = [
+        // x^2
+        Case { body: "dmul(x, x)", f: |x| x * x, x: 2.5 },
+        // x^3
+        Case { body: "dmul(dmul(x, x), x)", f: |x| x * x * x, x: -1.3 },
+        // x*x + 2*x  (i.e. x^2 + 2x)
+        Case { body: "dadd(dmul(x, x), dmul(dconst(2.0), x))", f: |x| x * x + 2.0 * x, x: 0.7 },
+        // (x - 3)^2
+        Case { body: "{ let t = dsub(x, dconst(3.0)); dmul(t, t) }", f: |x| (x - 3.0) * (x - 3.0), x: 5.0 },
+    ];
+
+    let cc = cc_available();
+    for (i, c) in cases.iter().enumerate() {
+        let src = format!(
+            "{lib}\nfn fcase(x: Dual) -> Dual = {body}\nfn main() -> Float = grad1(fcase, {x})\n",
+            lib = DUAL_LIB, body = c.body, x = fmt_f64_lit(c.x),
+        );
+        // AD gradient through the interpreter oracle.
+        let ad = parse_float_result(&ast_run(&src).unwrap_or_else(|e| panic!("case {} interp: {}\n{}", i, e, src)));
+
+        // Central finite difference of the SAME function.
+        let h = 1e-6;
+        let fd = (((c.f)(c.x + h)) - ((c.f)(c.x - h))) / (2.0 * h);
+
+        assert!(
+            (ad - fd).abs() <= 1e-4 * (1.0 + fd.abs()),
+            "case {}: AD grad {} != finite-diff {} (point x={})\n{}",
+            i, ad, fd, c.x, src
+        );
+
+        // And, when a C compiler is present, the native backend must agree
+        // bit-for-bit with the interpreter on the AD gradient.
+        if cc {
+            let prog = parser::parse(lexer::lex(&src).expect("lex")).expect("parse");
+            assert!(typeck::check(&prog).is_ok(), "type error\n{}", src);
+            let c_src = crate::c_backend::compile(&prog)
+                .unwrap_or_else(|e| panic!("c_backend failed: {}\n{}", e, src));
+            let (nat, live) = run_native_live(&c_src)
+                .unwrap_or_else(|e| panic!("case {} native: {}\n{}", i, e, src));
+            assert_eq!(
+                ast_run(&src).unwrap().trim(), nat,
+                "case {}: native AD grad != interp\n{}", i, src
+            );
+            assert_eq!(live, 0, "case {}: native AD not garbage-free (live={})", i, live);
+        }
+    }
+}
+
+#[test]
+fn autodiff_gradient_descent_converges() {
+    // Minimize f(x) = (x-3)^2 by GD with grad1 (forward-mode). From x=0, lr=0.1,
+    // 100 steps, x must land near 3 and the loss near 0 — a real "program that
+    // learns" in pure Aria, checked through the interpreter oracle.
+    let src = format!(
+        "{lib}\n\
+         fn fsq(x: Dual) -> Dual = {{ let t = dsub(x, dconst(3.0)); dmul(t, t) }}\n\
+         fn descend(x: Float, lr: Float, steps: Int) -> Float =\n\
+           if steps <= 0 {{ x }} else {{ descend(x - lr * grad1(fsq, x), lr, steps - 1) }}\n\
+         fn main() -> Float = descend(0.0, 0.1, 100)\n",
+        lib = DUAL_LIB,
+    );
+    let xstar = parse_float_result(&ast_run(&src).unwrap_or_else(|e| panic!("descend: {}\n{}", e, src)));
+    assert!((xstar - 3.0).abs() < 1e-3, "GD did not converge to 3: x={}", xstar);
+    let loss = (xstar - 3.0) * (xstar - 3.0);
+    assert!(loss < 1e-6, "GD loss not near 0: {}", loss);
+}
+
+/// Format an f64 as an Aria Float literal (always with a decimal point so the
+/// lexer reads it as a Float, never an Int).
+fn fmt_f64_lit(x: f64) -> String {
+    let mut s = format!("{:?}", x); // `{:?}` always emits a decimal point for f64
+    if !s.contains('.') && !s.contains('e') && !s.contains('E') {
+        s.push_str(".0");
+    }
+    s
+}

@@ -512,3 +512,180 @@ gaps are closed in the order above.
 - **Smallest honest "it learns" demo:** logistic regression trained by `grad`-SGD
   on the native backend, weights saved/reloaded — almost entirely buildable on
   what exists *once `grad` lands.*
+
+---
+
+## G. AUTODIFF SPIKE — results & reverse-mode design (appended 2026-06)
+
+This section records the outcome of the autodiff research spike: a **working
+forward-mode AD + a program that learns**, both in pure Aria, plus the concrete
+design for the reverse-mode `grad` builtin that is the real training target.
+
+### G.1 What works TODAY (forward-mode AD, pure Aria, all 3 backends)
+
+`examples/autodiff.aria` implements forward-mode AD with **dual numbers** as
+ordinary Aria code — **zero compiler changes**. A `Dual` is a 2-field record
+`type Dual = { v: Float, d: Float }` (value + derivative); the arithmetic ops
+(`dadd`/`dsub`/`dmul`/`ddiv`/`dscale`/`dconst`/`dvar`) propagate derivatives by
+the sum/product/quotient rules; `grad1(f, x) = (f(dvar(x))).d` reads the exact
+derivative off the `.d` field. This is the dual-number **oracle** the roadmap
+(§B.1 Option 2) recommends.
+
+The example then **descends a loss by gradient descent** — Aria has no
+assignment, so the update `p := p - lr*grad` is a tail-recursive call with the
+updated parameter (the native backend turns the tail recursion into a `goto`
+loop, §B.2.1):
+- **(a)** minimize `f(x) = (x-3)^2` from x=0: converges to **x ≈ 3** (printed
+  `2.9999999993888893`), final loss **≈ 0** (`3.7e-19`).
+- **(b)** fit `y = w*x + b` to a 4-point dataset whose true line is `y = 2x + 1`,
+  by minimizing MSE via gradient descent. The two partials `∂loss/∂w` and
+  `∂loss/∂b` are each obtained by one forward (dual) evaluation that seeds the
+  chosen parameter with `dvar` and holds the other as `dconst`. After 2000 steps
+  (lr=0.05): learned **w ≈ 2.0** (`2.0000000000000018`), **b ≈ 1.0**
+  (`0.999999999999997`), final MSE **≈ 0** (`4.7e-30`).
+
+**Verification (pasted):** identical output across all three backends, garbage-free.
+
+```
+$ aria run        examples/autodiff.aria     # interpreter (oracle)
+$ aria native-run examples/autodiff.aria     # transpile to C, build, run
+$ aria wasm-run   examples/autodiff.aria     # compile to wasm, run via Node
+-6
+4
+2.9999999993888893
+0.00000000000000000037345630914781746
+21
+2.0000000000000018
+0.999999999999997
+0.0000000000000000000000000000046622912093726206
+2.0000000000000018
+```
+`diff` of all three outputs: **IDENTICAL**. Native reports `aria_live=0
+aria_reuses=0`; wasm reports `__live=0 __reuses=0` — **garbage-free** on both
+compiled backends. (Float formatting is identical by construction: `aria_fmt_float`
+in the C runtime and the wasm JS renderer both match Rust's `format!("{}", f)`.)
+
+**Where the Dual library lives — decision.** *Inside the example*, not the
+prelude. The prelude (`src/prelude.rs`) currently holds only generic
+*functions*; it has **no `type` declarations**. Adding `type Dual` plus its ops
+there would (a) inject a record type into every program's namespace and the GBNF
+acceptance corpus, and (b) is unnecessary for monomorphization-dropping (unused
+*functions* are already dropped, but a prelude *type* is a larger surface to
+justify). Keeping `Dual` in the example makes it self-contained and obviously
+correct, matching the spike's "if uncertain, keep them in the example" guidance.
+A future milestone can promote a blessed `Dual`/AD module once trait-based
+numerics (`src/traits.rs`) allow operator overloading so dual code reads like
+ordinary arithmetic.
+
+**Correctness test (not just "it runs").** `src/proptest.rs` adds:
+- `autodiff_dual_matches_finite_difference` — for `x^2`, `x^3`, `x*x + 2*x`, and
+  `(x-3)^2`, asserts the AD gradient `grad1(f, x)` (through the interpreter
+  oracle, and the native C backend when `cc` is present) matches a **central
+  finite-difference** approximation within tolerance, and that the native AD run
+  is garbage-free (`live == 0`). This proves the gradients are *correct*, not
+  merely produced.
+- `autodiff_gradient_descent_converges` — asserts the `(x-3)^2` descent lands
+  within `1e-3` of 3 with loss `< 1e-6`.
+
+Test count: **328 → 330**, all green (`RUST_MIN_STACK=536870912 cargo test`).
+`"autodiff"` added to the GBNF acceptor corpus in `src/gbnf.rs`.
+
+### G.2 Why forward-mode is not the training path
+
+Forward-mode costs **O(#inputs)** passes: each parameter needs its own dual
+evaluation (demo (b) runs the loss twice per step, once per parameter). For a
+real model (thousands–millions of parameters, one scalar loss) that is
+catastrophic. Reverse-mode computes **all** partials in **one** backward pass —
+O(1) in #inputs — which is why it is the real target (roadmap §B.1 Option 1).
+
+### G.3 Reverse-mode `grad` builtin — design (assessed, NOT implemented)
+
+**Target surface (pure at the Aria level, tape hidden in the runtime, exactly as
+`matmul` hides a mutable out-buffer):**
+```aria
+grad(f: (Vector) -> Float, x: Vector) -> Vector   -- ∂f/∂x, one backward pass
+```
+
+**Tractability finding — the type checker is ALREADY ready; the runtime is not.**
+The spike inspected the exact machinery:
+- `Ty::Fn` (the arrow type) exists in `src/ast.rs`, and its own doc says *"Only
+  the interpreter executes these; the compiled backends reject any program
+  mentioning a `Ty::Fn`."* Function values are therefore **already an
+  interpreter-only feature** — the prelude HOFs (`array_map`, …) only reach the
+  compiled backends because monomorphization specializes them away so no `Ty::Fn`
+  survives. A `grad` builtin taking a `Ty::Fn` is, by the same rule, naturally
+  interp-only and **already rejected cleanly** by native/wasm (`"unsupported
+  builtin"`, `c_backend.rs:1765`, `wasm.rs:1494/1923`) — the exact gating pattern
+  the spike was asked to use.
+- The builtin-call type path in `typeck.rs` (~line 1300-1342) **already accepts a
+  function-typed parameter**: it `check`s `Expr::Lambda` arguments bidirectionally
+  against the parameter type, and `builtin_type_params` already walks into
+  `Ty::Fn` (`ty_mentions_var`, line 709). So adding a builtin signature
+  `grad: ((Vector)->Float, Vector) -> Vector` to `src/builtins.rs` would type-check
+  with **no typeck changes** — the claim in §B.1 that "Aria builtins don't take
+  function args" is true of the *signature table* today but **not a checker
+  limitation**.
+- The interpreter already has `apply_value` (apply a closure to args) and
+  `fn_as_closure` (lift a top-level fn name to a closure), and the HOF prelude
+  already passes closures through interp. So `grad` *could* receive a
+  `Value::Closure` and invoke it.
+
+**What makes a TRUE reverse pass NOT low-risk (why it was deferred).** Reverse
+mode must record a tape of every scalar op performed *inside* `f`, then replay it
+backward accumulating adjoints. To record that tape, `f` must be evaluated over a
+**tracing value** (a "tape node id" instead of a raw `f64`), which means
+intercepting **every** arithmetic primitive (`+ - * /`, `vec_get`, `vec_dot`,
+`vec_add`, `vec_scale`, …) on the interpreter's **hot path** — a new
+`Value::Tracing` variant threaded through `eval_binary`, the vector builtins, and
+record/field ops. That is a deep, broad change to the core evaluator, exactly the
+"touches the arithmetic core" risk the spike was told to avoid. **Per the spike's
+instruction ("If it's NOT low-risk … DO NOT implement it — instead write the
+precise design"), reverse-mode was left as design.** The forward-mode dual
+oracle above already provides the cross-check any reverse-mode impl must pass.
+
+**Precise implementation plan for reverse-mode (next milestone, interp-first):**
+1. **Add the signature** to `src/builtins.rs`:
+   `("grad", vec![Ty::Fn(vec![vector()], Box::new(Float)), vector()], vector())`.
+   (Type-checks today; native/wasm reject it as an unsupported builtin — keep
+   that gate, document it like the codec builtins.)
+2. **Tracing value.** Add `Value::Tracing(TapeRef)` where a `TapeRef` is an index
+   into a per-`grad`-call `Tape` (a `Vec<Node>`; `Node` records the op and parent
+   `TapeRef`s plus the local partials, i.e. the VJP — a Wengert list). The tape is
+   a `RefCell<Tape>` owned by the `grad` call frame only (the mutation is *scoped
+   to the builtin*, never visible to Aria — the §B.1 "impurity in the runtime"
+   contract).
+3. **Forward trace.** In `grad`, build a tracing Vector whose elements are fresh
+   leaf nodes (one per input coordinate), apply `f` to it via `apply_value`, and
+   in the arithmetic/vector builtins add a branch: if any operand is `Tracing`,
+   push a node recording the result's local partials w.r.t. its operands.
+4. **Reverse sweep.** Seed the output node's adjoint = 1.0, walk the tape in
+   reverse, accumulate `parent.adj += node.adj * local_partial` (standard VJP).
+   Read leaf adjoints into the result `Vector`.
+5. **Cross-check test.** Assert `grad(f, x)` equals the forward-mode `grad1`
+   per-coordinate gradient (and finite differences) for a few scalar-of-Vector
+   functions — reuse the dual oracle from G.1 as ground truth.
+
+**Op set for the first reverse-mode `grad`** (smallest set that trains a linear
+model / logistic regression, per §B.4): `+ - * /` on Float, `vec_get`,
+`vec_dot`, `vec_add`, `vec_scale`, and `relu`/`sigmoid` once added. Control flow
+inside `f` (`if`/`match`, recursion) is traced *by value* automatically because
+the interpreter takes the actual branch during the forward trace — the
+checkpoint/trace problem (§B.1 Option 3) does **not** arise for a *tape-based*
+interpreter reverse mode (it only bites source-to-source AD).
+
+**Recommended next milestone:** implement steps 1–5 above as the
+**interpreter-only** `grad` (Phase 1a), gated off the compiled backends, validated
+against the dual oracle delivered here. It is the smallest real reverse gradient
+and unblocks the §B.4 "logistic regression that learns on native" demo (which
+needs the gradient on the native backend — a later step that either (i)
+monomorphizes a source-to-source adjoint, §B.1 Option 3 / Phase 3a, or (ii) adds a
+native tape runtime mirroring the interpreter one).
+
+### G.4 Summary
+
+| Capability | Status after spike |
+|---|---|
+| Forward-mode AD (dual numbers), pure Aria | **DONE** — `examples/autodiff.aria`, all 3 backends identical, garbage-free |
+| A program that *learns* (GD on a loss) | **DONE** — `(x-3)^2`→3 and a line-fit recovering `y=2x+1` |
+| Correctness proof (AD vs finite-diff) | **DONE** — 2 new tests, 330 green |
+| Reverse-mode `grad` builtin | **DESIGNED** (typeck is ready; runtime tape deferred as not-low-risk) — precise 5-step plan above |

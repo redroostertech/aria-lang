@@ -1,0 +1,118 @@
+-- Forward-mode automatic differentiation (AD) in PURE Aria — no compiler changes,
+-- runs identically on `aria run`, `aria native-run`, and `aria wasm-run`.
+--
+-- The idea (dual numbers): carry a pair (value, derivative). A `Dual` is just a
+-- 2-field record. Every arithmetic op propagates the derivative by the usual
+-- calculus rules (sum rule, product rule, quotient rule). Seed the input variable
+-- with derivative 1 (`dvar`) and constants with derivative 0 (`dconst`); after
+-- evaluating any composition of these ops, the `.d` field IS the exact derivative
+-- df/dx at that point — no finite differences, no tape, no mutation.
+--
+-- We then DESCEND a loss by gradient descent (tail recursion threading the
+-- parameter — Aria has no assignment, so `p := p - lr*grad` is a recursive call
+-- with the updated parameter), proving an Aria PROGRAM can learn:
+--   (a) minimize f(x) = (x - 3)^2          -> x converges to 3
+--   (b) fit a line y = w*x + b to data     -> recover the true slope/intercept
+--       by computing the partials d(loss)/dw and d(loss)/db with forward-mode
+--       (one dual evaluation per parameter) and stepping both.
+
+-- A dual number: `v` is the value, `d` is the derivative w.r.t. the seed variable.
+type Dual = { v: Float, d: Float }
+
+-- A constant has derivative 0; the differentiation variable has derivative 1.
+fn dconst(c: Float) -> Dual = Dual { v: c, d: 0.0 }
+fn dvar(x: Float) -> Dual = Dual { v: x, d: 1.0 }
+
+-- Sum/difference rule: (a + b)' = a' + b'.
+fn dadd(a: Dual, b: Dual) -> Dual = Dual { v: a.v + b.v, d: a.d + b.d }
+fn dsub(a: Dual, b: Dual) -> Dual = Dual { v: a.v - b.v, d: a.d - b.d }
+
+-- Product rule: (a*b)' = a'*b + a*b'.
+fn dmul(a: Dual, b: Dual) -> Dual =
+  Dual { v: a.v * b.v, d: a.d * b.v + a.v * b.d }
+
+-- Quotient rule: (a/b)' = (a'*b - a*b') / b^2.
+fn ddiv(a: Dual, b: Dual) -> Dual =
+  Dual { v: a.v / b.v, d: (a.d * b.v - a.v * b.d) / (b.v * b.v) }
+
+-- Scale a dual by a plain constant (derivative scales too): (k*a)' = k*a'.
+fn dscale(a: Dual, k: Float) -> Dual = Dual { v: k * a.v, d: k * a.d }
+
+-- grad1(f, x) = f'(x): seed x as the variable, read off the derivative field.
+fn grad1(f: (Dual) -> Dual, x: Float) -> Float = (f(dvar(x))).d
+
+-- ===== (a) minimize f(x) = (x - 3)^2 by gradient descent =====
+-- f as a function of a Dual, so grad1 can differentiate it.
+fn fsq(x: Dual) -> Dual = { let t = dsub(x, dconst(3.0)); dmul(t, t) }
+fn fsq_val(x: Float) -> Float = { let t = x - 3.0; t * t }
+
+-- One GD step is a recursive call with x updated by `x - lr * f'(x)`.
+fn descend(x: Float, lr: Float, steps: Int) -> Float =
+  if steps <= 0 { x }
+  else { descend(x - lr * grad1(fsq, x), lr, steps - 1) }
+
+-- ===== (b) fit y = w*x + b to a tiny dataset by minimizing MSE =====
+-- True line of the data below is y = 2*x + 1 (4 hardcoded points).
+-- Predicted value w*x + b as a Dual, given dual params (so we can pick which
+-- parameter is the differentiation variable by seeding it with dvar).
+fn predict(w: Dual, b: Dual, x: Float) -> Dual = dadd(dmul(w, dconst(x)), b)
+
+-- Per-point squared error (pred - y)^2 as a Dual.
+fn sqerr(w: Dual, b: Dual, x: Float, y: Float) -> Dual =
+  { let e = dsub(predict(w, b, x), dconst(y)); dmul(e, e) }
+
+-- Mean squared error over the 4 fixed points, as a Dual. Whichever of w/b was
+-- seeded with dvar, `.d` of the result is the partial of the loss w.r.t. it.
+fn mse(w: Dual, b: Dual) -> Dual =
+  dscale(
+    dadd(dadd(sqerr(w, b, 0.0, 1.0), sqerr(w, b, 1.0, 3.0)),
+         dadd(sqerr(w, b, 2.0, 5.0), sqerr(w, b, 3.0, 7.0))),
+    0.25)
+
+-- Partial of the loss w.r.t. w: seed w as the variable, hold b constant.
+fn dloss_dw(w: Float, b: Float) -> Float = (mse(dvar(w), dconst(b))).d
+-- Partial w.r.t. b: seed b as the variable, hold w constant.
+fn dloss_db(w: Float, b: Float) -> Float = (mse(dconst(w), dvar(b))).d
+-- The loss value itself (both params constant; `.v` is the loss).
+fn loss_val(w: Float, b: Float) -> Float = (mse(dconst(w), dconst(b))).v
+
+-- Gradient-descent on (w, b): each step updates both params by their partials.
+fn fit(w: Float, b: Float, lr: Float, steps: Int) -> Float =
+  if steps <= 0 { w }
+  else {
+    let gw = dloss_dw(w, b);
+    let gb = dloss_db(w, b);
+    fit(w - lr * gw, b - lr * gb, lr, steps - 1)
+  }
+-- Run the fit and return the learned intercept (run again from the same start;
+-- `fit` returns w, this returns b — two tiny tail-recursive runs keep it scalar).
+fn fit_b(w: Float, b: Float, lr: Float, steps: Int) -> Float =
+  if steps <= 0 { b }
+  else {
+    let gw = dloss_dw(w, b);
+    let gb = dloss_db(w, b);
+    fit_b(w - lr * gw, b - lr * gb, lr, steps - 1)
+  }
+
+fn main() -> Float = {
+  -- (a) Derivative check: f(x)=(x-3)^2, f'(x)=2(x-3). At x=0, f'=-6; at x=5, f'=4.
+  print_float(grad1(fsq, 0.0));            -- -6
+  print_float(grad1(fsq, 5.0));            -- 4
+  -- Descend from x=0 with lr=0.1 for 100 steps -> x ~= 3, loss ~= 0.
+  let xstar = descend(0.0, 0.1, 100);
+  print_float(xstar);                      -- ~3 (learned x)
+  print_float(fsq_val(xstar));             -- ~0 (final loss)
+
+  -- (b) Fit y = w*x + b to data whose true line is y = 2x + 1.
+  -- Start at w=0,b=0; lr=0.05; 2000 steps of gradient descent.
+  let w0 = 0.0;
+  let b0 = 0.0;
+  print_float(loss_val(w0, b0));           -- initial MSE (large)
+  let w = fit(w0, b0, 0.05, 2000);
+  let b = fit_b(w0, b0, 0.05, 2000);
+  print_float(w);                          -- ~2 (learned slope)
+  print_float(b);                          -- ~1 (learned intercept)
+  print_float(loss_val(w, b));             -- ~0 (final MSE)
+  -- Return the learned slope as the scalar program result (so it runs on wasm).
+  w
+}
