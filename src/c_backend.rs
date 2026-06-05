@@ -975,13 +975,13 @@ fn emit_bind(
             let _ = writeln!(out, "{}if ({}) {{", ind, cx);
             let inner = format!("{}    ", ind);
             if is_unreachable_unit(then) {
-                let _ = writeln!(out, "{}aria_trap();", inner);
+                let _ = writeln!(out, "{}aria_trap_msg(\"unreachable expression evaluated\");", inner);
             } else {
                 emit_iexpr(then, dst, dst_ty, env, &inner, out)?;
             }
             let _ = writeln!(out, "{}}} else {{", ind);
             if is_unreachable_unit(els) {
-                let _ = writeln!(out, "{}aria_trap();", inner);
+                let _ = writeln!(out, "{}aria_trap_msg(\"unreachable expression evaluated\");", inner);
             } else {
                 emit_iexpr(els, dst, dst_ty, env, &inner, out)?;
             }
@@ -1111,7 +1111,7 @@ fn emit_prim(
                 BinOp::Sub => "__builtin_sub_overflow",
                 _ => "__builtin_mul_overflow",
             };
-            let _ = writeln!(out, "{}if ({}({}, {}, &{})) aria_trap();", ind, bi, lx, rx, dst);
+            let _ = writeln!(out, "{}if ({}({}, {}, &{})) aria_trap_msg(\"integer overflow\");", ind, bi, lx, rx, dst);
             Ok(())
         }
         BinOp::Div | BinOp::Mod => {
@@ -1130,7 +1130,7 @@ fn emit_prim(
             // Trap on /0 and INT64_MIN / -1 (UB in C) to match interp's Err.
             let _ = writeln!(
                 out,
-                "{}if ({} == 0 || ({} == INT64_MIN && {} == -1)) aria_trap();",
+                "{}if ({} == 0 || ({} == INT64_MIN && {} == -1)) aria_trap_msg(\"division by zero or overflow\");",
                 ind, rx, lx, rx
             );
             let _ = writeln!(out, "{}{} = {} {} {};", ind, dst, lx, cop, rx);
@@ -1224,7 +1224,7 @@ fn emit_unary(
                 let _ = writeln!(out, "{}{} = -{};", ind, dst, ax);
             } else if t == CType::Int {
                 // Checked negation: INT64_MIN negation overflows -> trap.
-                let _ = writeln!(out, "{}if (__builtin_sub_overflow((int64_t)0, {}, &{})) aria_trap();", ind, ax, dst);
+                let _ = writeln!(out, "{}if (__builtin_sub_overflow((int64_t)0, {}, &{})) aria_trap_msg(\"integer overflow\");", ind, ax, dst);
             } else {
                 return Err("c backend: unary `-` expects Int/Float".into());
             }
@@ -1992,7 +1992,7 @@ fn emit_match_chain(
     out: &mut String,
 ) -> Result<(), String> {
     if i >= arms.len() {
-        let _ = writeln!(out, "{}aria_trap();", ind);
+        let _ = writeln!(out, "{}aria_trap_msg(\"no matching pattern (non-exhaustive match)\");", ind);
         return Ok(());
     }
     let arm = &arms[i];
@@ -2128,13 +2128,17 @@ static int64_t aria_reuses = 0;
 /* ---- ADT cell: { int64_t rc; int64_t tag; int64_t fields[]; } ---- */
 typedef struct { int64_t rc; int64_t tag; int64_t fields[]; } AriaCell;
 
-static void aria_trap(void) {
-    /* Print TRAP (stdout) so a runner can detect it, then abort like a wasm
-       trap / the interpreter's Err. */
-    fputs("TRAP\n", stdout);
+static void aria_trap_msg(const char* msg) {
+    /* A defined Aria runtime error. Print a descriptive message to stderr in the
+       same `runtime error: ...` form the interpreter uses, then abort with a
+       non-zero status (which runners detect as a trap, independent of output). */
     fflush(stdout);
+    fprintf(stderr, "runtime error: %s\n", msg);
+    fflush(stderr);
     exit(70);
 }
+/* Generic trap with no specific context (allocation failure, internal invariant). */
+static void aria_trap(void) { aria_trap_msg("aborted"); }
 
 static void* aria_alloc(int64_t nfields) {
     AriaCell* c = (AriaCell*)malloc(sizeof(AriaCell) + (size_t)nfields * sizeof(int64_t));
@@ -2254,7 +2258,7 @@ static void aria_array_drop(void* p) {
 
 static int64_t aria_array_get(void* p, int64_t i) {
     AriaArray* a = (AriaArray*)p;
-    if (i < 0 || i >= a->len) aria_trap();
+    if (i < 0 || i >= a->len) aria_trap_msg("array index out of range");
     int64_t slot = a->elems[i];
     /* The element is still owned by the array; hand the caller its own
        reference, then release the (consumed) array. */
@@ -2277,7 +2281,7 @@ static void* aria_array_clone(AriaArray* a) {
 
 static void* aria_array_set(void* p, int64_t i, int64_t x) {
     AriaArray* a = (AriaArray*)p;
-    if (i < 0 || i >= a->len) aria_trap();
+    if (i < 0 || i >= a->len) aria_trap_msg("array index out of range");
     if (a->rc == 1) {
         /* FBIP: overwrite in place; drop the displaced element. */
         aria_array_drop_elem(a->kind, a->elems[i]);
@@ -2357,7 +2361,7 @@ static int64_t aria_bytes_len(void* p) {
 }
 static int64_t aria_bytes_get(void* p, int64_t i) {
     AriaBytes* b = (AriaBytes*)p;
-    if (i < 0 || i >= b->len) aria_trap();
+    if (i < 0 || i >= b->len) aria_trap_msg("bytes index out of range");
     int64_t v = (int64_t)b->bytes[i];
     aria_bytes_drop(p);  /* bytes_get consumes its argument */
     return v;
@@ -2371,8 +2375,8 @@ static AriaBytes* aria_bytes_clone(AriaBytes* b) {
 }
 static void* aria_bytes_set(void* p, int64_t i, int64_t v) {
     AriaBytes* b = (AriaBytes*)p;
-    if (i < 0 || i >= b->len) aria_trap();
-    if (v < 0 || v > 255) aria_trap();
+    if (i < 0 || i >= b->len) aria_trap_msg("bytes index out of range");
+    if (v < 0 || v > 255) aria_trap_msg("byte value out of range (must be 0..255)");
     if (b->rc == 1) {
         b->bytes[i] = (unsigned char)v;
         aria_reuses++;
@@ -2393,7 +2397,7 @@ static AriaBytes* aria_bytes_grow(AriaBytes* b) {
 }
 static void* aria_bytes_push(void* p, int64_t v) {
     AriaBytes* b = (AriaBytes*)p;
-    if (v < 0 || v > 255) aria_trap();
+    if (v < 0 || v > 255) aria_trap_msg("byte value out of range (must be 0..255)");
     if (b->rc == 1) {
         b = aria_bytes_grow(b);
         b->bytes[b->len++] = (unsigned char)v;
@@ -2445,7 +2449,7 @@ static int aria_utf8_valid(const unsigned char* s, int64_t n) {
 }
 static void* aria_bytes_to_str(void* p) {
     AriaBytes* b = (AriaBytes*)p;
-    if (!aria_utf8_valid(b->bytes, b->len)) aria_trap();
+    if (!aria_utf8_valid(b->bytes, b->len)) aria_trap_msg("bytes are not valid UTF-8");
     AriaStr* s = (AriaStr*)aria_str_alloc(b->len);
     memcpy(s->bytes, b->bytes, (size_t)b->len);
     aria_bytes_drop(p);  /* the Bytes argument is consumed */
@@ -2505,7 +2509,7 @@ static int64_t aria_vec_len(void* p) {
 }
 static double aria_vec_get(void* p, int64_t i) {
     AriaVector* v = (AriaVector*)p;
-    if (i < 0 || i >= v->len) aria_trap();
+    if (i < 0 || i >= v->len) aria_trap_msg("vector index out of range");
     double x = v->elems[i];
     aria_vec_drop(p);  /* vec_get consumes its argument */
     return x;
@@ -2565,7 +2569,7 @@ static double aria_vec_dot_raw(AriaVector* x, AriaVector* y) {
 }
 static double aria_vec_dot(void* a, void* b) {
     AriaVector* x = (AriaVector*)a; AriaVector* y = (AriaVector*)b;
-    if (x->len != y->len) aria_trap();  /* length mismatch -> clean trap */
+    if (x->len != y->len) aria_trap_msg("vector length mismatch");  /* clean trap */
     double r = aria_vec_dot_raw(x, y);
     aria_vec_drop(a); aria_vec_drop(b);  /* both operands consumed */
     return r;
@@ -2578,7 +2582,7 @@ static double aria_vec_norm(void* a) {
 }
 static double aria_vec_cosine(void* a, void* b) {
     AriaVector* x = (AriaVector*)a; AriaVector* y = (AriaVector*)b;
-    if (x->len != y->len) aria_trap();  /* length mismatch -> clean trap */
+    if (x->len != y->len) aria_trap_msg("vector length mismatch");  /* clean trap */
     double nx = sqrt(aria_vec_dot_raw(x, x));
     double ny = sqrt(aria_vec_dot_raw(y, y));
     double r;
@@ -2591,7 +2595,7 @@ static double aria_vec_cosine(void* a, void* b) {
 /* Elementwise add. FBIP: reuse the first operand in place when it is unique. */
 static void* aria_vec_add(void* a, void* b) {
     AriaVector* x = (AriaVector*)a; AriaVector* y = (AriaVector*)b;
-    if (x->len != y->len) aria_trap();  /* length mismatch -> clean trap */
+    if (x->len != y->len) aria_trap_msg("vector length mismatch");  /* clean trap */
     if (x->rc == 1) {
         for (int64_t i = 0; i < x->len; i++) x->elems[i] += y->elems[i];
         aria_reuses++;
