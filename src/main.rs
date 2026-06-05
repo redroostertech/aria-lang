@@ -14,10 +14,13 @@
 //!   aria native-run <file.aria>     transpile to C, build, run, print the result
 //!   aria gbnf  [<file.out>]         emit a GBNF grammar for Aria's syntax
 //!   aria lsp                        run a stdio LSP server (live diagnostics)
+//!   aria agent [opts] "<task>"      AI authoring loop: an LLM writes Aria, the
+//!                                   compiler checks+runs it, diagnostics feed back
 
 // Many runtime modules expose library-style APIs not all wired into the CLI yet.
 #![allow(dead_code)]
 
+mod agent;
 mod arith;
 mod ast;
 mod builtins;
@@ -72,7 +75,7 @@ fn main() -> ExitCode {
 fn real_main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: aria <run|check|ast|pack|unpack|npack|nunpack|bench|demo|mem|wasm|wasm-run|native|native-run|gbnf|lsp> [args...]");
+        eprintln!("usage: aria <run|check|ast|pack|unpack|npack|nunpack|bench|demo|mem|wasm|wasm-run|native|native-run|gbnf|lsp|agent> [args...]");
         return ExitCode::from(2);
     }
 
@@ -94,6 +97,7 @@ fn real_main() -> ExitCode {
         "native-run" => run_native_run(&args),
         "gbnf" => run_gbnf(&args),
         "lsp" => ExitCode::from(lsp::run() as u8),
+        "agent" => run_agent(&args),
         other => {
             eprintln!("unknown command `{}`", other);
             ExitCode::from(2)
@@ -486,6 +490,145 @@ fn run_gbnf(args: &[String]) -> ExitCode {
         print!("{}", g);
     }
     ExitCode::SUCCESS
+}
+
+/// `aria agent [--provider <spec>] [--max-iters N] [--out <file.aria>]
+/// [--verbose] "<task>"`: the provider-agnostic AI authoring loop. An LLM (via
+/// the chosen provider) writes an Aria program; the compiler checks it; the
+/// STRUCTURED DIAGNOSTICS feed back so the model fixes it; on a clean check the
+/// program is RUN in-process (safe by construction — Aria has no I/O/FFI/network/
+/// filesystem) and the result reported. Defaults: `--provider mock`,
+/// `--max-iters 5`.
+fn run_agent(args: &[String]) -> ExitCode {
+    let mut provider_spec = "mock".to_string();
+    let mut max_iters: usize = 5;
+    let mut out_file: Option<String> = None;
+    let mut verbose = false;
+    let mut task: Option<String> = None;
+
+    let mut i = 2;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--provider" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => provider_spec = v.clone(),
+                    None => {
+                        eprintln!("error: --provider needs a value");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            "--max-iters" => {
+                i += 1;
+                match args.get(i).and_then(|v| v.parse::<usize>().ok()) {
+                    Some(n) if n >= 1 => max_iters = n,
+                    _ => {
+                        eprintln!("error: --max-iters needs a positive integer");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            "--out" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => out_file = Some(v.clone()),
+                    None => {
+                        eprintln!("error: --out needs a file path");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            "--verbose" => verbose = true,
+            other if other.starts_with("--") => {
+                eprintln!("error: unknown option `{}`", other);
+                return ExitCode::from(2);
+            }
+            // The first non-flag positional is the task description.
+            _ => {
+                if task.is_none() {
+                    task = Some(args[i].clone());
+                } else {
+                    eprintln!("error: unexpected extra argument `{}`", args[i]);
+                    return ExitCode::from(2);
+                }
+            }
+        }
+        i += 1;
+    }
+
+    let task = match task {
+        Some(t) if !t.trim().is_empty() => t,
+        _ => {
+            eprintln!(
+                "usage: aria agent [--provider <spec>] [--max-iters N] [--out <file.aria>] [--verbose] \"<task>\""
+            );
+            eprintln!("providers: mock | cmd:<shell> | claude | codex | llama:<model.gguf> | anthropic | openai");
+            return ExitCode::from(2);
+        }
+    };
+
+    let provider = match agent::provider_from_spec(&provider_spec) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            return ExitCode::from(2);
+        }
+    };
+
+    eprintln!("aria agent: provider `{}`, up to {} iteration(s)", provider.label(), max_iters);
+
+    // Run the loop on a large-stack thread (it executes model-generated Aria via
+    // the interpreter, which uses native stack per Aria call — mirroring `run`).
+    let outcome = std::thread::Builder::new()
+        .stack_size(1 << 30)
+        .spawn(move || agent::run_loop(provider.as_ref(), &task, max_iters, verbose))
+        .expect("spawn agent thread")
+        .join()
+        .expect("agent thread panicked");
+
+    if outcome.success {
+        eprintln!(
+            "\nSUCCESS after {} iteration(s).",
+            outcome.iterations
+        );
+        eprintln!("--- final program ---");
+        eprintln!("{}", outcome.program);
+        if let Some(r) = &outcome.result {
+            eprintln!("--- result ---");
+            eprintln!("{}", r);
+        }
+        if let Some(path) = &out_file {
+            match std::fs::write(path, &outcome.program) {
+                Ok(()) => eprintln!("wrote {}", path),
+                Err(e) => {
+                    eprintln!("error: cannot write {}: {}", path, e);
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        ExitCode::SUCCESS
+    } else {
+        eprintln!("\nFAILURE after {} iteration(s).", outcome.iterations);
+        if let Some(e) = &outcome.runtime_error {
+            eprintln!("error: {}", e);
+        }
+        if !outcome.program.is_empty() {
+            eprintln!("--- best attempt ---");
+            eprintln!("{}", outcome.program);
+        }
+        if !outcome.diagnostics.is_empty() {
+            eprintln!("--- remaining diagnostics ---");
+            eprintln!("{}", diagnostics::array_to_json(&outcome.diagnostics));
+        }
+        if verbose && !outcome.transcript.is_empty() {
+            eprintln!("--- transcript ---");
+            for (n, msg) in outcome.transcript.iter().enumerate() {
+                eprintln!("[feedback {}] {}", n + 1, msg);
+            }
+        }
+        ExitCode::FAILURE
+    }
 }
 
 fn run_demo(which: Option<&str>) -> ExitCode {
