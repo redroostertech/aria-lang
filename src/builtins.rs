@@ -61,6 +61,7 @@ fn build_signatures() -> Vec<(&'static str, Vec<Ty>, Ty)> {
     // vector builtins. A `Vector` is an immutable dense buffer of `Float` (f64).
     let vector = || Named("Vector".to_string(), vec![]);
     let float_array = || Named("Array".to_string(), vec![Float]);
+    let vector_array = || Named("Array".to_string(), vec![vector()]);
     vec![
         ("print_int", vec![Int], Unit),
         ("print_float", vec![Float], Unit),
@@ -74,6 +75,15 @@ fn build_signatures() -> Vec<(&'static str, Vec<Ty>, Ty)> {
         ("tensor_get", vec![tensor(), Int, Int], Float),
         ("tensor_rows", vec![tensor()], Int),
         ("tensor_cols", vec![tensor()], Int),
+        // ---- Tensor <-> Vector bridge --------------------------------------
+        // `tensor_row(t, i)` pulls row i of a 2D tensor out as a length-cols
+        // Vector, widening each stored f32 to f64 (exact). Out-of-range i traps.
+        // `tensor_from_rows(rows)` stacks an `Array[Vector]` of equal-length
+        // vectors into a `[len, L]` tensor, narrowing each f64 to f32. Unequal
+        // lengths trap; an empty array yields a 0x0 tensor. Identical on all
+        // three backends (interp/native/wasm).
+        ("tensor_row", vec![tensor(), Int], vector()),
+        ("tensor_from_rows", vec![vector_array()], tensor()),
         ("matmul", vec![tensor(), tensor()], tensor()),
         ("transpose", vec![tensor()], tensor()),
         ("softmax", vec![tensor()], tensor()),

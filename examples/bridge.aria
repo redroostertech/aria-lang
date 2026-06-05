@@ -1,0 +1,43 @@
+-- Bridge: the Tensor (2-D f32 matrix) and Vector (1-D f64 embedding) worlds.
+-- `tensor_from_rows` stacks a set of equal-length embedding Vectors into a
+-- matrix (narrowing each f64 -> f32); `tensor_row` pulls a matrix row back out
+-- as an embedding Vector (widening f32 -> f64). Together they let the numeric
+-- (matmul / transpose) and the embedding (dot / cosine) primitives compose.
+--
+-- Demo: take three embeddings, stack them into a matrix M, form the pairwise
+-- dot-product (Gram) matrix G = matmul(M, transpose(M)), then pull a row of M
+-- back out as a Vector and cosine it against a query embedding.
+-- Returns a scalar Float so it runs on every backend (interp / native / wasm).
+-- Identical output via `aria run`, `aria native-run`, AND `aria wasm-run`,
+-- and garbage-free (aria_live / __live == 0).
+
+fn main() -> Float = {
+  -- Three length-3 embeddings, assembled as an Array[Vector].
+  let store = [
+    vec_from_array([1.0, 0.0, 2.0]),
+    vec_from_array([0.0, 3.0, 1.0]),
+    vec_from_array([2.0, 1.0, 0.0])
+  ];
+
+  -- Stack into a 3x3 matrix M (rows = embeddings).
+  let m = tensor_from_rows(store);
+  print_int(tensor_rows(m));            -- 3
+  print_int(tensor_cols(m));            -- 3
+
+  -- Gram matrix G = M * M^T : G[i][j] = dot(embedding_i, embedding_j).
+  let g = matmul(m, transpose(m));
+  -- G[0][0] = dot(e0, e0) = 1 + 0 + 4 = 5
+  print_float(tensor_get(g, 0, 0));     -- 5
+  -- G[0][1] = dot(e0, e1) = 0 + 0 + 2 = 2
+  print_float(tensor_get(g, 0, 1));     -- 2
+
+  -- Pull row 0 of M back out as a Vector and cosine it against a query.
+  let e0 = tensor_row(m, 0);
+  let query = vec_from_array([1.0, 0.0, 2.0]);
+  -- e0 == query, so cosine == 1.
+  print_float(vec_cosine(e0, query));   -- 1
+
+  -- Bridged scalar: dot of two rows recovered from the matrix (= G[1][2]).
+  -- dot(e1, e2) = 0 + 3 + 0 = 3
+  vec_dot(tensor_row(m, 1), tensor_row(m, 2))
+}

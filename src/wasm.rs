@@ -833,6 +833,8 @@ enum HeapHelper {
     Relu,        // (t:i32) -> ptr:i32   elementwise relu, consumes t
     Softmax,     // (t:i32) -> ptr:i32   row-wise softmax (uses env.exp), consumes t
     EmbedSim,    // (a:i32, b:i32) -> f64  embed_similarity, consumes both Strings
+    TensorRow,      // (t:i32, i:i64) -> ptr:i32  row i as a Vector (widen f32->f64), consumes t
+    TensorFromRows, // (arr:i32) -> ptr:i32  stack Array[Vector] into a Tensor (narrow f64->f32), consumes arr
     HashEmbed,   // (s:i32, vec_addr:i32) -> () write a dim-64 normalized embedding to vec_addr
     // ---- Array runtime ----
     AllocArray, // (kind:i32, cap:i32) -> ptr:i32   alloc an Array (rc=1, len=0, hdr set)
@@ -894,7 +896,7 @@ enum HeapHelper {
 }
 
 impl HeapHelper {
-    const ALL: [HeapHelper; 79] = [
+    const ALL: [HeapHelper; 81] = [
         HeapHelper::Alloc,
         HeapHelper::Free,
         HeapHelper::Dup,
@@ -974,6 +976,8 @@ impl HeapHelper {
         HeapHelper::SetToArr,
         HeapHelper::SetEq,
         HeapHelper::SetShow,
+        HeapHelper::TensorRow,
+        HeapHelper::TensorFromRows,
     ];
 
     fn offset(self) -> u32 {
@@ -1057,6 +1061,8 @@ impl HeapHelper {
             HeapHelper::SetToArr => 76,
             HeapHelper::SetEq => 77,
             HeapHelper::SetShow => 78,
+            HeapHelper::TensorRow => 79,
+            HeapHelper::TensorFromRows => 80,
         }
     }
 
@@ -1148,6 +1154,8 @@ impl HeapHelper {
             HeapHelper::SetToArr => (vec![WType::I32, WType::I32], WType::I32),
             HeapHelper::SetEq => (vec![WType::I32, WType::I32], WType::I32),
             HeapHelper::SetShow => (vec![WType::I32], WType::I32),
+            HeapHelper::TensorRow => (vec![WType::I32, WType::I64], WType::I32),
+            HeapHelper::TensorFromRows => (vec![WType::I32], WType::I32),
         }
     }
 }
@@ -2743,6 +2751,8 @@ fn tensor_builtin_ret(name: &str) -> Option<WType> {
         }
         "tensor_get" | "embed_similarity" => WType::F64,
         "tensor_rows" | "tensor_cols" => WType::I64,
+        "tensor_row" => WType::Vector,
+        "tensor_from_rows" => WType::Tensor,
         _ => return None,
     })
 }
@@ -2795,6 +2805,16 @@ fn emit_tensor_builtin(
         ),
         "tensor_rows" => (vec![WType::Tensor], HeapHelper::TensorRows, WType::I64),
         "tensor_cols" => (vec![WType::Tensor], HeapHelper::TensorCols, WType::I64),
+        "tensor_row" => (
+            vec![WType::Tensor, WType::I64],
+            HeapHelper::TensorRow,
+            WType::Vector,
+        ),
+        "tensor_from_rows" => (
+            vec![WType::Array(ElemKind::Vector)],
+            HeapHelper::TensorFromRows,
+            WType::Tensor,
+        ),
         "matmul" => (
             vec![WType::Tensor, WType::Tensor],
             HeapHelper::Matmul,
@@ -6681,6 +6701,342 @@ fn emit_heap_helper(
                     WType::I32, // bucket (8)
                     WType::F32, // sign (9)
                 ],
+                body,
+            )
+        }
+        HeapHelper::TensorRow => {
+            // (t:i32, i:i64) -> ptr:i32. Pull row i out as a length-cols Vector,
+            // WIDENING each stored f32 -> f64. Trap OOB row. Consumes t. Locals:
+            // rows(2,i64), cols(2?)… rows(2,i64), cols(3,i64), vptr(4,i32),
+            // c(5,i32), base(6,i32).
+            // rows = [t+8]; cols = [t+16]
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(8, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(2, &mut body); // rows
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(16, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(3, &mut body); // cols
+            // bounds: if i < 0 || i >= rows -> trap
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body);
+            body.push(I64_CONST);
+            leb_s(0, &mut body);
+            body.push(0x53); // i < 0
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body); // rows
+            body.push(0x59); // i >= rows (i64.ge_s)
+            body.push(0x72); // or
+            body.push(IF);
+            body.push(BT_VOID);
+            body.push(0x00); // unreachable
+            body.push(END);
+            // vptr = __alloc_vec(i32.wrap cols); [vptr+8] = cols (len)
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body); // cols
+            body.push(I32_WRAP_I64);
+            body.push(CALL);
+            leb_u(alloc_vec_idx as u64, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(4, &mut body); // vptr
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body); // cols
+            i64_store(8, &mut body); // [vptr+8] = cols
+            // base = t + 24 + 4*(i*cols)  (byte offset of row i, i32)
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body); // t
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body); // i
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body); // cols
+            body.push(0x7E); // i64.mul -> i*cols
+            body.push(I32_WRAP_I64);
+            body.push(I32_CONST);
+            leb_s(4, &mut body);
+            body.push(I32_MUL); // 4*(i*cols)
+            body.push(I32_ADD); // t + 4*(i*cols)
+            body.push(LOCAL_SET);
+            leb_u(6, &mut body); // base
+            // c = 0; while c < (i32)cols { vptr[24+8*c] = (f64) base[24+4*c] }
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(5, &mut body); // c
+            body.push(0x03); // loop
+            body.push(BT_VOID);
+            body.push(LOCAL_GET);
+            leb_u(5, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body); // cols
+            body.push(I32_WRAP_I64);
+            body.push(0x48); // i32.lt_s
+            body.push(IF);
+            body.push(BT_VOID);
+            // dst addr = vptr + 24 + 8*c
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body); // vptr
+            body.push(LOCAL_GET);
+            leb_u(5, &mut body); // c
+            body.push(I32_CONST);
+            leb_s(SLOT as i64, &mut body);
+            body.push(I32_MUL);
+            body.push(I32_ADD);
+            // value = f64.promote( f32.load[ base + 24 + 4*c ] )
+            body.push(LOCAL_GET);
+            leb_u(6, &mut body); // base
+            body.push(LOCAL_GET);
+            leb_u(5, &mut body); // c
+            body.push(I32_CONST);
+            leb_s(4, &mut body);
+            body.push(I32_MUL);
+            body.push(I32_ADD);
+            f32_load(TENSOR_HEADER, &mut body);
+            body.push(0xBB); // f64.promote_f32
+            f64_store(VEC_HEADER, &mut body);
+            // c++
+            body.push(LOCAL_GET);
+            leb_u(5, &mut body);
+            body.push(I32_CONST);
+            leb_s(1, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_SET);
+            leb_u(5, &mut body);
+            body.push(0x0C); // br loop
+            leb_u(1, &mut body);
+            body.push(END); // end if
+            body.push(END); // end loop
+            // drop t (consumed)
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(CALL);
+            leb_u(drop_tensor_idx as u64, &mut body);
+            body.push(DROP);
+            // return vptr
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body);
+            helper_entry(
+                &[WType::I64, WType::I64, WType::I32, WType::I32, WType::I32],
+                body,
+            )
+        }
+        HeapHelper::TensorFromRows => {
+            // (arr:i32) -> ptr:i32. Stack an Array[Vector] of equal-length vectors
+            // into a [n, L] Tensor, NARROWING each f64 -> f32. Unequal lengths ->
+            // trap. Empty array -> 0x0 tensor. Consumes the array (and, via
+            // __drop_array, the Vectors it owns). Locals: n(1,i32), L(2,i64),
+            // tptr(3,i32), i(4,i32), c(5,i32), vrow(6,i32).
+            // n = (i32) [arr+8]
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(8, &mut body);
+            body.push(I32_WRAP_I64);
+            body.push(LOCAL_SET);
+            leb_u(1, &mut body); // n
+            // if n == 0 { tptr = __alloc_tensor(0,0); drop arr; return tptr }
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body);
+            body.push(0x45); // i32.eqz
+            body.push(IF);
+            body.push(BT_VOID);
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            body.push(CALL);
+            leb_u(alloc_tensor_idx as u64, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(3, &mut body); // tptr (0x0)
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(CALL);
+            leb_u(drop_array_idx as u64, &mut body);
+            body.push(DROP);
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            body.push(0x0F); // return
+            body.push(END);
+            // L = [ (i32)[arr+32] + 8 ]   (len of the first Vector)
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(ARRAY_HEADER, &mut body); // slot 0 = first Vector ptr (i64)
+            body.push(I32_WRAP_I64);
+            i64_load(8, &mut body); // its len
+            body.push(LOCAL_SET);
+            leb_u(2, &mut body); // L
+            // length check: i = 1; while i < n { if [vrow_i + 8] != L -> trap }
+            body.push(I32_CONST);
+            leb_s(1, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(4, &mut body); // i
+            body.push(0x03); // loop
+            body.push(BT_VOID);
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body); // n
+            body.push(0x48); // i32.lt_s
+            body.push(IF);
+            body.push(BT_VOID);
+            // vrow = (i32) i64.load[arr + 32 + 8*i]
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(I32_CONST);
+            leb_s(ARRAY_HEADER as i64, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body);
+            body.push(I32_CONST);
+            leb_s(SLOT as i64, &mut body);
+            body.push(I32_MUL);
+            body.push(I32_ADD);
+            i64_load(0, &mut body);
+            body.push(I32_WRAP_I64);
+            i64_load(8, &mut body); // its len
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body); // L
+            body.push(0x52); // i64.ne
+            body.push(IF);
+            body.push(BT_VOID);
+            body.push(0x00); // unreachable (unequal length)
+            body.push(END);
+            // i++
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body);
+            body.push(I32_CONST);
+            leb_s(1, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_SET);
+            leb_u(4, &mut body);
+            body.push(0x0C); // br loop
+            leb_u(1, &mut body);
+            body.push(END); // end if
+            body.push(END); // end loop
+            // tptr = __alloc_tensor(n, (i32)L)
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body); // n
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body); // L
+            body.push(I32_WRAP_I64);
+            body.push(CALL);
+            leb_u(alloc_tensor_idx as u64, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(3, &mut body); // tptr
+            // for i in 0..n: vrow = (i32)[arr+32+8*i];
+            //   for c in 0..L: tptr[24+4*(i*L+c)] = (f32) vrow[24+8*c]
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(4, &mut body); // i
+            body.push(0x03); // outer loop
+            body.push(BT_VOID);
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body); // n
+            body.push(0x48); // i32.lt_s
+            body.push(IF);
+            body.push(BT_VOID);
+            // vrow = (i32) i64.load[arr + 32 + 8*i]
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(I32_CONST);
+            leb_s(ARRAY_HEADER as i64, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body);
+            body.push(I32_CONST);
+            leb_s(SLOT as i64, &mut body);
+            body.push(I32_MUL);
+            body.push(I32_ADD);
+            i64_load(0, &mut body);
+            body.push(I32_WRAP_I64);
+            body.push(LOCAL_SET);
+            leb_u(6, &mut body); // vrow
+            // c = 0; inner loop
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(5, &mut body); // c
+            body.push(0x03); // inner loop
+            body.push(BT_VOID);
+            body.push(LOCAL_GET);
+            leb_u(5, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body); // L
+            body.push(I32_WRAP_I64);
+            body.push(0x48); // i32.lt_s
+            body.push(IF);
+            body.push(BT_VOID);
+            // dst = tptr + 24 + 4*(i*(i32)L + c)
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body); // tptr
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body); // i
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body); // L
+            body.push(I32_WRAP_I64);
+            body.push(I32_MUL); // i*L
+            body.push(LOCAL_GET);
+            leb_u(5, &mut body); // c
+            body.push(I32_ADD); // i*L + c
+            body.push(I32_CONST);
+            leb_s(4, &mut body);
+            body.push(I32_MUL); // 4*(i*L+c)
+            body.push(I32_ADD); // tptr + 4*(i*L+c)
+            // value = (f32) f64.load[ vrow + 24 + 8*c ]
+            body.push(LOCAL_GET);
+            leb_u(6, &mut body); // vrow
+            body.push(LOCAL_GET);
+            leb_u(5, &mut body); // c
+            body.push(I32_CONST);
+            leb_s(SLOT as i64, &mut body);
+            body.push(I32_MUL);
+            body.push(I32_ADD);
+            f64_load(VEC_HEADER, &mut body);
+            body.push(0xB6); // f32.demote_f64
+            f32_store(TENSOR_HEADER, &mut body);
+            // c++
+            body.push(LOCAL_GET);
+            leb_u(5, &mut body);
+            body.push(I32_CONST);
+            leb_s(1, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_SET);
+            leb_u(5, &mut body);
+            body.push(0x0C); // br inner loop
+            leb_u(1, &mut body);
+            body.push(END); // end inner if
+            body.push(END); // end inner loop
+            // i++
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body);
+            body.push(I32_CONST);
+            leb_s(1, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_SET);
+            leb_u(4, &mut body);
+            body.push(0x0C); // br outer loop
+            leb_u(1, &mut body);
+            body.push(END); // end outer if
+            body.push(END); // end outer loop
+            // drop arr (recursively drops each owned Vector)
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(CALL);
+            leb_u(drop_array_idx as u64, &mut body);
+            body.push(DROP);
+            // return tptr
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            helper_entry(
+                &[WType::I32, WType::I64, WType::I32, WType::I32, WType::I32, WType::I32],
                 body,
             )
         }

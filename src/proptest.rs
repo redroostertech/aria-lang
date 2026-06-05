@@ -2225,6 +2225,129 @@ fn embedding_retrieval_matches_compiled() {
     );
 }
 
+/// The Tensor <-> Vector bridge (`tensor_row` / `tensor_from_rows`) runs
+/// IDENTICALLY across ALL THREE backends: interp (oracle), native (cc-gated),
+/// and wasm (node-gated). Covers: extracting a matrix row as a Vector (widen
+/// f32->f64), stacking an `Array[Vector]` into a matrix (narrow f64->f32), the
+/// round-trip (f64->f32->f64 yields the f32-rounded originals — identical on
+/// every backend), the Gram-matrix bridge demo, and clean TRAPs on an OOB row
+/// index and on unequal-length rows. Each `main` returns a SCALAR so the wasm
+/// Node harness renders it. Results must match and the native/wasm heaps be
+/// garbage-free (live == 0).
+#[test]
+fn tensor_vector_bridge_matches_compiled() {
+    // A 2x3 tensor [[1,2,3],[4,5,6]] built purely through builtins.
+    let mat = "let t = tensor_set(tensor_set(tensor_set(tensor_set(tensor_set(\
+        tensor_set(tensor_zeros(2, 3), 0, 0, 1.0), 0, 1, 2.0), 0, 2, 3.0), \
+        1, 0, 4.0), 1, 1, 5.0), 1, 2, 6.0);";
+    // An Array[Vector] of two length-3 embeddings.
+    let store = "let store = [vec_from_array([1.0, 2.0, 3.0]), \
+        vec_from_array([4.0, 5.0, 6.0])];";
+    let cases: Vec<(String, &str)> = vec![
+        // tensor_row: read row 1, element 0 (widened f32->f64) -> 4.
+        (
+            format!("fn main() -> Float = {{ {} vec_get(tensor_row(t, 1), 0) }}\n", mat),
+            "4",
+        ),
+        // tensor_row composed with vec_dot: dot(row0, row1) = 1*4+2*5+3*6 = 32.
+        (
+            format!("fn main() -> Float = {{ {} vec_dot(tensor_row(t, 0), tensor_row(t, 1)) }}\n", mat),
+            "32",
+        ),
+        // tensor_from_rows: shape and a couple of cells (narrowed f64->f32).
+        (
+            format!("fn main() -> Int = {{ {} tensor_rows(tensor_from_rows(store)) }}\n", store),
+            "2",
+        ),
+        (
+            format!("fn main() -> Int = {{ {} tensor_cols(tensor_from_rows(store)) }}\n", store),
+            "3",
+        ),
+        (
+            format!("fn main() -> Float = {{ {} tensor_get(tensor_from_rows(store), 1, 2) }}\n", store),
+            "6",
+        ),
+        // Empty Array[Vector] -> 0x0 tensor (chosen empty-array behavior).
+        (
+            "fn main() -> Int = { let s: Array[Vector] = []; tensor_rows(tensor_from_rows(s)) }\n".to_string(),
+            "0",
+        ),
+        // Round-trip: tensor_row(tensor_from_rows(store), 0) recovers row 0
+        // (values are the f32-rounded originals; 3.0 is exact in f32).
+        (
+            format!("fn main() -> Float = {{ {} vec_get(tensor_row(tensor_from_rows(store), 0), 2) }}\n", store),
+            "3",
+        ),
+        // Bridge demo: stack embeddings, Gram matrix G = M*M^T, read G[0][0]
+        // = dot(e0,e0) = 1+4+9 = 14.
+        (
+            format!(
+                "fn main() -> Float = {{ {} let m = tensor_from_rows(store); \
+                 tensor_get(matmul(m, transpose(m)), 0, 0) }}\n",
+                store
+            ),
+            "14",
+        ),
+        // OOB row index -> clean TRAP on every backend.
+        (
+            format!("fn main() -> Float = {{ {} vec_get(tensor_row(t, 5), 0) }}\n", mat),
+            "TRAP",
+        ),
+        // Unequal-length rows -> clean TRAP on every backend.
+        (
+            "fn main() -> Int = { let s = [vec_from_array([1.0, 2.0]), \
+             vec_from_array([3.0])]; tensor_rows(tensor_from_rows(s)) }\n".to_string(),
+            "TRAP",
+        ),
+    ];
+    let cc = cc_available();
+    let node = node_available();
+    let (mut nat, mut wasm_n) = (0u64, 0u64);
+    for (src, expected) in &cases {
+        // Interp oracle (trap cases are runtime errors).
+        if *expected == "TRAP" {
+            assert!(ast_run(src).is_err(), "interp should trap\n{}", src);
+        } else {
+            let interp = ast_run(src).unwrap_or_else(|e| panic!("interp failed: {}\n{}", e, src));
+            assert_eq!(&interp, expected, "interp mismatch\n{}", src);
+        }
+        let prog = parser::parse(lexer::lex(src).expect("lex")).expect("parse");
+        assert!(typeck::check(&prog).is_ok(), "type error\n{}", src);
+        if cc {
+            let c_src = crate::c_backend::compile(&prog)
+                .unwrap_or_else(|e| panic!("c_backend failed: {}\n{}", e, src));
+            let (n, live) = run_native_live(&c_src)
+                .unwrap_or_else(|e| panic!("native runner failed: {}\n{}", e, src));
+            if *expected == "TRAP" {
+                assert_eq!(n, "TRAP", "native should trap cleanly\n{}\n got={}", src, n);
+            } else {
+                assert_eq!(n, *expected, "native != expected\n{}\n native={}", src, n);
+                assert_eq!(live, 0, "native leaked {} cell(s)\n{}", live, src);
+            }
+            nat += 1;
+        }
+        if node {
+            let bytes = wasm::compile(&prog)
+                .unwrap_or_else(|e| panic!("wasm compile failed: {}\n{}", e, src));
+            let (w, live) = run_wasm_live(&bytes)
+                .unwrap_or_else(|e| panic!("wasm runner failed: {}\n{}", e, src));
+            if *expected == "TRAP" {
+                assert_eq!(w, "TRAP", "wasm should trap cleanly\n{}\n got={}", src, w);
+            } else {
+                assert_eq!(&w, expected, "wasm != expected\n{}\n wasm={}", src, w);
+                assert_eq!(live, 0, "wasm leaked {} cell(s)\n{}", live, src);
+            }
+            wasm_n += 1;
+        }
+    }
+    eprintln!(
+        "tensor_vector_bridge_matches_compiled: {} programs ({} native, {} wasm)",
+        cases.len(),
+        nat,
+        wasm_n
+    );
+}
+
 /// The prelude's higher-order operations (`array_map`/`array_filter`/
 /// `array_fold`/`range`) are ordinary Aria functions, so they must agree across
 /// ALL THREE backends. Each program is wrapped with the real prelude (exactly as

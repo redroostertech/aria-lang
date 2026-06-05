@@ -777,11 +777,11 @@ fn builtin_ret(name: &str) -> Option<CType> {
         "vec_len" => Some(CType::Int),
         "vec_get" | "vec_dot" | "vec_norm" | "vec_cosine" => Some(CType::Float),
         // Tensor / neural primitives (non-generic; no element-kind suffix).
-        "tensor_zeros" | "tensor_set" | "matmul" | "transpose" | "relu" | "softmax" => {
-            Some(CType::Tensor)
-        }
+        "tensor_zeros" | "tensor_set" | "matmul" | "transpose" | "relu" | "softmax"
+        | "tensor_from_rows" => Some(CType::Tensor),
         "tensor_get" => Some(CType::Float),
         "tensor_rows" | "tensor_cols" => Some(CType::Int),
+        "tensor_row" => Some(CType::Vector),
         _ => None,
     }
 }
@@ -1704,6 +1704,26 @@ fn emit_builtin(
             }
             let (_, t) = emit_atom(&args[0], env, out)?;
             let _ = writeln!(out, "{}{} = aria_tensor_cols({});", ind, dst, t);
+            Ok(())
+        }
+        "tensor_row" => {
+            if args.len() != 2
+                || atom_type(&args[0], env)? != CType::Tensor
+                || atom_type(&args[1], env)? != CType::Int
+            {
+                return Err("c backend: tensor_row expects (Tensor, Int)".into());
+            }
+            let (_, t) = emit_atom(&args[0], env, out)?;
+            let (_, i) = emit_atom(&args[1], env, out)?;
+            let _ = writeln!(out, "{}{} = aria_tensor_row({}, {});", ind, dst, t, i);
+            Ok(())
+        }
+        "tensor_from_rows" => {
+            if args.len() != 1 || atom_type(&args[0], env)? != CType::Array(ElemKind::Vector) {
+                return Err("c backend: tensor_from_rows expects one Array[Vector]".into());
+            }
+            let (_, a) = emit_atom(&args[0], env, out)?;
+            let _ = writeln!(out, "{}{} = aria_tensor_from_rows({});", ind, dst, a);
             Ok(())
         }
         "matmul" => {
@@ -3010,6 +3030,44 @@ static void* aria_tensor_set(void* p, int64_t r, int64_t c, double v) {
     n->data[r * n->cols + c] = (float)v;
     aria_tensor_drop(p);
     return (void*)n;
+}
+/* tensor_row(t, i): pull row i of a 2D tensor out as a length-cols Vector,
+   WIDENING each stored f32 -> f64 (exact). Out-of-range i -> clean trap.
+   Consumes t, allocates a fresh Vector. */
+static void* aria_tensor_row(void* p, int64_t i) {
+    AriaTensor* t = (AriaTensor*)p;
+    if (i < 0 || i >= t->rows) aria_trap_msg("tensor_row index out of range");
+    int64_t cols = t->cols;
+    AriaVector* v = (AriaVector*)aria_vec_alloc(cols > 0 ? cols : 0);
+    v->len = cols;
+    for (int64_t c = 0; c < cols; c++) v->elems[c] = (double)t->data[i * cols + c];
+    aria_tensor_drop(p);  /* consumes its argument */
+    return (void*)v;
+}
+/* tensor_from_rows(rows): stack an Array[Vector] (kind 9) of equal-length
+   vectors into a [n, L] tensor, NARROWING each f64 -> f32. Unequal lengths ->
+   clean trap. Empty array -> 0x0 tensor. Consumes the array (and the Vectors
+   it owns), allocates a fresh tensor. */
+static void* aria_tensor_from_rows(void* p) {
+    AriaArray* a = (AriaArray*)p;
+    int64_t n = a->len;
+    if (n == 0) {
+        void* out = aria_tensor_zeros(0, 0);
+        aria_array_drop(p);  /* drop the (empty) array */
+        return out;
+    }
+    int64_t l = ((AriaVector*)(uintptr_t)a->elems[0])->len;
+    for (int64_t i = 1; i < n; i++) {
+        if (((AriaVector*)(uintptr_t)a->elems[i])->len != l)
+            aria_trap_msg("tensor_from_rows: rows must have equal length");
+    }
+    AriaTensor* t = (AriaTensor*)aria_tensor_alloc(n, l);
+    for (int64_t i = 0; i < n; i++) {
+        AriaVector* v = (AriaVector*)(uintptr_t)a->elems[i];
+        for (int64_t c = 0; c < l; c++) t->data[i * l + c] = (float)v->elems[c];
+    }
+    aria_array_drop(p);  /* consumes the array and its owned Vector elements */
+    return (void*)t;
 }
 /* matmul: (m,k) x (k,n) -> (m,n), f32 accumulation, i-p-j loop order EXACTLY
    matching the interpreter (a different order or an f64 accumulator would

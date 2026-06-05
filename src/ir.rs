@@ -201,6 +201,8 @@ const WASM_ONLY_BUILTINS: &[&str] = &[
     "tensor_get",
     "tensor_rows",
     "tensor_cols",
+    "tensor_row",
+    "tensor_from_rows",
     "matmul",
     "transpose",
     "softmax",

@@ -928,6 +928,58 @@ fn builtin(name: &str, args: &[Value]) -> Result<Option<Value>, String> {
             [Value::Tensor(t)] => Ok(Some(Value::Int(t.cols() as i64))),
             _ => Err("tensor_cols expects (Tensor)".into()),
         },
+        // Pull row `i` of a 2D tensor out as a length-cols Vector, widening
+        // each stored f32 to f64 (exact). Out-of-range row index traps.
+        "tensor_row" => match args {
+            [Value::Tensor(t), Value::Int(i)] => {
+                let (rows, cols) = (t.rows(), t.cols());
+                if *i < 0 || *i as usize >= rows {
+                    return Err(format!(
+                        "tensor_row index {} out of range for {}x{} tensor",
+                        i, rows, cols
+                    ));
+                }
+                let r = *i as usize;
+                let out: Vec<f64> = (0..cols).map(|c| t.at(r, c) as f64).collect();
+                Ok(Some(Value::Vector(out)))
+            }
+            _ => Err("tensor_row expects (Tensor, Int)".into()),
+        },
+        // Stack an Array[Vector] of equal-length vectors into a [n, L] tensor,
+        // narrowing each f64 element to f32. Unequal lengths trap; an empty
+        // array yields a 0x0 tensor.
+        "tensor_from_rows" => match args {
+            [Value::Array(rows)] => {
+                if rows.is_empty() {
+                    return Ok(Some(Value::Tensor(crate::tensor::Tensor::zeros(&[0, 0]))));
+                }
+                let l = match &rows[0] {
+                    Value::Vector(v) => v.len(),
+                    _ => return Err("tensor_from_rows expects (Array[Vector])".into()),
+                };
+                let mut data: Vec<f32> = Vec::with_capacity(rows.len() * l);
+                for row in rows {
+                    match row {
+                        Value::Vector(v) => {
+                            if v.len() != l {
+                                return Err(
+                                    "tensor_from_rows: rows must have equal length".into()
+                                );
+                            }
+                            for x in v {
+                                data.push(*x as f32);
+                            }
+                        }
+                        _ => return Err("tensor_from_rows expects (Array[Vector])".into()),
+                    }
+                }
+                Ok(Some(Value::Tensor(crate::tensor::Tensor::new(
+                    vec![rows.len(), l],
+                    data,
+                ))))
+            }
+            _ => Err("tensor_from_rows expects (Array[Vector])".into()),
+        },
         "matmul" => match args {
             [Value::Tensor(a), Value::Tensor(b)] => {
                 if a.cols() != b.rows() {
