@@ -52,57 +52,88 @@ use crate::ir::{self, Atom, Bind, IExpr, IFn};
 /// mirrors the one-char suffix the monomorphizer attaches to array builtins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ElemKind {
-    Int,   // Int/Bool — stored directly in an int64 slot
-    Float, // Float — f64 bit-reinterpreted into an int64 slot
-    Str,   // heap String object (ref counted, recursive drop)
-    Ref,   // boxed heap value: ADT cell, closure, nested array (recursive drop)
+    Int,    // Int/Bool — stored directly in an int64 slot
+    Float,  // Float — f64 bit-reinterpreted into an int64 slot
+    Str,    // heap String object (ref counted, recursive drop)
+    Ref,    // boxed heap value: ADT cell / closure (recursive drop via aria_drop)
+    Bytes,  // heap AriaBytes buffer (aria_bytes_drop)
+    Array,  // heap AriaArray — a nested array (aria_array_drop)
+    Map,    // heap AriaMap (aria_map_drop)
+    Set,    // heap AriaSet (aria_set_drop)
+    Vector, // heap AriaVector / embedding (aria_vec_drop)
 }
 
 impl ElemKind {
-    /// Parse the monomorphizer's one-char element-kind suffix.
+    /// Parse the monomorphizer's one-char element-kind suffix. The codes match
+    /// `SlotKind`'s so array elements can route through the shared
+    /// `aria_slot_dup`/`aria_slot_drop` runtime dispatch.
     fn from_tag(c: char) -> Result<ElemKind, String> {
         match c {
             'i' => Ok(ElemKind::Int),
             'f' => Ok(ElemKind::Float),
             's' => Ok(ElemKind::Str),
             'r' => Ok(ElemKind::Ref),
+            'b' => Ok(ElemKind::Bytes),
+            'a' => Ok(ElemKind::Array),
+            'm' => Ok(ElemKind::Map),
+            'e' => Ok(ElemKind::Set),
+            'v' => Ok(ElemKind::Vector),
             other => Err(format!("c backend: bad array element-kind tag `{}`", other)),
         }
     }
 
     /// The header `kind` code stored in `AriaArray.kind` (drives the kind-aware
-    /// runtime drop). Must match the codes used in the C runtime below.
+    /// runtime drop). These MATCH the `SlotKind` codes so the per-element dup/drop
+    /// can be dispatched through `aria_slot_dup`/`aria_slot_drop`.
     fn code(self) -> i64 {
         match self {
             ElemKind::Int => 0,
             ElemKind::Float => 1,
             ElemKind::Str => 2,
             ElemKind::Ref => 3,
+            ElemKind::Bytes => 4,
+            ElemKind::Array => 5,
+            ElemKind::Map => 6,
+            ElemKind::Set => 7,
+            ElemKind::Vector => 9,
         }
     }
 
-    /// The C value type of an element of this kind.
+    /// The C value type of an element of this kind. For the heap-container kinds
+    /// (nested Array, Map, Set) the inner element kind is not threaded through the
+    /// one-char tag, so we report a COARSE inner kind (Ref); this only affects the
+    /// static type of a retrieved container — its C declaration is `void*` either
+    /// way, and the container's own runtime header carries the precise inner kind.
+    /// The FLAT heap kinds (Bytes, Vector) round-trip exactly.
     fn elem_ctype(self) -> CType {
         match self {
             ElemKind::Int => CType::Int,
             ElemKind::Float => CType::Float,
             ElemKind::Str => CType::Str,
             ElemKind::Ref => CType::Ref,
+            ElemKind::Bytes => CType::Bytes,
+            ElemKind::Vector => CType::Vector,
+            ElemKind::Array => CType::Array(ElemKind::Ref),
+            ElemKind::Map => CType::Map(SlotKind::Ref, SlotKind::Ref),
+            ElemKind::Set => CType::Set(SlotKind::Ref),
         }
     }
 
-    /// The element kind that holds a value of the given C value type.
-    fn from_ctype(ct: CType) -> ElemKind {
+    /// The element kind that holds a value of the given C value type. Each tagged
+    /// heap type gets its OWN kind (so the per-element dup/drop uses the correct
+    /// runtime function — no type confusion treating an AriaVector/AriaBytes as an
+    /// AriaCell).
+    fn from_ctype(ct: &CType) -> ElemKind {
         match ct {
             CType::Int | CType::Bool => ElemKind::Int,
             CType::Float => ElemKind::Float,
             CType::Str => ElemKind::Str,
-            // A Bytes/Map/Set buffer is a heap pointer, so an array element of one
-            // is a boxed heap ref (recursive drop), like a nested Array/ADT.
-            CType::Ref | CType::Bytes | CType::Array(_) | CType::Map(..) | CType::Set(_)
-            | CType::Vector => {
-                ElemKind::Ref
-            }
+            CType::Ref => ElemKind::Ref,
+            CType::Bytes => ElemKind::Bytes,
+            CType::Vector => ElemKind::Vector,
+            CType::Array(_) => ElemKind::Array,
+            CType::Map(..) => ElemKind::Map,
+            CType::Set(_) => ElemKind::Set,
         }
     }
 }
@@ -219,7 +250,7 @@ impl CType {
             Ty::Str => Ok(CType::Str),
             Ty::Named(n, args) if n == "Array" && args.len() == 1 => {
                 let elem = CType::from_ty(&args[0])?;
-                Ok(CType::Array(ElemKind::from_ctype(elem)))
+                Ok(CType::Array(ElemKind::from_ctype(&elem)))
             }
             Ty::Named(n, _) if n == "Bytes" => Ok(CType::Bytes),
             // The opaque, reference-counted dense float vector / embedding.
@@ -719,6 +750,11 @@ fn slot_kind_from_tag(c: char) -> SlotKind {
         'i' => SlotKind::Int,
         'f' => SlotKind::Float,
         's' => SlotKind::Str,
+        'b' => SlotKind::Bytes,
+        'v' => SlotKind::Vector,
+        'a' => SlotKind::Array,
+        'm' => SlotKind::Map,
+        'e' => SlotKind::Set,
         _ => SlotKind::Ref,
     }
 }
@@ -1545,7 +1581,13 @@ fn encode_elem_slot(kind: ElemKind, t: CType, ex: &str) -> Result<String, String
         ElemKind::Int => matches!(t, CType::Int | CType::Bool),
         ElemKind::Float => t == CType::Float,
         ElemKind::Str => t == CType::Str,
-        ElemKind::Ref => matches!(t, CType::Ref | CType::Str | CType::Bytes | CType::Array(_) | CType::Map(..) | CType::Set(_) | CType::Vector),
+        ElemKind::Bytes => t == CType::Bytes,
+        ElemKind::Vector => t == CType::Vector,
+        ElemKind::Array => matches!(t, CType::Array(_)),
+        ElemKind::Map => matches!(t, CType::Map(..)),
+        ElemKind::Set => matches!(t, CType::Set(_)),
+        // A `Ref`-kind element is any boxed ADT cell / closure stored as a pointer.
+        ElemKind::Ref => matches!(t, CType::Ref),
     };
     if !ok {
         return Err(format!(
@@ -1557,7 +1599,14 @@ fn encode_elem_slot(kind: ElemKind, t: CType, ex: &str) -> Result<String, String
     Ok(match kind {
         ElemKind::Int => format!("(int64_t)({})", ex),
         ElemKind::Float => format!("aria_f2i({})", ex),
-        ElemKind::Str | ElemKind::Ref => format!("(int64_t)(uintptr_t)({})", ex),
+        // every heap kind is stored as a pointer cast through uintptr_t.
+        ElemKind::Str
+        | ElemKind::Ref
+        | ElemKind::Bytes
+        | ElemKind::Array
+        | ElemKind::Map
+        | ElemKind::Set
+        | ElemKind::Vector => format!("(int64_t)(uintptr_t)({})", ex),
     })
 }
 
@@ -1566,7 +1615,13 @@ fn decode_elem_slot(kind: ElemKind, slot: &str) -> String {
     match kind {
         ElemKind::Int => slot.to_string(),
         ElemKind::Float => format!("aria_i2f({})", slot),
-        ElemKind::Str | ElemKind::Ref => format!("(void*)(uintptr_t)({})", slot),
+        ElemKind::Str
+        | ElemKind::Ref
+        | ElemKind::Bytes
+        | ElemKind::Array
+        | ElemKind::Map
+        | ElemKind::Set
+        | ElemKind::Vector => format!("(void*)(uintptr_t)({})", slot),
     }
 }
 
@@ -2213,10 +2268,14 @@ static void* aria_drop_reuse(void* p) {
 }
 
 /* ---- native array: { rc; kind; len; cap; int64_t elems[] } ----
-   kind codes: 0=Int/Bool, 1=Float, 2=Str (heap ref), 3=Ref (boxed heap ref).
-   Elements are stored one per int64 slot: Int directly, Float via aria_f2i, and
-   Str/Ref as the pointer cast through uintptr_t. FBIP: set/push mutate in place
-   when rc==1, else copy-on-write. */
+   kind codes match SlotKind: 0=Int/Bool, 1=Float, 2=Str, 3=Ref (ADT/closure),
+   4=Bytes, 5=Array (nested), 6=Map, 7=Set, 9=Vector. Elements are stored one per
+   int64 slot: Int directly, Float via aria_f2i, every heap kind as the pointer
+   cast through uintptr_t. Per-element dup/drop dispatch through the shared
+   aria_slot_dup/aria_slot_drop (forward-declared) so each heap kind uses its
+   CORRECT recursive drop. FBIP: set/push mutate in place when rc==1, else COW. */
+static void aria_slot_dup(int64_t kind, int64_t slot);
+static void aria_slot_drop(int64_t kind, int64_t slot);
 typedef struct { int64_t rc; int64_t kind; int64_t len; int64_t cap; int64_t elems[]; } AriaArray;
 
 static void* aria_array_alloc(int64_t kind, int64_t cap) {
@@ -2235,22 +2294,23 @@ static int64_t aria_array_len(void* p) {
     return n;
 }
 
-/* Dup a single element slot (used when copy-on-write clones a buffer). */
+/* Dup a single element slot (used when copy-on-write clones a buffer). The
+   kind-aware dispatch lives in aria_slot_dup (Str/Ref/Bytes/Array/Map/Set/Vector;
+   Int/Float are no-ops). */
 static void aria_array_dup_elem(int64_t kind, int64_t slot) {
-    if (kind == 2) aria_str_dup((void*)(uintptr_t)slot);
-    else if (kind == 3) aria_dup((void*)(uintptr_t)slot);
+    aria_slot_dup(kind, slot);
 }
 /* Drop a single element slot. */
 static void aria_array_drop_elem(int64_t kind, int64_t slot) {
-    if (kind == 2) aria_str_drop((void*)(uintptr_t)slot);
-    else if (kind == 3) aria_drop((void*)(uintptr_t)slot);
+    aria_slot_drop(kind, slot);
 }
 
 static void aria_array_drop(void* p) {
     AriaArray* a = (AriaArray*)p;
     if (--a->rc == 0) {
-        if (a->kind == 2) { for (int64_t i = 0; i < a->len; i++) aria_str_drop((void*)(uintptr_t)a->elems[i]); }
-        else if (a->kind == 3) { for (int64_t i = 0; i < a->len; i++) aria_drop((void*)(uintptr_t)a->elems[i]); }
+        if (a->kind != 0 && a->kind != 1) {
+            for (int64_t i = 0; i < a->len; i++) aria_slot_drop(a->kind, a->elems[i]);
+        }
         aria_live--;
         free(a);
     }
@@ -2678,7 +2738,8 @@ static void aria_slot_dup(int64_t kind, int64_t slot) {
         case 5: aria_array_dup((void*)(uintptr_t)slot); break;
         case 6: aria_map_dup((void*)(uintptr_t)slot); break;
         case 7: aria_set_dup((void*)(uintptr_t)slot); break;
-        default: break;  /* Int/Float: nothing to dup */
+        case 9: aria_vec_dup((void*)(uintptr_t)slot); break;
+        default: break;  /* Int(0)/Float(1)/Bool(8): nothing to dup */
     }
 }
 static void aria_slot_drop(int64_t kind, int64_t slot) {
@@ -2689,7 +2750,8 @@ static void aria_slot_drop(int64_t kind, int64_t slot) {
         case 5: aria_array_drop((void*)(uintptr_t)slot); break;
         case 6: aria_map_drop((void*)(uintptr_t)slot); break;
         case 7: aria_set_drop((void*)(uintptr_t)slot); break;
-        default: break;
+        case 9: aria_vec_drop((void*)(uintptr_t)slot); break;
+        default: break;  /* Int(0)/Float(1)/Bool(8): nothing to drop */
     }
 }
 /* Total ordering on keys/elements. kind is 0 (Int) or 2 (Str). Returns <0/0/>0. */

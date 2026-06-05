@@ -1647,14 +1647,22 @@ impl<'a> Mono<'a> {
 
 /// Map a concrete array-element `Ty` to the one-char element-kind tag that the
 /// native/wasm backends dispatch on. `Int`/`Bool` are unboxed integers (`"i"`),
-/// `Float` an unboxed double (`"f"`), `Str` a heap string (`"s"`), and every
-/// other element — ADTs, nested `Array`/`Tensor`, etc. — a boxed heap ref
-/// (`"r"`). Used to suffix the six array-builtin call names (`array_get$i`, …).
+/// `Float` an unboxed double (`"f"`), `Str` a heap string (`"s"`). The TAGGED
+/// heap types each get their own tag so the backend keeps the precise element
+/// type (and the correct kind-aware dup/drop): `Bytes`→`"b"`, `Vector`→`"v"`,
+/// nested `Array`→`"a"`, `Map`→`"m"`, `Set`→`"e"`. Every other element — ADTs,
+/// closures, `Tensor`, etc. — is a boxed heap ref (`"r"`). Used to suffix the
+/// array-builtin call names (`array_get$i`, …) and, reused, the map/set suffixes.
 fn array_elem_tag(elem: &Ty) -> &'static str {
     match elem {
         Ty::Int | Ty::Bool => "i",
         Ty::Float => "f",
         Ty::Str => "s",
+        Ty::Named(n, _) if n == "Bytes" => "b",
+        Ty::Named(n, _) if n == "Vector" => "v",
+        Ty::Named(n, args) if n == "Array" && args.len() == 1 => "a",
+        Ty::Named(n, args) if n == "Map" && args.len() == 2 => "m",
+        Ty::Named(n, args) if n == "Set" && args.len() == 1 => "e",
         _ => "r",
     }
 }

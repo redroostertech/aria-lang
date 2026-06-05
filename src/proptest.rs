@@ -1600,6 +1600,107 @@ fn vectors_interp_matches_compiled() {
     );
 }
 
+/// `Array[Vector]` and `Array[Bytes]` differential: an array whose ELEMENT is a
+/// tagged heap type (Vector / Bytes) must keep its PRECISE element type through
+/// `array_get` (so `vec_*` / `bytes_*` ops on a retrieved element type-check in
+/// the native backend, matching the interpreter) and must dup/drop each element
+/// with the CORRECT kind-aware runtime function — never the generic ADT
+/// `aria_drop` (a type-confusion). Interp (oracle) vs native (cc-gated): identical
+/// result AND garbage-free heap (live == 0). Wasm intentionally rejects both
+/// (vectors gated; a Bytes array element exceeds the wasm subset) — asserted
+/// cleanly (no panic).
+#[test]
+fn arrays_of_tagged_heap_elems_interp_matches_compiled() {
+    let cc = cc_available();
+    // (source, expected interp result). Each builds an array of 2-3 tagged-heap
+    // elements, retrieves elements with `array_get`, and operates on them.
+    let cases: &[(&str, &str)] = &[
+        // --- Array[Vector]: an embedding store. The headline case — the same
+        //     `vec_cosine(array_get(vs, i), array_get(vs, j))` the issue cited. ---
+        // cosine of two stored, orthogonal embeddings = 0.
+        (
+            "fn main() -> Float = {\n\
+               let vs: Array[Vector] = [vec_from_array([1.0, 0.0]), vec_from_array([0.0, 1.0])];\n\
+               vec_cosine(array_get(vs, 0), array_get(vs, 1))\n\
+             }\n",
+            "0",
+        ),
+        // dot of two stored embeddings (1*4 + 2*5 + 3*6 = 32).
+        (
+            "fn main() -> Float = {\n\
+               let vs: Array[Vector] = [vec_from_array([1.0, 2.0, 3.0]), vec_from_array([4.0, 5.0, 6.0])];\n\
+               vec_dot(array_get(vs, 0), array_get(vs, 1))\n\
+             }\n",
+            "32",
+        ),
+        // vec_add of two stored embeddings, then norm (||[4,6]|| = sqrt(52)).
+        (
+            "fn main() -> Float = {\n\
+               let vs: Array[Vector] = [vec_from_array([1.0, 2.0]), vec_from_array([3.0, 4.0])];\n\
+               vec_norm(vec_add(array_get(vs, 0), array_get(vs, 1)))\n\
+             }\n",
+            "7.211102550927978",
+        ),
+        // array_len + per-element vec_len of a 3-embedding store.
+        (
+            "fn main() -> Int = {\n\
+               let vs: Array[Vector] = [vec_from_array([1.0]), vec_from_array([1.0, 2.0]), vec_from_array([1.0, 2.0, 3.0])];\n\
+               array_len(vs) * 100 + vec_len(array_get(vs, 2)) * 10 + vec_len(array_get(vs, 0))\n\
+             }\n",
+            "331",
+        ),
+        // --- Array[Bytes] ---
+        // build two byte buffers, get one, bytes_len + bytes_get it.
+        (
+            "fn main() -> Int = {\n\
+               let bs: Array[Bytes] = [bytes_push(bytes_push(bytes_new(), 10), 20), bytes_push(bytes_new(), 99)];\n\
+               array_len(bs) * 1000 + bytes_len(array_get(bs, 0)) * 100 + bytes_get(array_get(bs, 0), 1) * 10 + bytes_get(array_get(bs, 1), 0) / 11\n\
+             }\n",
+            "2409",
+        ),
+    ];
+
+    let mut native_checked = 0u64;
+    for (src, expected) in cases {
+        // Oracle: tree-walking interpreter.
+        let interp = ast_run(src).unwrap_or_else(|e| panic!("interp failed: {}\n{}", e, src));
+        assert_eq!(
+            &interp, expected,
+            "interpreter result mismatch\n{}\n got={} want={}",
+            src, interp, expected
+        );
+
+        let prog = parser::parse(lexer::lex(src).expect("lex")).expect("parse");
+        assert!(typeck::check(&prog).is_ok(), "type error\n{}", src);
+
+        // Native (C) backend: identical result + garbage-free (live == 0).
+        if cc {
+            let c_src = crate::c_backend::compile(&prog)
+                .unwrap_or_else(|e| panic!("c_backend failed: {}\n{}", e, src));
+            let (nat, live) = run_native_live(&c_src)
+                .unwrap_or_else(|e| panic!("native runner failed: {}\n{}", e, src));
+            assert_eq!(nat, *expected, "native != expected\n{}\n native={}", src, nat);
+            assert_eq!(live, 0, "native leaked {} cell(s)\n{}", live, src);
+            native_checked += 1;
+        }
+
+        // The wasm backend must cleanly REJECT both (vector gate / Bytes array
+        // element outside the subset) — never compile or panic.
+        let bytes = wasm::compile(&prog);
+        assert!(
+            bytes.is_err(),
+            "wasm backend unexpectedly accepted a tagged-heap array program\n{}",
+            src
+        );
+    }
+
+    eprintln!(
+        "arrays_of_tagged_heap_elems_interp_matches_compiled: {} programs ({} native)",
+        cases.len(),
+        native_checked
+    );
+}
+
 /// Error cases (length mismatch on dot/add/cosine, OOB vec_get) must surface as a
 /// CLEAN runtime error in the interpreter AND a CLEAN trap (`abort` -> "TRAP", no
 /// panic) in the native backend — never a panic or silent wrong answer.

@@ -68,13 +68,19 @@ enum ElemKind {
 }
 
 impl ElemKind {
-    /// Parse the monomorphizer's one-char element-kind suffix.
+    /// Parse the monomorphizer's one-char element-kind suffix. The wasm backend
+    /// collapses every BOXED heap element to the single `Ref` kind, so the native
+    /// backend's finer-grained heap tags — `a` (nested Array), `b` (Bytes), `m`
+    /// (Map), `e` (Set), `v` (Vector) — all parse here as `Ref`. Nested arrays are
+    /// the only heap-element arrays wasm actually supports (Bytes/Vector/Map/Set
+    /// are rejected earlier at the type level); routing them through `Ref`
+    /// preserves wasm's pre-existing behavior.
     fn from_tag(c: char) -> Result<ElemKind, String> {
         match c {
             'i' => Ok(ElemKind::Int),
             'f' => Ok(ElemKind::Float),
             's' => Ok(ElemKind::Str),
-            'r' => Ok(ElemKind::Ref),
+            'r' | 'a' | 'b' | 'm' | 'e' | 'v' => Ok(ElemKind::Ref),
             other => Err(format!("wasm backend: bad array element-kind tag `{}`", other)),
         }
     }
