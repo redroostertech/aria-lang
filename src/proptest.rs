@@ -1600,6 +1600,73 @@ fn vectors_interp_matches_compiled() {
     );
 }
 
+/// The prelude's higher-order operations (`array_map`/`array_filter`/
+/// `array_fold`/`range`) are ordinary Aria functions, so they must agree across
+/// ALL THREE backends. Each program is wrapped with the real prelude (exactly as
+/// the CLI does) and run through interp (oracle), native (cc-gated), and wasm
+/// (node-gated); results must be identical and the native/wasm heaps garbage-free.
+#[test]
+fn prelude_hofs_match_across_backends() {
+    let progs: &[(&str, &str)] = &[
+        // map then fold: sum of x*10 over [1,2,3] = 60.
+        (
+            "fn main() -> Int = array_fold(array_map(array_push(array_push(array_push(array_new(), 1), 2), 3), \\x -> x * 10), 0, \\(a: Int, x: Int) -> a + x)\n",
+            "60",
+        ),
+        // range + map + filter + fold: even squares in [0,6) = 0+4+16 = 20.
+        (
+            "fn main() -> Int = array_fold(array_filter(array_map(range(6), \\x -> x * x), \\x -> x % 2 == 0), 0, \\(a: Int, x: Int) -> a + x)\n",
+            "20",
+        ),
+        // range length, and fold over a plain range: sum 0..10 = 45.
+        (
+            "fn main() -> Int = array_fold(range(10), 0, \\(a: Int, x: Int) -> a + x)\n",
+            "45",
+        ),
+        // filter keeps a subset; len via fold of 1s. [0..10) > 4 -> 5 elements.
+        (
+            "fn main() -> Int = array_fold(array_filter(range(10), \\x -> x > 4), 0, \\(a: Int, x: Int) -> a + 1)\n",
+            "5",
+        ),
+    ];
+    let cc = cc_available();
+    let node = node_available();
+    let (mut nat_n, mut wasm_n) = (0u64, 0u64);
+    for (user_src, expected) in progs {
+        let src = crate::prelude::wrap(user_src);
+        let interp = ast_run(&src).unwrap_or_else(|e| panic!("interp failed: {}\n{}", e, user_src));
+        assert_eq!(&interp, expected, "interp mismatch\n{}", user_src);
+
+        let prog = parser::parse(lexer::lex(&src).expect("lex")).expect("parse");
+        assert!(typeck::check(&prog).is_ok(), "type error\n{}", user_src);
+
+        if cc {
+            let c_src = crate::c_backend::compile(&prog)
+                .unwrap_or_else(|e| panic!("c_backend failed: {}\n{}", e, user_src));
+            let (nat, live) = run_native_live(&c_src)
+                .unwrap_or_else(|e| panic!("native runner failed: {}\n{}", e, user_src));
+            assert_eq!(nat, *expected, "native != expected\n{}", user_src);
+            assert_eq!(live, 0, "native leaked {} cell(s)\n{}", live, user_src);
+            nat_n += 1;
+        }
+        if node {
+            let bytes = wasm::compile(&prog)
+                .unwrap_or_else(|e| panic!("wasm compile failed: {}\n{}", e, user_src));
+            let (w, live) = run_wasm_live(&bytes)
+                .unwrap_or_else(|e| panic!("wasm runner failed: {}\n{}", e, user_src));
+            assert_eq!(w, *expected, "wasm != expected\n{}", user_src);
+            assert_eq!(live, 0, "wasm leaked {} cell(s)\n{}", live, user_src);
+            wasm_n += 1;
+        }
+    }
+    eprintln!(
+        "prelude_hofs_match_across_backends: {} programs ({} native, {} wasm)",
+        progs.len(),
+        nat_n,
+        wasm_n
+    );
+}
+
 /// `Array[Vector]` and `Array[Bytes]` differential: an array whose ELEMENT is a
 /// tagged heap type (Vector / Bytes) must keep its PRECISE element type through
 /// `array_get` (so `vec_*` / `bytes_*` ops on a retrieved element type-check in

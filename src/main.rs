@@ -28,6 +28,7 @@ mod neural_codec;
 mod pack;
 mod parser;
 mod predict;
+mod prelude;
 #[cfg(test)]
 mod proptest;
 mod rag;
@@ -88,7 +89,7 @@ fn run_mem(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let prog = match lexer::lex(&src).and_then(parser::parse) {
+    let prog = match lexer::lex(&prelude::wrap(&src)).and_then(parser::parse) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("error: {}", e);
@@ -176,7 +177,7 @@ fn run_mem(args: &[String]) -> ExitCode {
 /// Parse + type-check a file and compile it to a WebAssembly binary (subset 2a).
 fn compile_to_wasm(path: &str) -> Result<Vec<u8>, String> {
     let src = std::fs::read_to_string(path).map_err(|e| format!("cannot read {}: {}", path, e))?;
-    let prog = lexer::lex(&src).and_then(parser::parse)?;
+    let prog = lexer::lex(&prelude::wrap(&src)).and_then(parser::parse)?;
     typeck::check(&prog).map_err(|errs| errs.join("; "))?;
     wasm::compile(&prog)
 }
@@ -301,7 +302,7 @@ fn run_wasm_run(args: &[String]) -> ExitCode {
 /// Parse + type-check a file and transpile it to C source (native backend).
 fn compile_to_c(path: &str) -> Result<String, String> {
     let src = std::fs::read_to_string(path).map_err(|e| format!("cannot read {}: {}", path, e))?;
-    let prog = lexer::lex(&src).and_then(parser::parse)?;
+    let prog = lexer::lex(&prelude::wrap(&src)).and_then(parser::parse)?;
     typeck::check(&prog).map_err(|errs| errs.join("; "))?;
     c_backend::compile(&prog)
 }
@@ -447,7 +448,7 @@ fn run_source(args: &[String]) -> ExitCode {
         }
     };
 
-    let toks = match lexer::lex(&src) {
+    let toks = match lexer::lex(&prelude::wrap(&src)) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("lex error: {}", e);

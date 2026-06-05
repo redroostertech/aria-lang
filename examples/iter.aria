@@ -1,0 +1,20 @@
+-- Iteration & higher-order operations over collections (prelude). Aria has no
+-- mutable `for`/`while` loops — it has tail-recursion (which never grows the
+-- stack) plus these pure higher-order functions, so iterating a collection reads
+-- like a pipeline rather than hand-rolled index recursion. `array_map`,
+-- `array_filter`, `array_fold`, and `range` are ordinary Aria functions (see the
+-- prelude); they run identically on the interpreter, native, and wasm backends.
+
+-- Sum of the squares of the even numbers in [0, n).
+fn sum_even_squares(n: Int) -> Int =
+  array_fold(
+    array_filter(array_map(range(n), \x -> x * x), \x -> x % 2 == 0),
+    0,
+    \(acc: Int, x: Int) -> acc + x
+  )
+
+fn main() -> Int = {
+  -- range(6) = [0,1,2,3,4,5]; squares = [0,1,4,9,16,25];
+  -- evens = [0,4,16]; sum = 20.
+  sum_even_squares(6)
+}
