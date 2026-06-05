@@ -2168,6 +2168,43 @@ fn vectors_run_in_wasm_matches_interp() {
     );
 }
 
+/// The prelude's embedding-retrieval helpers (`nearest`/`nearest_score`/
+/// `similarities`) implement cosine nearest-neighbour search over an
+/// `Array[Vector]` store — the core of a RAG / semantic-search pipeline. They run
+/// on interp + native (Array[Vector] is outside the wasm subset). The store is
+/// built so the expected nearest index is unambiguous.
+#[test]
+fn embedding_retrieval_matches_compiled() {
+    let store = "let s = array_push(array_push(array_push(array_new(), \
+        vec_from_array([1.0, 0.0, 0.0])), vec_from_array([0.0, 1.0, 0.0])), \
+        vec_from_array([0.9, 0.1, 0.0]));";
+    let progs: Vec<(String, &str)> = vec![
+        (format!("fn main() -> Int = {{ {} nearest(s, vec_from_array([1.0, 0.2, 0.0])) }}\n", store), "2"),
+        (format!("fn main() -> Int = {{ {} nearest(s, vec_from_array([0.0, 1.0, 0.0])) }}\n", store), "1"),
+        (format!("fn main() -> Float = {{ {} nearest_score(s, vec_from_array([1.0, 0.0, 0.0])) }}\n", store), "1"),
+        (format!("fn main() -> Float = {{ {} array_get(similarities(s, vec_from_array([1.0, 0.0, 0.0])), 1) }}\n", store), "0"),
+    ];
+    let cc = cc_available();
+    let mut nat = 0u64;
+    for (user_src, expected) in &progs {
+        let src = crate::prelude::wrap(user_src);
+        let interp = ast_run(&src).unwrap_or_else(|e| panic!("interp failed: {}\n{}", e, user_src));
+        assert_eq!(&interp, expected, "interp mismatch\n{}", user_src);
+        if cc {
+            let prog = parser::parse(lexer::lex(&src).expect("lex")).expect("parse");
+            assert!(typeck::check(&prog).is_ok(), "type error\n{}", user_src);
+            let c_src = crate::c_backend::compile(&prog)
+                .unwrap_or_else(|e| panic!("c_backend failed: {}\n{}", e, user_src));
+            let (n, live) = run_native_live(&c_src)
+                .unwrap_or_else(|e| panic!("native runner failed: {}\n{}", e, user_src));
+            assert_eq!(n, *expected, "native != expected\n{}", user_src);
+            assert_eq!(live, 0, "native leaked {} cell(s)\n{}", live, user_src);
+            nat += 1;
+        }
+    }
+    eprintln!("embedding_retrieval_matches_compiled: {} programs ({} native)", progs.len(), nat);
+}
+
 /// The prelude's higher-order operations (`array_map`/`array_filter`/
 /// `array_fold`/`range`) are ordinary Aria functions, so they must agree across
 /// ALL THREE backends. Each program is wrapped with the real prelude (exactly as

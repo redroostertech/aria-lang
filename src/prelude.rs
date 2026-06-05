@@ -50,6 +50,42 @@ fn array__filter_go[A](xs: Array[A], i: Int, acc: Array[A], keep: (A) -> Bool) -
 fn range(n: Int) -> Array[Int] = array__range_go(0, n, array_new())
 fn array__range_go(i: Int, n: Int, acc: Array[Int]) -> Array[Int] =
   if i >= n { acc } else { array__range_go(i + 1, n, array_push(acc, i)) }
+
+-- ===== Embedding retrieval: nearest-neighbour search over a Vector store =====
+-- An embedding STORE is an `Array[Vector]` (e.g. one Vector per document); a
+-- QUERY is a Vector. These find the most similar stored embedding by cosine
+-- similarity — the core retrieval step of a RAG / semantic-search pipeline —
+-- built purely on `vec_cosine` and the array primitives.
+
+-- Index of the store embedding most similar to `query` (-1 for an empty store).
+fn nearest(store: Array[Vector], query: Vector) -> Int =
+  embed__argmax_go(store, query, 0, 0 - 1, 0.0 - 2.0)
+-- The best cosine similarity itself (-2.0 for an empty store, below cosine's -1).
+fn nearest_score(store: Array[Vector], query: Vector) -> Float =
+  embed__max_go(store, query, 0, 0.0 - 2.0)
+-- The cosine of `query` against every stored embedding, in store order.
+fn similarities(store: Array[Vector], query: Vector) -> Array[Float] =
+  embed__sims_go(store, query, 0, array_new())
+
+fn embed__argmax_go(store: Array[Vector], query: Vector, i: Int, bi: Int, bs: Float) -> Int =
+  if i >= array_len(store) { bi }
+  else {
+    let s = vec_cosine(query, array_get(store, i));
+    if s > bs { embed__argmax_go(store, query, i + 1, i, s) }
+    else { embed__argmax_go(store, query, i + 1, bi, bs) }
+  }
+fn embed__max_go(store: Array[Vector], query: Vector, i: Int, bs: Float) -> Float =
+  if i >= array_len(store) { bs }
+  else {
+    let s = vec_cosine(query, array_get(store, i));
+    if s > bs { embed__max_go(store, query, i + 1, s) }
+    else { embed__max_go(store, query, i + 1, bs) }
+  }
+fn embed__sims_go(store: Array[Vector], query: Vector, i: Int, acc: Array[Float]) -> Array[Float] =
+  if i >= array_len(store) { acc }
+  else {
+    embed__sims_go(store, query, i + 1, array_push(acc, vec_cosine(query, array_get(store, i))))
+  }
 "#;
 
 /// Append the prelude to a user program. Returns the combined source to lex.

@@ -1,0 +1,29 @@
+-- Embedding retrieval / semantic search (the core of a RAG pipeline), built on
+-- the first-class Vector type. An embedding STORE is an `Array[Vector]` — one
+-- dense float vector per "document" — and a QUERY is a Vector. The prelude's
+-- `nearest` / `nearest_score` / `similarities` find the most similar stored
+-- embedding by cosine similarity, using only `vec_cosine` and the array
+-- primitives (no special runtime). Identical on `aria run` and `aria native-run`;
+-- `Array[Vector]` is currently outside the wasm subset, so `aria wasm-run` reports
+-- that cleanly.
+--
+-- In a real system the vectors come from an embedding model; here they are
+-- hand-written so the answer is checkable. Three "documents":
+--   doc 0: [1, 0, 0]   ("cat")
+--   doc 1: [0, 1, 0]   ("finance")
+--   doc 2: [0.9, 0.1, 0] ("kitten" — close to doc 0)
+-- A query [1, 0.2, 0] is most similar to doc 2 (highest cosine).
+
+fn store() -> Array[Vector] =
+  array_push(array_push(array_push(array_new(),
+    vec_from_array([1.0, 0.0, 0.0])),
+    vec_from_array([0.0, 1.0, 0.0])),
+    vec_from_array([0.9, 0.1, 0.0]))
+
+fn main() -> Int = {
+  let query = vec_from_array([1.0, 0.2, 0.0]);
+  -- The best match's score, scaled to an Int so it prints as a stable value.
+  print_int(nearest(store(), query));                  -- 2  (the "kitten" doc)
+  print_int(nearest(store(), vec_from_array([0.0, 1.0, 0.0]))); -- 1 (exact "finance")
+  nearest(store(), query)                              -- returns 2
+}
