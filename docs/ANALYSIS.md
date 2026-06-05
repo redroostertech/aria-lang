@@ -128,6 +128,27 @@ separately (they are never counted as "unused user code").
 The JSON is compact (one line), hand-rolled, and reuses `diagnostics::json_escape`
 so it is always valid — pipe it through `python3 -m json.tool` to confirm.
 
+### A TYPED, source-located program model
+
+`aria analyze --json` is the **program model an AI tool / static analyzer
+consumes**. Every function node carries:
+
+- its **declared type signature** (`signature`) — parameter names + types, the
+  return type, and any generic `type_params` / `bounds`, rendered with the same
+  pretty-printer (`typeck::show`) the diagnostics use;
+- **who it calls** (`callees` / `lib_callees`) and **who calls it** (`callers`);
+- **where** each call happens, to the exact `[line, col]` (`call_sites`).
+
+So the result is a typed, source-located call graph: *who calls whom, from which
+line:col, and the type signature of every function* — exactly what a tool needs
+to reason about the code precisely (e.g. "this function takes an `Array[Int]`
+and returns an `Int`; it is called from `main` at line 9:5; it is recursive").
+
+Signatures are **declared types, not inferred**: the analyzer renders what the
+source wrote (it runs after type-checking, so the program is well-formed). Full
+per-call-site *argument* type inference is intentionally out of scope (a bigger
+job); the strong typed model is function signatures + the call structure.
+
 ### JSON schema
 
 ```json
@@ -136,6 +157,12 @@ so it is always valid — pipe it through `python3 -m json.tool` to confirm.
   "functions": [
     {
       "name": "b",
+      "signature": {
+        "type_params": [],
+        "bounds":      [],
+        "params":      [{"name": "n", "type": "Int"}],
+        "ret":         "Int"
+      },
       "line": 2,
       "user": true,
       "callees":     ["c"],
@@ -159,6 +186,7 @@ so it is always valid — pipe it through `python3 -m json.tool` to confirm.
 | --- | --- |
 | `entry` | The program's entry point (`"main"`), or `null` if there is no `main`. |
 | `functions[].name` | Function name. |
+| `functions[].signature` | The function's **declared type signature** (rendered via `typeck::show`): `type_params` (generic params, e.g. `["T"]`, empty if none), `bounds` (trait bounds as `[var, trait]` pairs, e.g. `[["T","Show"]]`, empty if none), `params` (an ordered array of `{"name", "type"}` for each parameter), and `ret` (the return type). A no-param function has `params: []`; a unit return is `"ret": "Unit"`. These are *declared* types read off the source — no inference. |
 | `functions[].line` | 1-based definition line; `0` for compiler-generated functions (trait dispatchers, lowered impl methods). |
 | `functions[].user` | `true` for functions the human/model wrote; `false` for prelude / synthetic (trait) functions. Only `user` functions are eligible to be `unused`. |
 | `functions[].callees` | The set of **user** functions this function calls, sorted and de-duplicated. A top-level function passed by **name** as a value (`array_map(xs, helper)`) counts as a callee (so it is not flagged dead). |
@@ -174,6 +202,10 @@ so it is always valid — pipe it through `python3 -m json.tool` to confirm.
 
 ### How an AI tool / static analyzer uses it
 
+- **Typed reasoning** — `signature` gives the model the *types* each function
+  operates over (params, return, generics + bounds) without re-running the
+  checker: it can verify an edge is type-compatible, suggest a call, or report a
+  signature mismatch precisely.
 - **Impact analysis** — *"what breaks if I change `f`?"* -> `callers` / `fan_in`,
   and the transitive closure of callers.
 - **Dependency understanding** — *"what does `f` rely on?"* -> `callees` +
@@ -189,10 +221,22 @@ so it is always valid — pipe it through `python3 -m json.tool` to confirm.
 ### Human output
 
 Without `--json`, `aria analyze` prints a readable summary: the entry point and
-function count, then per-function `fan_in`/`fan_out`, `recursive`, and the
-`calls` / `uses(lib)` / `called by` lists (library functions tagged
-`[library]`), followed by the `unused`, `unreachable`, and `recursive cycles`
-sections (cycles rendered as `a <-> b (mutual)` or `f (self-recursive)`).
+function count, then per function its **rendered signature** (e.g.
+`fn fib(n: Int) -> Int` or `fn id[T](x: T) -> T`) with its definition line,
+followed by `fan_in`/`fan_out`, `recursive`, and the `calls` / `uses(lib)` /
+`called by` lists (library functions tagged `[library]`), then the `unused`,
+`unreachable`, and `recursive cycles` sections (cycles rendered as
+`a <-> b (mutual)` or `f (self-recursive)`). For example:
+
+```text
+fn fib(n: Int) -> Int  (line 1)
+  fan_in=2 fan_out=1 recursive
+  calls:     fib
+  called by: fib, main
+fn id[T](x: T) -> T  (line 3)
+  fan_in=1 fan_out=0
+  called by: main
+```
 
 ### Scope (honest notes)
 

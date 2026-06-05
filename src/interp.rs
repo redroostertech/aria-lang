@@ -608,6 +608,37 @@ impl Interp {
         with_call_stack(|| self.run_main_capturing())
     }
 
+    /// Like [`run_main_capturing_traced`] but ALSO returns whatever the program
+    /// printed BEFORE it trapped: the second tuple element is the captured stdout
+    /// even on the error path. Used by the agent loop so a program that prints
+    /// some lines and THEN fails can surface those lines (the full picture) in the
+    /// runtime feedback to the model. On success the value + full output are
+    /// returned exactly as [`run_main_capturing_traced`].
+    pub fn run_main_capturing_traced_partial(
+        &self,
+    ) -> (Result<Value, RuntimeError>, String) {
+        let mut captured = String::new();
+        let result = with_call_stack(|| {
+            let (res, out) = self.run_main_capturing_keep_output();
+            // Stash the partial output regardless of outcome, then propagate the
+            // inner `Result<Value, String>` so `with_call_stack` builds the trace.
+            captured = out;
+            res
+        });
+        (result, captured)
+    }
+
+    /// Run `main` with output capture on, returning BOTH `main`'s
+    /// `Result<Value, String>` AND the captured stdout — even on a runtime error,
+    /// so a partial print-then-trap output is preserved. Mirrors
+    /// [`run_main_capturing`] but keeps the buffer on the error path.
+    fn run_main_capturing_keep_output(&self) -> (Result<Value, String>, String) {
+        let prev = OUTPUT_CAPTURE.with(|c| c.borrow_mut().replace(String::new()));
+        let result = self.run_main();
+        let captured = OUTPUT_CAPTURE.with(|c| std::mem::replace(&mut *c.borrow_mut(), prev));
+        (result, captured.unwrap_or_default())
+    }
+
     /// Run `main` with OUTPUT CAPTURE on: every `print_*` builtin appends its
     /// formatted line to a buffer instead of writing to stdout. Returns BOTH
     /// `main`'s value AND the captured stdout `String` (byte-for-byte what a

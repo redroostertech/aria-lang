@@ -486,13 +486,31 @@ pub fn build_feedback(program: &str, diags: &[Diagnostic]) -> String {
 /// program. This closes the loop over runtime failures (write -> check -> RUN ->
 /// fix), not just type errors. The literal phrase "failed at runtime" lets a
 /// mock/test key its corrected response on having received runtime feedback.
-pub fn build_runtime_feedback(program: &str, err: &interp::RuntimeError) -> String {
+///
+/// `output` is whatever the program PRINTED before it trapped (captured `print_*`
+/// output). When non-empty it is surfaced FIRST ("Your program printed: ...")
+/// so the model has the full picture — what the program produced AND where it
+/// then failed — not just the error. A program that printed nothing adds no such
+/// preamble.
+pub fn build_runtime_feedback(
+    program: &str,
+    err: &interp::RuntimeError,
+    output: Option<&str>,
+) -> String {
     // `err.render()` is `runtime error: <msg>` + the indented frames.
-    format!(
-        "Your program type-checks but failed at runtime:\n{}\nHere is the program you wrote:\n{}\nReturn the corrected full Aria program (only the program).",
-        err.render(),
-        program
-    )
+    match output {
+        Some(o) if !o.is_empty() => format!(
+            "Your program type-checks and printed:\n{}\nthen failed at runtime:\n{}\nHere is the program you wrote:\n{}\nReturn the corrected full Aria program (only the program).",
+            o,
+            err.render(),
+            program
+        ),
+        _ => format!(
+            "Your program type-checks but failed at runtime:\n{}\nHere is the program you wrote:\n{}\nReturn the corrected full Aria program (only the program).",
+            err.render(),
+            program
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -602,6 +620,7 @@ pub fn run_loop(
     let mut last_program = String::new();
     let mut last_diags: Vec<Diagnostic> = Vec::new();
     let mut last_runtime_error: Option<String> = None;
+    let mut last_output: Option<String> = None;
     let iters = max_iters.max(1);
 
     for iter in 1..=iters {
@@ -667,18 +686,23 @@ pub fn run_loop(
                         eprintln!("[runtime error] {}", err.render());
                     }
                     last_runtime_error = Some(err.render());
+                    last_output = output.clone();
                     if iter < iters {
-                        let feedback = build_runtime_feedback(&program, &err);
+                        // Include any output the program printed BEFORE it trapped,
+                        // so the model sees the full picture (printed-then-failed).
+                        let feedback =
+                            build_runtime_feedback(&program, &err, output.as_deref());
                         transcript.push(feedback);
                         continue;
                     }
-                    // Last iteration: report the runtime failure.
+                    // Last iteration: report the runtime failure, surfacing any
+                    // output the program printed before it trapped.
                     return AgentOutcome {
                         success: false,
                         program,
                         diagnostics: Vec::new(),
                         result: None,
-                        output: None,
+                        output,
                         runtime_error: Some(err.render()),
                         iterations: iter,
                         transcript,
@@ -706,7 +730,7 @@ pub fn run_loop(
         program: last_program,
         diagnostics: last_diags,
         result: None,
-        output: None,
+        output: last_output,
         runtime_error: last_runtime_error,
         iterations: iters,
         transcript,
@@ -743,6 +767,12 @@ pub fn run_program(program: &str) -> (Option<String>, Option<String>, Option<Str
 /// + stack frames) on a runtime failure, so the loop can both render the trace as
 /// feedback for the model AND inspect the frames. Construction / lex-parse
 /// failures (which carry no Aria call stack) become a frame-less `RuntimeError`.
+///
+/// The captured OUTPUT (second element) is returned on BOTH paths: on success it
+/// is everything the program printed; on a runtime error it is whatever the
+/// program printed BEFORE it trapped (the partial print-then-trap output), so the
+/// loop can include it in the feedback to the model. It is `None` only for a
+/// lex/parse/construction failure (the program never ran).
 pub fn run_program_traced(
     program: &str,
 ) -> (Option<String>, Option<String>, Option<interp::RuntimeError>) {
@@ -755,9 +785,11 @@ pub fn run_program_traced(
         Ok(i) => i,
         Err(e) => return (None, None, Some(no_frames(e))),
     };
-    match interp.run_main_capturing_traced() {
-        Ok((v, out)) => (Some(v.display()), Some(out), None),
-        Err(e) => (None, None, Some(e)),
+    let (result, out) = interp.run_main_capturing_traced_partial();
+    match result {
+        Ok(v) => (Some(v.display()), Some(out), None),
+        // Keep the partial output the program printed before it trapped.
+        Err(e) => (None, Some(out), Some(e)),
     }
 }
 
@@ -1075,6 +1107,97 @@ fn main() -> Int = outer(5)
             "feedback must carry the stack trace: {}",
             outcome.transcript[0]
         );
+    }
+
+    #[test]
+    fn run_program_traced_keeps_output_printed_before_a_trap() {
+        // A program that PRINTS two lines and THEN divides by zero: the captured
+        // output before the trap must survive on the runtime-error path.
+        let src = "\
+fn main() -> Int = {
+  print_int(1);
+  print_int(2);
+  1 / 0
+}
+";
+        let (res, out, err) = run_program_traced(src);
+        assert!(res.is_none());
+        assert!(err.expect("runtime error").message.contains("division by zero"));
+        // The two printed lines are preserved even though the run trapped.
+        assert_eq!(out.as_deref(), Some("1\n2\n"), "partial output before trap");
+    }
+
+    #[test]
+    fn runtime_feedback_includes_printed_output() {
+        // When a program printed before trapping, the feedback surfaces BOTH the
+        // captured output AND the runtime error + trace.
+        let err = interp::RuntimeError {
+            message: "division by zero".to_string(),
+            frames: Vec::new(),
+        };
+        let fb = build_runtime_feedback("fn main() -> Int = 0", &err, Some("1\n2\n"));
+        assert!(fb.contains("printed:\n1\n2\n"), "feedback shows printed output: {}", fb);
+        assert!(fb.contains("then failed at runtime"));
+        assert!(fb.contains("division by zero"));
+        // With NO output, no "printed" preamble — just the runtime error.
+        let fb2 = build_runtime_feedback("fn main() -> Int = 0", &err, None);
+        assert!(!fb2.contains("printed:"), "no output -> no preamble: {}", fb2);
+        assert!(fb2.contains("failed at runtime"));
+        let fb3 = build_runtime_feedback("fn main() -> Int = 0", &err, Some(""));
+        assert!(!fb3.contains("printed:"), "empty output -> no preamble: {}", fb3);
+    }
+
+    #[test]
+    fn loop_feeds_back_printed_output_with_runtime_trace() {
+        // A provider whose first program PRINTS then traps; its corrected program
+        // (returned once it has seen runtime feedback) is clean. The feedback that
+        // drove the fix must carry BOTH the printed lines AND the stack trace.
+        struct PrintThenTrap;
+        impl Provider for PrintThenTrap {
+            fn complete(&self, prompt: &str) -> Result<String, String> {
+                if prompt.contains("failed at runtime") {
+                    Ok("```aria\nfn main() -> Int = { print_int(42); 42 }\n```".to_string())
+                } else {
+                    Ok("```aria\nfn main() -> Int = { print_int(1); print_int(2); 1 / 0 }\n```"
+                        .to_string())
+                }
+            }
+            fn label(&self) -> String {
+                "pt".to_string()
+            }
+        }
+        let outcome = run_loop(&PrintThenTrap, "task", 5, false);
+        assert!(outcome.success, "should reconverge after print-then-trap feedback");
+        assert_eq!(outcome.iterations, 2);
+        // The single feedback message carries the printed output AND the trace.
+        assert_eq!(outcome.transcript.len(), 1);
+        let fb = &outcome.transcript[0];
+        assert!(fb.contains("printed:\n1\n2\n"), "feedback must include printed output: {}", fb);
+        assert!(fb.contains("then failed at runtime"), "got: {}", fb);
+        assert!(fb.contains("division by zero"), "got: {}", fb);
+        assert!(fb.contains("at `main`"), "feedback must carry the stack trace: {}", fb);
+        // The converged program prints 42 and returns 42.
+        assert_eq!(outcome.result.as_deref(), Some("42"));
+        assert_eq!(outcome.output.as_deref(), Some("42\n"));
+    }
+
+    #[test]
+    fn successful_outcome_surfaces_captured_output() {
+        // On a converged run the outcome carries the program's OUTPUT distinct from
+        // main's return value: this program PRINTS "hi" but RETURNS 0.
+        struct PrintsHi;
+        impl Provider for PrintsHi {
+            fn complete(&self, _p: &str) -> Result<String, String> {
+                Ok("```aria\nfn main() -> Int = { print_str(\"hi\"); 0 }\n```".to_string())
+            }
+            fn label(&self) -> String {
+                "hi".to_string()
+            }
+        }
+        let outcome = run_loop(&PrintsHi, "task", 3, false);
+        assert!(outcome.success);
+        assert_eq!(outcome.result.as_deref(), Some("0"), "main returns 0");
+        assert_eq!(outcome.output.as_deref(), Some("hi\n"), "but prints `hi`");
     }
 
     #[test]

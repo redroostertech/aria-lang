@@ -642,6 +642,17 @@ fn run_agent(args: &[String]) -> ExitCode {
             eprintln!("--- best attempt ---");
             eprintln!("{}", outcome.program);
         }
+        // If the program printed something before failing at runtime, surface it
+        // so the failure report shows what it produced (print-then-trap).
+        if let Some(o) = &outcome.output {
+            if !o.is_empty() {
+                eprintln!("--- output (before failure) ---");
+                eprint!("{}", o);
+                if !o.ends_with('\n') {
+                    eprintln!();
+                }
+            }
+        }
         if !outcome.diagnostics.is_empty() {
             eprintln!("--- remaining diagnostics ---");
             eprintln!("{}", diagnostics::array_to_json(&outcome.diagnostics));

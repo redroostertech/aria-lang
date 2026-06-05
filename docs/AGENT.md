@@ -21,15 +21,22 @@
    `aria check --json`. If there are diagnostics, build a feedback message
    embedding the **JSON diagnostics** + the program, append it to the transcript,
    and loop back to step 2.
-5. **Run it** in-process via the interpreter when the check is clean. If the
-   program **type-checks but fails at runtime** (e.g. division by zero), the loop
-   treats it as *not yet converged*: it builds a runtime-error feedback message
-   carrying the error **and the stack trace** (the exact call chain — see
-   [ANALYSIS.md](ANALYSIS.md)), appends it to the transcript, and loops back to
-   step 2. This closes the loop over runtime failures too —
-   **write → check → RUN → fix** — and the trace is exactly the signal the model
-   needs to localize the bug. On a clean check *and* a clean run, report the
-   program, `main`'s result, the captured output, and the iteration count.
+5. **Run it** in-process via the interpreter when the check is clean, **capturing
+   the program's `print_*` output**. If the program **type-checks but fails at
+   runtime** (e.g. division by zero), the loop treats it as *not yet converged*:
+   it builds a runtime-error feedback message carrying the error **and the stack
+   trace** (the exact call chain — see [ANALYSIS.md](ANALYSIS.md)), appends it to
+   the transcript, and loops back to step 2. **If the program printed something
+   before it trapped**, that captured output is included in the feedback too
+   (`Your program type-checks and printed: <output> then failed at runtime:
+   <error> <trace>`), so the model sees the *full picture* — what the program
+   produced *and* where it then failed — not just the error. (A type error
+   produces no output — the program never ran — so that feedback is diagnostics
+   only.) This closes the loop over runtime failures too —
+   **write → check → RUN → fix** — and the trace + partial output are exactly the
+   signal the model needs to localize the bug. On a clean check *and* a clean
+   run, report the program, **the captured OUTPUT (what it printed)**, `main`'s
+   result, and the iteration count.
 6. **Give up gracefully** after `--max-iters` (default 5) without a converging
    run: report the best attempt, its remaining diagnostics *or* the last runtime
    error, and the transcript.
@@ -59,6 +66,31 @@ aria agent [--provider <spec>] [--max-iters N] [--out <file.aria>] [--verbose] "
 The progress, final program, result, and diagnostics are printed to **stderr**
 (so `--out` keeps stdout for the program's own `print_*` output). Exit code is
 `0` on success, `1` on failure, `2` on a usage error.
+
+### Captured output in the report
+
+The loop runs the converged program with its `print_*` output **buffered**, and
+surfaces that captured **OUTPUT** as a first-class part of the report — labelled
+and distinct from `main`'s return value:
+
+```text
+SUCCESS after 2 iteration(s).
+--- final program ---
+fn main() -> Int = { print_int(55); 55 }
+--- output ---
+55
+--- result ---
+55
+```
+
+The `--- output ---` block is what the program **printed** (the program's
+observable behaviour); `--- result ---` is `main`'s **return value**. The two
+are reported separately because a program can print one thing and return another
+(e.g. print `"hi"` but return `0`). The same captured output is also carried in
+the structured `AgentOutcome.output` (distinct from `AgentOutcome.result`), which
+the benchmark grades against. On a **failed** run that nonetheless printed
+something before trapping, the failure report shows it under
+`--- output (before failure) ---`.
 
 ### Offline demo (no model required)
 

@@ -28,15 +28,112 @@
 //! a bare function-name reference as a use). Constructor applications are not part
 //! of the call graph (they are data, not control flow).
 
-use crate::ast::{Expr, ExprKind, Item, Program, Stmt};
+use crate::ast::{Expr, ExprKind, FnDecl, Item, Program, Stmt};
 use crate::diagnostics::json_escape;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+
+/// The declared TYPE SIGNATURE of a function, rendered as clean type strings via
+/// [`crate::typeck::show`]. This is the metadata that turns the call graph into a
+/// TYPED program model: alongside who-calls-whom, every node carries the types it
+/// operates over. Purely declared (no inference): it reads what the source wrote.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Signature {
+    /// Declared generic type parameters, e.g. `["T", "U"]` for `fn id[T,U](..)`.
+    /// Empty for a non-generic function.
+    pub type_params: Vec<String>,
+    /// Trait bounds on the type parameters, e.g. `[("T", "Show")]` for
+    /// `fn p[T: Show](..)`. Empty for an unbounded function.
+    pub bounds: Vec<(String, String)>,
+    /// Each parameter's name and its declared type (rendered), in source order.
+    pub params: Vec<(String, String)>,
+    /// The declared return type (rendered), e.g. `"Int"` or `"(Int, Bool)"`.
+    pub ret: String,
+}
+
+impl Signature {
+    /// Render `f`'s declared signature into clean type strings (no inference).
+    fn of(f: &FnDecl) -> Signature {
+        Signature {
+            type_params: f.type_params.clone(),
+            bounds: f.bounds.clone(),
+            params: f
+                .params
+                .iter()
+                .map(|p| (p.name.clone(), crate::typeck::show(&p.ty)))
+                .collect(),
+            ret: crate::typeck::show(&f.ret),
+        }
+    }
+
+    /// Render this signature in Aria surface syntax, e.g.
+    /// `fn id[T](x: T) -> T` or `fn add(a: Int, b: Int) -> Int`. Used by the
+    /// human summary so each node shows its types inline.
+    pub fn render(&self, name: &str) -> String {
+        let mut s = String::from("fn ");
+        s.push_str(name);
+        if !self.type_params.is_empty() {
+            // Attach any bound to its parameter, e.g. `[T: Show, U]`.
+            let parts: Vec<String> = self
+                .type_params
+                .iter()
+                .map(|tp| match self.bounds.iter().find(|(v, _)| v == tp) {
+                    Some((_, tr)) => format!("{}: {}", tp, tr),
+                    None => tp.clone(),
+                })
+                .collect();
+            s.push('[');
+            s.push_str(&parts.join(", "));
+            s.push(']');
+        }
+        let ps: Vec<String> =
+            self.params.iter().map(|(n, t)| format!("{}: {}", n, t)).collect();
+        s.push('(');
+        s.push_str(&ps.join(", "));
+        s.push(')');
+        s.push_str(" -> ");
+        s.push_str(&self.ret);
+        s
+    }
+
+    /// JSON-encode this signature as a stable object:
+    /// `{"type_params":[..],"bounds":[["T","Show"]],"params":[{"name":..,"type":..}],"ret":".."}`.
+    fn to_json(&self) -> String {
+        let mut s = String::from("{\"type_params\":");
+        s.push_str(&str_array_json(&self.type_params));
+        s.push_str(",\"bounds\":[");
+        for (i, (v, tr)) in self.bounds.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str(&format!("[\"{}\",\"{}\"]", json_escape(v), json_escape(tr)));
+        }
+        s.push_str("],\"params\":[");
+        for (i, (n, t)) in self.params.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str(&format!(
+                "{{\"name\":\"{}\",\"type\":\"{}\"}}",
+                json_escape(n),
+                json_escape(t)
+            ));
+        }
+        s.push_str("],\"ret\":");
+        s.push_str(&format!("\"{}\"", json_escape(&self.ret)));
+        s.push('}');
+        s
+    }
+}
 
 /// Per-function call-graph facts.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FnInfo {
     /// Function name.
     pub name: String,
+    /// The declared TYPE SIGNATURE (params + types, return type, generics +
+    /// bounds), rendered via [`crate::typeck::show`]. This is what makes the call
+    /// graph a TYPED program model: each node carries the types it works over.
+    pub signature: Signature,
     /// 1-based source line of the definition (`fn` keyword); 0 for
     /// compiler-generated functions (trait dispatchers / lowered impl methods).
     pub line: usize,
@@ -95,6 +192,7 @@ pub fn analyze(program: &Program, prelude_names: &HashSet<String>) -> CallGraph 
     // their decls, so a call to one is a graph node and a call to anything else
     // is a builtin.
     let mut decls: BTreeMap<String, (usize, bool)> = BTreeMap::new(); // name -> (line, user)
+    let mut sigs: BTreeMap<String, Signature> = BTreeMap::new(); // name -> declared signature
     let mut order: Vec<String> = Vec::new();
     let builtin: HashSet<&str> = crate::builtins::names().into_iter().collect();
 
@@ -113,6 +211,7 @@ pub fn analyze(program: &Program, prelude_names: &HashSet<String>) -> CallGraph 
                 order.push(f.name.clone());
             }
             decls.insert(f.name.clone(), (f.line, user));
+            sigs.insert(f.name.clone(), Signature::of(f));
         }
     }
 
@@ -186,6 +285,12 @@ pub fn analyze(program: &Program, prelude_names: &HashSet<String>) -> CallGraph 
             .collect();
         functions.push(FnInfo {
             name: name.clone(),
+            signature: sigs.get(name).cloned().unwrap_or(Signature {
+                type_params: Vec::new(),
+                bounds: Vec::new(),
+                params: Vec::new(),
+                ret: String::new(),
+            }),
             line,
             user,
             fan_out: user_callees.len(),
@@ -504,9 +609,13 @@ impl CallGraph {
     /// {
     ///   "entry": "main" | null,
     ///   "functions": [
-    ///     { "name": "...", "line": N, "user": true,
+    ///     { "name": "...",
+    ///       "signature": { "type_params": ["T"], "bounds": [["T","Show"]],
+    ///                      "params": [{"name":"x","type":"T"}], "ret": "T" },
+    ///       "line": N, "user": true,
     ///       "callees": ["..."], "lib_callees": ["..."], "callers": ["..."],
-    ///       "recursive": false, "fan_in": N, "fan_out": N }
+    ///       "recursive": false, "fan_in": N, "fan_out": N,
+    ///       "call_sites": {"callee": [[line, col]]} }
     ///   ],
     ///   "unused":      ["..."],   // user fns with no callers, not main (dead code)
     ///   "unreachable": ["..."],   // user fns not reachable from main
@@ -528,8 +637,9 @@ impl CallGraph {
                 s.push(',');
             }
             s.push_str(&format!(
-                "{{\"name\":\"{}\",\"line\":{},\"user\":{},\"callees\":{},\"lib_callees\":{},\"callers\":{},\"recursive\":{},\"fan_in\":{},\"fan_out\":{},\"call_sites\":{}}}",
+                "{{\"name\":\"{}\",\"signature\":{},\"line\":{},\"user\":{},\"callees\":{},\"lib_callees\":{},\"callers\":{},\"recursive\":{},\"fan_in\":{},\"fan_out\":{},\"call_sites\":{}}}",
                 json_escape(&f.name),
+                f.signature.to_json(),
                 f.line,
                 f.user,
                 str_array_json(&f.callees),
@@ -572,7 +682,7 @@ impl CallGraph {
             } else {
                 format!("line {}", f.line)
             };
-            s.push_str(&format!("{} ({}){}\n", f.name, line, kind));
+            s.push_str(&format!("{}  ({}){}\n", f.signature.render(&f.name), line, kind));
             s.push_str(&format!(
                 "  fan_in={} fan_out={}{}\n",
                 f.fan_in,
@@ -839,6 +949,101 @@ fn main() -> Int = helper(1) + helper(2)
             "local var `x` must not be a call site: {:?}",
             h.call_sites
         );
+    }
+
+    // ---- typed call graph: declared signatures ------------------------
+
+    #[test]
+    fn signature_renders_generic_multi_arg_recursive_and_unit() {
+        let src = "\
+fn id[T](x: T) -> T = x
+fn fib(n: Int) -> Int = if n < 2 { n } else { fib(n - 1) + fib(n - 2) }
+fn add(a: Int, b: Int) -> Int = a + b
+fn noop() -> Unit = ()
+fn main() -> Int = { let z = noop(); add(id(fib(5)), 0) }
+";
+        let g = graph_of(src);
+        // Generic single-param identity: type_params=[T], param x: T, ret T.
+        let id = info(&g, "id");
+        assert_eq!(id.signature.type_params, vec!["T".to_string()]);
+        assert_eq!(id.signature.params, vec![("x".to_string(), "T".to_string())]);
+        assert_eq!(id.signature.ret, "T");
+        assert_eq!(id.signature.render("id"), "fn id[T](x: T) -> T");
+        // Recursive Int->Int.
+        let fib = info(&g, "fib");
+        assert_eq!(fib.signature.render("fib"), "fn fib(n: Int) -> Int");
+        assert!(fib.recursive);
+        // Multi-arg.
+        let add = info(&g, "add");
+        assert_eq!(add.signature.render("add"), "fn add(a: Int, b: Int) -> Int");
+        // No-param, Unit return.
+        let noop = info(&g, "noop");
+        assert!(noop.signature.params.is_empty());
+        assert_eq!(noop.signature.ret, "Unit");
+        assert_eq!(noop.signature.render("noop"), "fn noop() -> Unit");
+    }
+
+    #[test]
+    fn signature_renders_bounds() {
+        let src = "\
+interface Show[T] { fn show(self: T) -> String }
+type Color = | Red
+impl Show for Color { fn show(self: Color) -> String = \"red\" }
+fn label[T: Show](x: T) -> String = show(x)
+fn main() -> Int = { let z = label(Red); 0 }
+";
+        let g = graph_of(src);
+        let lbl = info(&g, "label");
+        assert_eq!(lbl.signature.type_params, vec!["T".to_string()]);
+        assert_eq!(lbl.signature.bounds, vec![("T".to_string(), "Show".to_string())]);
+        // The bound attaches to its type param in the rendered form.
+        assert_eq!(lbl.signature.render("label"), "fn label[T: Show](x: T) -> String");
+    }
+
+    #[test]
+    fn json_carries_signatures_and_is_well_formed() {
+        let src = "\
+fn id[T](x: T) -> T = x
+fn fib(n: Int) -> Int = if n < 2 { n } else { fib(n - 1) + fib(n - 2) }
+fn even(n: Int) -> Bool = if n == 0 { true } else { odd(n - 1) }
+fn odd(n: Int) -> Bool = if n == 0 { false } else { even(n - 1) }
+fn add(a: Int, b: Int) -> Int = a + b
+fn dead() -> Int = 0
+fn main() -> Int = { let z = even(id(fib(add(1, 2)))); 0 }
+";
+        let g = graph_of(src);
+        let json = g.to_json();
+        // Each function carries a `signature` object.
+        assert!(json.contains("\"signature\":{\"type_params\":"));
+        // The generic id renders its type param + param type + ret.
+        assert!(json.contains("\"name\":\"id\",\"signature\":{\"type_params\":[\"T\"],\"bounds\":[],\"params\":[{\"name\":\"x\",\"type\":\"T\"}],\"ret\":\"T\"}"), "got {}", json);
+        // The multi-arg add.
+        assert!(json.contains("\"params\":[{\"name\":\"a\",\"type\":\"Int\"},{\"name\":\"b\",\"type\":\"Int\"}]"));
+        // Bool return on even/odd.
+        assert!(json.contains("\"ret\":\"Bool\""));
+        // Structure preserved alongside the new signatures: mutual + self cycles,
+        // and dead code. (fib is self-recursive; even<->odd is a mutual cycle.)
+        assert!(json.contains("\"cycles\":[[\"even\",\"odd\"],[\"fib\"]]"), "got {}", json);
+        assert!(json.contains("\"unused\":[\"dead\"]"));
+        // Balanced braces (well-formedness spot-check; full check is python json.tool).
+        let open = json.chars().filter(|&c| c == '{').count();
+        let close = json.chars().filter(|&c| c == '}').count();
+        assert_eq!(open, close, "balanced braces in {}", json);
+        let ob = json.chars().filter(|&c| c == '[').count();
+        let cb = json.chars().filter(|&c| c == ']').count();
+        assert_eq!(ob, cb, "balanced brackets in {}", json);
+    }
+
+    #[test]
+    fn human_summary_shows_signatures() {
+        let src = "\
+fn fib(n: Int) -> Int = if n < 2 { n } else { fib(n - 1) + fib(n - 2) }
+fn main() -> Int = fib(5)
+";
+        let g = graph_of(src);
+        let h = g.to_human();
+        assert!(h.contains("fn fib(n: Int) -> Int"), "human summary should show signatures:\n{}", h);
+        assert!(h.contains("fn main() -> Int"));
     }
 
     #[test]
