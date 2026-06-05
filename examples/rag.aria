@@ -3,9 +3,9 @@
 -- dense float vector per "document" — and a QUERY is a Vector. The prelude's
 -- `nearest` / `nearest_score` / `similarities` find the most similar stored
 -- embedding by cosine similarity, using only `vec_cosine` and the array
--- primitives (no special runtime). Identical on `aria run` and `aria native-run`;
--- `Array[Vector]` is currently outside the wasm subset, so `aria wasm-run` reports
--- that cleanly.
+-- primitives (no special runtime). Identical on `aria run`, `aria native-run`,
+-- AND `aria wasm-run` — `Array[Vector]` is now inside the wasm subset, so the
+-- whole embedding search runs in the browser/wasm target, garbage-free (__live=0).
 --
 -- In a real system the vectors come from an embedding model; here they are
 -- hand-written so the answer is checkable. Three "documents":

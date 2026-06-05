@@ -68,23 +68,40 @@ enum ElemKind {
     Float, // Float — f64 bits reinterpreted into an i64 slot
     Str,   // heap String object (ref counted, recursive drop)
     Ref,   // boxed heap value: ADT cell / closure (recursive drop)
+    Bytes, // heap Bytes buffer (an Array(Int) heap object): dup via __dup_array,
+           // drop via __drop_array. Tagged `b`, code 4 (aligned with native).
+    Vector, // heap dense-f64 Vector / embedding buffer: dup via __dup_vec, drop via
+            // __drop_vec. Tagged `v`, code 9 (aligned with native `ElemKind::Vector`).
 }
 
 impl ElemKind {
     /// Parse the monomorphizer's one-char element-kind suffix. The wasm backend
-    /// collapses every BOXED heap element to the single `Ref` kind, so the native
-    /// backend's finer-grained heap tags — `a` (nested Array), `b` (Bytes), `m`
-    /// (Map), `e` (Set), `v` (Vector) — all parse here as `Ref`. Nested arrays are
-    /// the only heap-element arrays wasm actually supports (Bytes/Vector/Map/Set
-    /// are rejected earlier at the type level); routing them through `Ref`
-    /// preserves wasm's pre-existing behavior.
+    /// now gives the FLAT tagged heap elements their own kinds — `b` (Bytes) and
+    /// `v` (Vector) — so their per-element dup/drop routes through the correct
+    /// heap-object runtime (mirroring the native `ElemKind`). The remaining
+    /// container heap tags — `a` (nested Array), `m` (Map), `e` (Set) — are not yet
+    /// supported as array elements in the wasm subset; they are rejected cleanly at
+    /// the type level (`WType::from_ty`), so they should not reach a suffixed
+    /// builtin. Parsing them as `Ref` here would silently drop them with the wrong
+    /// heap-object kind, so they are rejected with a clean `Err` instead.
     fn from_tag(c: char) -> Result<ElemKind, String> {
         match c {
             'i' => Ok(ElemKind::Int),
             'o' => Ok(ElemKind::Bool),
             'f' => Ok(ElemKind::Float),
             's' => Ok(ElemKind::Str),
-            'r' | 'a' | 'b' | 'm' | 'e' | 'v' => Ok(ElemKind::Ref),
+            'r' => Ok(ElemKind::Ref),
+            'b' => Ok(ElemKind::Bytes),
+            'v' => Ok(ElemKind::Vector),
+            'a' => Err(
+                "wasm backend: nested Array[Array[..]] is outside the wasm subset".into(),
+            ),
+            'm' => Err(
+                "wasm backend: Array[Map] is outside the wasm subset".into(),
+            ),
+            'e' => Err(
+                "wasm backend: Array[Set] is outside the wasm subset".into(),
+            ),
             other => Err(format!("wasm backend: bad array element-kind tag `{}`", other)),
         }
     }
@@ -97,7 +114,9 @@ impl ElemKind {
             ElemKind::Float => 1,
             ElemKind::Str => 2,
             ElemKind::Ref => 3,
+            ElemKind::Bytes => 4,
             ElemKind::Bool => 8,
+            ElemKind::Vector => 9,
         }
     }
 
@@ -109,6 +128,8 @@ impl ElemKind {
             ElemKind::Float => WType::F64,
             ElemKind::Str => WType::Str,
             ElemKind::Ref => WType::Ref,
+            ElemKind::Bytes => WType::Bytes,
+            ElemKind::Vector => WType::Vector,
         }
     }
 
@@ -120,8 +141,14 @@ impl ElemKind {
             WType::I32 => ElemKind::Bool,
             WType::F64 => ElemKind::Float,
             WType::Str => ElemKind::Str,
-            WType::Ref | WType::Array(_) | WType::Tensor | WType::Bytes | WType::Vector
-            | WType::Map(..) | WType::Set(_) => ElemKind::Ref,
+            WType::Bytes => ElemKind::Bytes,
+            WType::Vector => ElemKind::Vector,
+            // Nested Array / Map / Set elements are not in the wasm subset (rejected
+            // at the type level); should they reach here, route through `Ref` so the
+            // dispatch never panics (the type gate prevents reaching it in practice).
+            WType::Ref | WType::Array(_) | WType::Tensor | WType::Map(..) | WType::Set(_) => {
+                ElemKind::Ref
+            }
             WType::F32 => ElemKind::Float,
         }
     }
@@ -144,6 +171,26 @@ fn parse_array_builtin(name: &str) -> Option<(&'static str, ElemKind)> {
         _ => return None,
     };
     Some((base, kind))
+}
+
+/// If `name` is an array builtin (`array_*$X`) whose element tag is a known-but-
+/// UNSUPPORTED heap kind (nested Array `a`, Map `m`, Set `e`), return its precise
+/// "outside the wasm subset" gate message so the user sees WHY it was rejected
+/// (rather than a generic "unknown fn"). `None` for any other name. Never panics.
+fn array_builtin_gate_error(name: &str) -> Option<String> {
+    let (base, tag) = name.rsplit_once('$')?;
+    if !matches!(
+        base,
+        "array_new" | "array_lit" | "array_len" | "array_get" | "array_set" | "array_push"
+    ) {
+        return None;
+    }
+    // A supported tag parses Ok -> not gated here. An unsupported heap tag (a/m/e)
+    // produces our targeted gate message via `from_tag`'s Err.
+    match ElemKind::from_tag(tag.chars().next()?) {
+        Ok(_) => None,
+        Err(msg) => Some(msg),
+    }
 }
 
 /// A wasm-level value type. On the operand stack we keep `Int` as i64, `Bool`
@@ -204,21 +251,30 @@ impl WType {
             // the generic named-ADT case so it gets its own heap object kind.
             Ty::Named(n, args) if n == "Array" && args.len() == 1 => {
                 let elem = WType::from_ty(&args[0])?;
-                // A nested Array element ($r) would be dropped via the ADT `__drop`
-                // (wrong heap-object kind -> leak/corruption). Reject cleanly; the
-                // kind-aware Array drop only recurses through Str/ADT elements.
+                // SUPPORTED array element kinds: Int/Bool/Float/Str/Ref and the two
+                // FLAT tagged heap buffers Bytes (`b`) and Vector (`v`). Each routes
+                // its per-element dup/drop through the correct heap-object runtime
+                // (Bytes -> __dup_array/__drop_array, Vector -> __dup_vec/__drop_vec),
+                // mirroring the native backend's `aria_slot_dup`/`aria_slot_drop`.
+                //
+                // STILL GATED (clean Err, never a panic / silent wrong result):
+                // nested Array[Array[..]], Array[Map], Array[Set] — these container
+                // heap elements are not yet threaded through the wasm element-dup/drop
+                // dispatch, so they remain outside the wasm subset (the interpreter
+                // and native backend support them).
                 if matches!(elem, WType::Array(_)) {
                     return Err(
                         "wasm backend: nested Array[Array[..]] is outside the wasm subset".into(),
                     );
                 }
-                // A Vector element would be dropped via the generic ADT `__drop`
-                // (wrong heap-object kind), so `Array[Vector]` stays out of the
-                // wasm subset (matching the interpreter/native, where it is also
-                // unchanged here). Reject cleanly.
-                if matches!(elem, WType::Vector) {
+                if matches!(elem, WType::Map(..)) {
                     return Err(
-                        "wasm backend: Array[Vector] is outside the wasm subset".into(),
+                        "wasm backend: Array[Map] is outside the wasm subset".into(),
+                    );
+                }
+                if matches!(elem, WType::Set(_)) {
+                    return Err(
+                        "wasm backend: Array[Set] is outside the wasm subset".into(),
                     );
                 }
                 Ok(WType::Array(ElemKind::from_wtype(elem)))
@@ -698,7 +754,7 @@ impl SlotKind {
             SlotKind::Bool => ElemKind::Bool,
             SlotKind::Float => ElemKind::Float,
             SlotKind::Str => ElemKind::Str,
-            SlotKind::Bytes => ElemKind::Ref, // a Bytes element is a heap ptr (Ref drop)
+            SlotKind::Bytes => ElemKind::Bytes, // a Bytes element: __dup_array/__drop_array
         }
     }
 }
@@ -1421,6 +1477,9 @@ fn bind_type(bind: &Bind, env: &LocalEnv) -> Result<WType, String> {
             if let Some(ret) = vec_builtin_ret(name) {
                 return Ok(ret);
             }
+            if let Some(msg) = array_builtin_gate_error(name) {
+                return Err(msg);
+            }
             let sig = env
                 .sigs
                 .get(name)
@@ -1845,6 +1904,9 @@ fn emit_bind(bind: &Bind, env: &mut LocalEnv, code: &mut Vec<u8>) -> Result<WTyp
             }
             if is_vec_builtin(name) {
                 return emit_vec_builtin(name, args, env, code);
+            }
+            if let Some(msg) = array_builtin_gate_error(name) {
+                return Err(msg);
             }
             let sig_ret;
             let sig_params;
@@ -2892,6 +2954,8 @@ fn encode_array_elem(kind: ElemKind, got: WType, code: &mut Vec<u8>) -> Result<(
         ElemKind::Bool => got == WType::I32,
         ElemKind::Float => got == WType::F64,
         ElemKind::Str => got == WType::Str,
+        ElemKind::Bytes => got == WType::Bytes,
+        ElemKind::Vector => got == WType::Vector,
         ElemKind::Ref => matches!(got, WType::Ref | WType::Tensor),
     };
     if !ok {
@@ -2905,7 +2969,8 @@ fn encode_array_elem(kind: ElemKind, got: WType, code: &mut Vec<u8>) -> Result<(
         // Bool (i32 0/1) widens into the i64 slot.
         ElemKind::Bool => code.push(0xAD), // i64.extend_i32_u
         ElemKind::Float => code.push(0xBD), // i64.reinterpret_f64
-        ElemKind::Str | ElemKind::Ref => code.push(0xAD), // i64.extend_i32_u (ptr)
+        // Every heap-pointer element (i32 address) widens into the i64 slot.
+        ElemKind::Str | ElemKind::Ref | ElemKind::Bytes | ElemKind::Vector => code.push(0xAD),
     }
     Ok(())
 }
@@ -2918,7 +2983,8 @@ fn decode_array_elem(kind: ElemKind, code: &mut Vec<u8>) {
         // Bool narrows the i64 slot (0/1) back to an i32 Bool.
         ElemKind::Bool => code.push(0xA7),   // i32.wrap_i64
         ElemKind::Float => code.push(0xBF),  // f64.reinterpret_i64
-        ElemKind::Str | ElemKind::Ref => code.push(0xA7), // i32.wrap_i64 (ptr)
+        // Heap-pointer elements narrow the i64 slot back to an i32 address.
+        ElemKind::Str | ElemKind::Ref | ElemKind::Bytes | ElemKind::Vector => code.push(0xA7),
     }
 }
 
@@ -4165,6 +4231,20 @@ fn emit_heap_helper(
     let dup_idx = heap_base + HeapHelper::Dup.offset();
     let alloc_vec_idx = heap_base + HeapHelper::AllocVec.offset();
     let drop_vec_idx = heap_base + HeapHelper::DropVec.offset();
+    let dup_vec_idx = heap_base + HeapHelper::DupVec.offset();
+    let dup_array_idx = heap_base + HeapHelper::DupArray.offset();
+    // Bundle of the per-array-element heap dup/drop helper indices, threaded into
+    // the kind-aware element dup/drop dispatch (codes 2=Str, 3=Ref, 4=Bytes, 9=Vector).
+    let elem_rt = ElemRt {
+        dup_str_idx,
+        drop_str_idx,
+        dup_idx,
+        drop_idx,
+        dup_array_idx,
+        drop_array_idx,
+        dup_vec_idx,
+        drop_vec_idx,
+    };
     let array_push_idx = heap_base + HeapHelper::ArrayPush.offset();
     let int_to_str_idx = heap_base + HeapHelper::IntToStr.offset();
     // Map/Set helper indices.
@@ -6709,18 +6789,22 @@ fn emit_heap_helper(
             body.push(I32_WRAP_I64);
             body.push(LOCAL_SET);
             leb_u(3, &mut body); // n
-            // if kind == 2 || kind == 3: loop drop each element
-            body.push(LOCAL_GET);
-            leb_u(2, &mut body);
-            body.push(I64_CONST);
-            leb_s(2, &mut body);
-            body.push(0x51); // i64.eq
-            body.push(LOCAL_GET);
-            leb_u(2, &mut body);
-            body.push(I64_CONST);
-            leb_s(3, &mut body);
-            body.push(0x51); // i64.eq
-            body.push(0x72); // i32.or
+            // if kind is a heap kind (2 Str / 3 Ref / 4 Bytes / 9 Vector): loop and
+            // kind-aware drop each element. Guard = OR of the four equality tests.
+            {
+                let mut first = true;
+                for code in [2i64, 3, 4, 9] {
+                    body.push(LOCAL_GET);
+                    leb_u(2, &mut body);
+                    body.push(I64_CONST);
+                    leb_s(code, &mut body);
+                    body.push(0x51); // i64.eq
+                    if !first {
+                        body.push(0x72); // i32.or
+                    }
+                    first = false;
+                }
+            }
             body.push(IF);
             body.push(BT_VOID);
             // i = 0
@@ -6753,27 +6837,17 @@ fn emit_heap_helper(
             i64_load(0, &mut body);
             body.push(I32_WRAP_I64);
             body.push(LOCAL_SET);
-            leb_u(6, &mut body); // slot ptr
-            // if kind==2 __drop_str(slot) else __drop(slot)
-            body.push(LOCAL_GET);
-            leb_u(2, &mut body);
-            body.push(I64_CONST);
-            leb_s(2, &mut body);
-            body.push(I64_EQ);
-            body.push(IF);
-            body.push(BT_VOID);
-            body.push(LOCAL_GET);
-            leb_u(6, &mut body);
-            body.push(CALL);
-            leb_u(drop_str_idx as u64, &mut body);
-            body.push(DROP);
-            body.push(ELSE);
-            body.push(LOCAL_GET);
-            leb_u(6, &mut body);
-            body.push(CALL);
-            leb_u(drop_idx as u64, &mut body);
-            body.push(DROP);
-            body.push(END);
+            leb_u(6, &mut body); // slot ptr (i32, already loaded)
+            // kind-aware drop the element pointer in local 6 over codes 2/3/4/9.
+            {
+                let push_slot6: &dyn Fn(&mut Vec<u8>) = &|b: &mut Vec<u8>| {
+                    b.push(LOCAL_GET);
+                    leb_u(6, b);
+                };
+                for (code, _, drop_h) in elem_rt.heap_kinds() {
+                    emit_elem_kind_if(&mut body, 2, code, drop_h, push_slot6);
+                }
+            }
             // i++
             body.push(LOCAL_GET);
             leb_u(4, &mut body);
@@ -6884,35 +6958,9 @@ fn emit_heap_helper(
             i64_load(24, &mut body);
             body.push(LOCAL_SET);
             leb_u(3, &mut body); // kind
-            // dup elem if kind==2 (__dup_str) / kind==3 (__dup)
-            body.push(LOCAL_GET);
-            leb_u(3, &mut body);
-            body.push(I64_CONST);
-            leb_s(2, &mut body);
-            body.push(I64_EQ);
-            body.push(IF);
-            body.push(BT_VOID);
-            body.push(LOCAL_GET);
-            leb_u(2, &mut body);
-            body.push(I32_WRAP_I64);
-            body.push(CALL);
-            leb_u(dup_str_idx as u64, &mut body);
-            body.push(DROP);
-            body.push(END);
-            body.push(LOCAL_GET);
-            leb_u(3, &mut body);
-            body.push(I64_CONST);
-            leb_s(3, &mut body);
-            body.push(I64_EQ);
-            body.push(IF);
-            body.push(BT_VOID);
-            body.push(LOCAL_GET);
-            leb_u(2, &mut body);
-            body.push(I32_WRAP_I64);
-            body.push(CALL);
-            leb_u(dup_idx as u64, &mut body);
-            body.push(DROP);
-            body.push(END);
+            // dup the retrieved element kind-aware over codes 2/3/4/9 (kind in
+            // local 3 i64, slot heap ptr in local 2 i64).
+            array_dup_slot(&mut body, 3, 2, elem_rt);
             // __drop_array(ptr)
             body.push(LOCAL_GET);
             leb_u(0, &mut body);
@@ -6979,7 +7027,7 @@ fn emit_heap_helper(
             body.push(LOCAL_SET);
             leb_u(5, &mut body); // elemaddr
             // drop displaced elem kind-aware
-            array_drop_elem(&mut body, 3, 5, dup_str_idx, drop_str_idx, drop_idx, dup_idx, true);
+            array_drop_elem(&mut body, 3, 5, elem_rt);
             // [elemaddr] = x
             body.push(LOCAL_GET);
             leb_u(5, &mut body);
@@ -7078,7 +7126,7 @@ fn emit_heap_helper(
             body.push(0x52); // i64.ne
             body.push(IF);
             body.push(BT_VOID);
-            array_dup_slot(&mut body, 3, 8, dup_str_idx, dup_idx);
+            array_dup_slot(&mut body, 3, 8, elem_rt);
             body.push(END);
             // j++
             body.push(LOCAL_GET);
@@ -7248,7 +7296,7 @@ fn emit_heap_helper(
             body.push(I64_EXTEND_I32_U);
             i64_store(8, &mut body);
             // copy + dup each retained element (j=0..len)
-            array_copy_dup_loop(&mut body, 0, 5, 3, 7, 8, 2, dup_str_idx, dup_idx);
+            array_copy_dup_loop(&mut body, 0, 5, 3, 7, 8, 2, elem_rt);
             // np.elems[len] = x; np.len = len+1
             array_store_at(&mut body, 5, 3, 1);
             array_bump_len(&mut body, 5, 3);
@@ -11645,100 +11693,91 @@ fn emit_utf8_classify(body: &mut Vec<u8>, c_local: u32, need_local: u32, lo_loca
     body.push(0x0B); // end (ASCII vs non-ASCII)
 }
 
-/// Emit code to dup the element slot at `slot_local` (an i64 holding the slot)
-/// kind-aware: kind==2 -> `__dup_str`, kind==3 -> `__dup`. `kind_local` is an
-/// i64 local holding the array's element-kind code.
-fn array_dup_slot(
+/// The per-array-element heap dup/drop helper indices, threaded into the
+/// kind-aware element dup/drop dispatch. An array element's `kind` code selects
+/// the right heap-object runtime (mirroring native's `aria_slot_dup`/
+/// `aria_slot_drop`):
+///   * 2 (Str)    -> `__dup_str` / `__drop_str`
+///   * 3 (Ref)    -> `__dup` / `__drop` (ADT cell / closure)
+///   * 4 (Bytes)  -> `__dup_array` / `__drop_array` (a Bytes is an Array(Int) obj)
+///   * 9 (Vector) -> `__dup_vec` / `__drop_vec` (dense f64 buffer)
+/// Int/Float/Bool elements are inline (no heap ptr) and dispatch to nothing.
+#[derive(Clone, Copy)]
+struct ElemRt {
+    dup_str_idx: u32,
+    drop_str_idx: u32,
+    dup_idx: u32,
+    drop_idx: u32,
+    dup_array_idx: u32,
+    drop_array_idx: u32,
+    dup_vec_idx: u32,
+    drop_vec_idx: u32,
+}
+
+impl ElemRt {
+    /// `[(code, dup_idx, drop_idx)]` for every heap element kind, in code order.
+    fn heap_kinds(self) -> [(i64, u32, u32); 4] {
+        [
+            (2, self.dup_str_idx, self.drop_str_idx),
+            (3, self.dup_idx, self.drop_idx),
+            (4, self.dup_array_idx, self.drop_array_idx),
+            (9, self.dup_vec_idx, self.drop_vec_idx),
+        ]
+    }
+}
+
+/// Emit `if kind_local (i64) == code { <push the i32 heap ptr> ; call helper_idx ;
+/// drop result }`. `push_ptr` leaves the i32 element pointer on the stack.
+fn emit_elem_kind_if(
     body: &mut Vec<u8>,
     kind_local: u32,
-    slot_local: u32,
-    dup_str_idx: u32,
-    dup_idx: u32,
+    code: i64,
+    helper_idx: u32,
+    push_ptr: &dyn Fn(&mut Vec<u8>),
 ) {
-    // if kind==2 __dup_str(slot)
-    body.push(0x20);
+    body.push(0x20); // local.get kind
     leb_u(kind_local as u64, body);
-    body.push(0x42);
-    leb_s(2, body);
+    body.push(0x42); // i64.const code
+    leb_s(code, body);
     body.push(0x51); // i64.eq
-    body.push(0x04);
+    body.push(0x04); // if
     body.push(0x40);
-    body.push(0x20);
-    leb_u(slot_local as u64, body);
-    body.push(0xA7); // i32.wrap_i64
-    body.push(0x10);
-    leb_u(dup_str_idx as u64, body);
-    body.push(0x1A);
-    body.push(0x0B);
-    // if kind==3 __dup(slot)
-    body.push(0x20);
-    leb_u(kind_local as u64, body);
-    body.push(0x42);
-    leb_s(3, body);
-    body.push(0x51);
-    body.push(0x04);
-    body.push(0x40);
-    body.push(0x20);
-    leb_u(slot_local as u64, body);
-    body.push(0xA7);
-    body.push(0x10);
-    leb_u(dup_idx as u64, body);
-    body.push(0x1A);
-    body.push(0x0B);
+    push_ptr(body);
+    body.push(0x10); // call helper
+    leb_u(helper_idx as u64, body);
+    body.push(0x1A); // drop result
+    body.push(0x0B); // end if
+}
+
+/// Emit code to DUP the element slot at `slot_local` (an i64 holding the slot)
+/// kind-aware over codes 2/3/4/9. `kind_local` is an i64 local holding the
+/// array's element-kind code.
+fn array_dup_slot(body: &mut Vec<u8>, kind_local: u32, slot_local: u32, rt: ElemRt) {
+    let push_slot: &dyn Fn(&mut Vec<u8>) = &|b: &mut Vec<u8>| {
+        b.push(0x20); // local.get slot
+        leb_u(slot_local as u64, b);
+        b.push(0xA7); // i32.wrap_i64
+    };
+    for (code, dup_idx, _) in rt.heap_kinds() {
+        emit_elem_kind_if(body, kind_local, code, dup_idx, push_slot);
+    }
 }
 
 /// Emit code to kind-aware DROP the element currently stored at the address held
 /// in `addr_local` (the displaced element in an in-place set). `kind_local` is an
-/// i64 local with the element-kind code. `_with_load` is always true here; the
-/// element pointer is loaded from `[addr_local]`. Uses a scratch by re-loading.
-#[allow(clippy::too_many_arguments)]
-fn array_drop_elem(
-    body: &mut Vec<u8>,
-    kind_local: u32,
-    addr_local: u32,
-    _dup_str_idx: u32,
-    drop_str_idx: u32,
-    drop_idx: u32,
-    _dup_idx: u32,
-    _with_load: bool,
-) {
-    // if kind==2 __drop_str([addr]) ; if kind==3 __drop([addr])
-    // kind==2
-    body.push(0x20);
-    leb_u(kind_local as u64, body);
-    body.push(0x42);
-    leb_s(2, body);
-    body.push(0x51);
-    body.push(0x04);
-    body.push(0x40);
-    body.push(0x20);
-    leb_u(addr_local as u64, body);
-    body.push(0x29); // i64.load
-    leb_u(3, body);
-    leb_u(0, body);
-    body.push(0xA7);
-    body.push(0x10);
-    leb_u(drop_str_idx as u64, body);
-    body.push(0x1A);
-    body.push(0x0B);
-    // kind==3
-    body.push(0x20);
-    leb_u(kind_local as u64, body);
-    body.push(0x42);
-    leb_s(3, body);
-    body.push(0x51);
-    body.push(0x04);
-    body.push(0x40);
-    body.push(0x20);
-    leb_u(addr_local as u64, body);
-    body.push(0x29);
-    leb_u(3, body);
-    leb_u(0, body);
-    body.push(0xA7);
-    body.push(0x10);
-    leb_u(drop_idx as u64, body);
-    body.push(0x1A);
-    body.push(0x0B);
+/// i64 local with the element-kind code; the heap ptr is loaded from `[addr_local]`.
+fn array_drop_elem(body: &mut Vec<u8>, kind_local: u32, addr_local: u32, rt: ElemRt) {
+    let push_ptr: &dyn Fn(&mut Vec<u8>) = &|b: &mut Vec<u8>| {
+        b.push(0x20); // local.get addr
+        leb_u(addr_local as u64, b);
+        b.push(0x29); // i64.load [addr]
+        leb_u(3, b);
+        leb_u(0, b);
+        b.push(0xA7); // i32.wrap_i64
+    };
+    for (code, _, drop_idx) in rt.heap_kinds() {
+        emit_elem_kind_if(body, kind_local, code, drop_idx, push_ptr);
+    }
 }
 
 /// `arr.elems[len_local] = x_local` where `arr_local` holds the array ptr.
@@ -11859,8 +11898,7 @@ fn array_copy_dup_loop(
     j_local: u32,
     s_local: u32,
     kind_local: u32,
-    dup_str_idx: u32,
-    dup_idx: u32,
+    rt: ElemRt,
 ) {
     body.push(0x41);
     leb_s(0, body);
@@ -11893,38 +11931,27 @@ fn array_copy_dup_loop(
     body.push(0x21);
     leb_u(s_local as u64, body);
     array_store_at(body, dst_local, j_local, s_local);
-    // dup s kind-aware. kind_local here is an i32 param/local; widen to i64
-    // by storing into a temp is unnecessary — array_dup_slot expects an i64
-    // kind local, but our push kind is i32. Inline an i32-kind variant:
-    // if kind==2 __dup_str(s); if kind==3 __dup(s).
-    body.push(0x20);
-    leb_u(kind_local as u64, body);
-    body.push(0x41);
-    leb_s(2, body);
-    body.push(0x46); // i32.eq
-    body.push(0x04);
-    body.push(0x40);
-    body.push(0x20);
-    leb_u(s_local as u64, body);
-    body.push(0xA7);
-    body.push(0x10);
-    leb_u(dup_str_idx as u64, body);
-    body.push(0x1A);
-    body.push(0x0B);
-    body.push(0x20);
-    leb_u(kind_local as u64, body);
-    body.push(0x41);
-    leb_s(3, body);
-    body.push(0x46);
-    body.push(0x04);
-    body.push(0x40);
-    body.push(0x20);
-    leb_u(s_local as u64, body);
-    body.push(0xA7);
-    body.push(0x10);
-    leb_u(dup_idx as u64, body);
-    body.push(0x1A);
-    body.push(0x0B);
+    // dup s kind-aware over codes 2/3/4/9. `kind_local` is an i32 local here, so
+    // each test uses i32.const + i32.eq; `s_local` is an i64 slot (wrapped to i32).
+    let push_s: &dyn Fn(&mut Vec<u8>) = &|b: &mut Vec<u8>| {
+        b.push(0x20); // local.get s
+        leb_u(s_local as u64, b);
+        b.push(0xA7); // i32.wrap_i64
+    };
+    for (code, dup_idx, _) in rt.heap_kinds() {
+        body.push(0x20); // local.get kind (i32)
+        leb_u(kind_local as u64, body);
+        body.push(0x41); // i32.const code
+        leb_s(code, body);
+        body.push(0x46); // i32.eq
+        body.push(0x04); // if
+        body.push(0x40);
+        push_s(body);
+        body.push(0x10); // call dup helper
+        leb_u(dup_idx as u64, body);
+        body.push(0x1A); // drop result
+        body.push(0x0B); // end if
+    }
     // j++
     body.push(0x20);
     leb_u(j_local as u64, body);
@@ -13740,7 +13767,19 @@ mod tests {
         // ADT `==` itself is now supported — here it's main's RETURN type that is
         // out of subset).
         let s8 = "type P = | P(Int, Int)\nfn main() -> Bool = P(1, 2) == P(1, 2)";
-        for src in [s5, s8] {
+        // Tagged-heap array element kinds that remain OUTSIDE the wasm subset
+        // (the FLAT kinds Vector/Bytes are now supported; the CONTAINER kinds are
+        // not): each must produce a clean Err (no panic, no silent wrong result).
+        // nested Array[Array[..]]
+        let s_nested =
+            "fn main() -> Int = { let a: Array[Int] = [1, 2]; let aa: Array[Array[Int]] = [a]; array_len(aa) }";
+        // Array[Map]
+        let s_map = "fn main() -> Int = { let m: Map[Int, Int] = map_insert(map_new(), 1, 2); \
+            let ms: Array[Map[Int, Int]] = [m]; array_len(ms) }";
+        // Array[Set]
+        let s_set = "fn main() -> Int = { let s: Set[Int] = set_add(set_new(), 1); \
+            let ss: Array[Set[Int]] = [s]; array_len(ss) }";
+        for src in [s5, s8, s_nested, s_map, s_set] {
             let r = compile_src(src);
             assert!(r.is_err(), "expected Err (no panic) for:\n{}", src);
         }

@@ -2171,8 +2171,10 @@ fn vectors_run_in_wasm_matches_interp() {
 /// The prelude's embedding-retrieval helpers (`nearest`/`nearest_score`/
 /// `similarities`) implement cosine nearest-neighbour search over an
 /// `Array[Vector]` store — the core of a RAG / semantic-search pipeline. They run
-/// on interp + native (Array[Vector] is outside the wasm subset). The store is
-/// built so the expected nearest index is unambiguous.
+/// IDENTICALLY across ALL THREE backends: interp (oracle), native (cc-gated), and
+/// wasm (node-gated) — `Array[Vector]` is now inside the wasm subset, so embedding
+/// search runs in the browser/wasm target, garbage-free (__live == 0). The store
+/// is built so the expected nearest index is unambiguous.
 #[test]
 fn embedding_retrieval_matches_compiled() {
     let store = "let s = array_push(array_push(array_push(array_new(), \
@@ -2185,14 +2187,15 @@ fn embedding_retrieval_matches_compiled() {
         (format!("fn main() -> Float = {{ {} array_get(similarities(s, vec_from_array([1.0, 0.0, 0.0])), 1) }}\n", store), "0"),
     ];
     let cc = cc_available();
-    let mut nat = 0u64;
+    let node = node_available();
+    let (mut nat, mut wasm_n) = (0u64, 0u64);
     for (user_src, expected) in &progs {
         let src = crate::prelude::wrap(user_src);
         let interp = ast_run(&src).unwrap_or_else(|e| panic!("interp failed: {}\n{}", e, user_src));
         assert_eq!(&interp, expected, "interp mismatch\n{}", user_src);
+        let prog = parser::parse(lexer::lex(&src).expect("lex")).expect("parse");
+        assert!(typeck::check(&prog).is_ok(), "type error\n{}", user_src);
         if cc {
-            let prog = parser::parse(lexer::lex(&src).expect("lex")).expect("parse");
-            assert!(typeck::check(&prog).is_ok(), "type error\n{}", user_src);
             let c_src = crate::c_backend::compile(&prog)
                 .unwrap_or_else(|e| panic!("c_backend failed: {}\n{}", e, user_src));
             let (n, live) = run_native_live(&c_src)
@@ -2201,8 +2204,22 @@ fn embedding_retrieval_matches_compiled() {
             assert_eq!(live, 0, "native leaked {} cell(s)\n{}", live, user_src);
             nat += 1;
         }
+        if node {
+            let bytes = wasm::compile(&prog)
+                .unwrap_or_else(|e| panic!("wasm compile failed: {}\n{}", e, user_src));
+            let (w, live) = run_wasm_live(&bytes)
+                .unwrap_or_else(|e| panic!("wasm runner failed: {}\n{}", e, user_src));
+            assert_eq!(&w, expected, "wasm != expected\n{}\n wasm={}", user_src, w);
+            assert_eq!(live, 0, "wasm leaked {} cell(s)\n{}", live, user_src);
+            wasm_n += 1;
+        }
     }
-    eprintln!("embedding_retrieval_matches_compiled: {} programs ({} native)", progs.len(), nat);
+    eprintln!(
+        "embedding_retrieval_matches_compiled: {} programs ({} native, {} wasm)",
+        progs.len(),
+        nat,
+        wasm_n
+    );
 }
 
 /// The prelude's higher-order operations (`array_map`/`array_filter`/
@@ -2275,15 +2292,15 @@ fn prelude_hofs_match_across_backends() {
 /// `Array[Vector]` and `Array[Bytes]` differential: an array whose ELEMENT is a
 /// tagged heap type (Vector / Bytes) must keep its PRECISE element type through
 /// `array_get` (so `vec_*` / `bytes_*` ops on a retrieved element type-check in
-/// the native backend, matching the interpreter) and must dup/drop each element
-/// with the CORRECT kind-aware runtime function — never the generic ADT
-/// `aria_drop` (a type-confusion). Interp (oracle) vs native (cc-gated): identical
-/// result AND garbage-free heap (live == 0). Wasm intentionally rejects both
-/// (vectors gated; a Bytes array element exceeds the wasm subset) — asserted
-/// cleanly (no panic).
+/// the native AND wasm backends, matching the interpreter) and must dup/drop each
+/// element with the CORRECT kind-aware runtime function — never the generic ADT
+/// `aria_drop` / `__drop` (a type-confusion). Runs on ALL THREE backends: interp
+/// (oracle) vs native (cc-gated) vs wasm (node-gated): identical result AND a
+/// garbage-free heap (live == 0) on both compiled backends.
 #[test]
 fn arrays_of_tagged_heap_elems_interp_matches_compiled() {
     let cc = cc_available();
+    let node = node_available();
     // (source, expected interp result). Each builds an array of 2-3 tagged-heap
     // elements, retrieves elements with `array_get`, and operates on them.
     let cases: &[(&str, &str)] = &[
@@ -2333,6 +2350,7 @@ fn arrays_of_tagged_heap_elems_interp_matches_compiled() {
     ];
 
     let mut native_checked = 0u64;
+    let mut wasm_checked = 0u64;
     for (src, expected) in cases {
         // Oracle: tree-walking interpreter.
         let interp = ast_run(src).unwrap_or_else(|e| panic!("interp failed: {}\n{}", e, src));
@@ -2356,20 +2374,81 @@ fn arrays_of_tagged_heap_elems_interp_matches_compiled() {
             native_checked += 1;
         }
 
-        // The wasm backend must cleanly REJECT both (vector gate / Bytes array
-        // element outside the subset) — never compile or panic.
-        let bytes = wasm::compile(&prog);
-        assert!(
-            bytes.is_err(),
-            "wasm backend unexpectedly accepted a tagged-heap array program\n{}",
-            src
-        );
+        // Wasm backend: now SUPPORTS Array[Vector] / Array[Bytes]. Identical result
+        // + garbage-free (__live == 0). The precise element type flows through
+        // `array_get` so the `vec_*` / `bytes_*` ops on a retrieved element emit.
+        if node {
+            let bytes = wasm::compile(&prog)
+                .unwrap_or_else(|e| panic!("wasm compile failed: {}\n{}", e, src));
+            let (w, live) = run_wasm_live(&bytes)
+                .unwrap_or_else(|e| panic!("wasm runner failed: {}\n{}", e, src));
+            assert_eq!(w, *expected, "wasm != expected\n{}\n wasm={}", src, w);
+            assert_eq!(live, 0, "wasm leaked {} cell(s)\n{}", live, src);
+            wasm_checked += 1;
+        }
+    }
+
+    // Prelude HOFs (fold/map) OVER a tagged-heap array — each element is duped by
+    // the lambda's apply and dropped per iteration with the right kind. Wrapped
+    // with the real prelude (like the CLI), run on all three backends, garbage-free.
+    let hof_cases: &[(&str, &str)] = &[
+        // fold over Array[Vector]: sum of per-embedding norms ([1,0]=1, [0,2]=2,
+        // [3,4]=5) -> 8.
+        (
+            "fn main() -> Float = {\n\
+               let vs: Array[Vector] = [vec_from_array([1.0, 0.0]), vec_from_array([0.0, 2.0]), vec_from_array([3.0, 4.0])];\n\
+               array_fold(vs, 0.0, \\(a: Float, v: Vector) -> a + vec_norm(v))\n\
+             }\n",
+            "8",
+        ),
+        // map over Array[Vector] -> Array[Float] of norms, then fold-sum: same 8.
+        (
+            "fn main() -> Float = {\n\
+               let vs: Array[Vector] = [vec_from_array([1.0, 0.0]), vec_from_array([0.0, 2.0]), vec_from_array([3.0, 4.0])];\n\
+               array_fold(array_map(vs, \\v -> vec_norm(v)), 0.0, \\(a: Float, x: Float) -> a + x)\n\
+             }\n",
+            "8",
+        ),
+        // fold over Array[Bytes]: sum of buffer lengths (2 + 1 + 3) -> 6.
+        (
+            "fn main() -> Int = {\n\
+               let bs: Array[Bytes] = [bytes_push(bytes_push(bytes_new(), 1), 2), bytes_push(bytes_new(), 9), bytes_push(bytes_push(bytes_push(bytes_new(), 1), 2), 3)];\n\
+               array_fold(bs, 0, \\(a: Int, b: Bytes) -> a + bytes_len(b))\n\
+             }\n",
+            "6",
+        ),
+    ];
+    for (user_src, expected) in hof_cases {
+        let src = crate::prelude::wrap(user_src);
+        let interp = ast_run(&src).unwrap_or_else(|e| panic!("interp failed: {}\n{}", e, user_src));
+        assert_eq!(&interp, expected, "interp mismatch\n{}", user_src);
+        let prog = parser::parse(lexer::lex(&src).expect("lex")).expect("parse");
+        assert!(typeck::check(&prog).is_ok(), "type error\n{}", user_src);
+        if cc {
+            let c_src = crate::c_backend::compile(&prog)
+                .unwrap_or_else(|e| panic!("c_backend failed: {}\n{}", e, user_src));
+            let (nat, live) = run_native_live(&c_src)
+                .unwrap_or_else(|e| panic!("native runner failed: {}\n{}", e, user_src));
+            assert_eq!(nat, *expected, "native != expected\n{}\n native={}", user_src, nat);
+            assert_eq!(live, 0, "native leaked {} cell(s)\n{}", live, user_src);
+            native_checked += 1;
+        }
+        if node {
+            let bytes = wasm::compile(&prog)
+                .unwrap_or_else(|e| panic!("wasm compile failed: {}\n{}", e, user_src));
+            let (w, live) = run_wasm_live(&bytes)
+                .unwrap_or_else(|e| panic!("wasm runner failed: {}\n{}", e, user_src));
+            assert_eq!(&w, expected, "wasm != expected\n{}\n wasm={}", user_src, w);
+            assert_eq!(live, 0, "wasm leaked {} cell(s)\n{}", live, user_src);
+            wasm_checked += 1;
+        }
     }
 
     eprintln!(
-        "arrays_of_tagged_heap_elems_interp_matches_compiled: {} programs ({} native)",
-        cases.len(),
-        native_checked
+        "arrays_of_tagged_heap_elems_interp_matches_compiled: {} programs ({} native, {} wasm)",
+        cases.len() + hof_cases.len(),
+        native_checked,
+        wasm_checked
     );
 }
 
