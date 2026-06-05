@@ -13,6 +13,7 @@
 //!   aria native <file.aria> <out>   transpile to C and build a native exe via cc
 //!   aria native-run <file.aria>     transpile to C, build, run, print the result
 //!   aria gbnf  [<file.out>]         emit a GBNF grammar for Aria's syntax
+//!   aria lsp                        run a stdio LSP server (live diagnostics)
 
 // Many runtime modules expose library-style APIs not all wired into the CLI yet.
 #![allow(dead_code)]
@@ -26,6 +27,7 @@ mod gbnf;
 mod interp;
 mod ir;
 mod lexer;
+mod lsp;
 mod monomorphize;
 mod neural_codec;
 mod pack;
@@ -70,7 +72,7 @@ fn main() -> ExitCode {
 fn real_main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: aria <run|check|ast|pack|unpack|npack|nunpack|bench|demo|mem|wasm|wasm-run|native|native-run|gbnf> [args...]");
+        eprintln!("usage: aria <run|check|ast|pack|unpack|npack|nunpack|bench|demo|mem|wasm|wasm-run|native|native-run|gbnf|lsp> [args...]");
         return ExitCode::from(2);
     }
 
@@ -91,6 +93,7 @@ fn real_main() -> ExitCode {
         "native" => run_native_compile(&args),
         "native-run" => run_native_run(&args),
         "gbnf" => run_gbnf(&args),
+        "lsp" => ExitCode::from(lsp::run() as u8),
         other => {
             eprintln!("unknown command `{}`", other);
             ExitCode::from(2)
