@@ -573,6 +573,16 @@ impl<'a> Mono<'a> {
                             rt = resolve(&rt, &sub);
                         }
                     }
+                    // If a generic element type is still unconstrained (e.g. an
+                    // empty `set_new()`/`map_new()`/`array_new()` with no concrete
+                    // args, or an enumeration over one), DON'T seed the FIRST
+                    // unification pass with a var-containing type: that would pin a
+                    // caller's type parameter to this throwaway var and block the
+                    // SECOND pass (which rewrites the arg to a concrete empty-
+                    // container element, defaulted to Int) from refining it.
+                    if contains_var(&rt) {
+                        return None;
+                    }
                     return Some(rt);
                 }
                 let info = self.fns.get(name).cloned()?;
@@ -685,7 +695,7 @@ impl<'a> Mono<'a> {
             "array_new" => {
                 // The element type comes from context (an `Array[E]` expected
                 // type — a callee param, a `let` annotation, or a sibling arg).
-                let elem = expected.and_then(array_elem_of).unwrap_or(Ty::Unit);
+                let elem = default_empty_elem(expected.and_then(array_elem_of).unwrap_or(Ty::Unit));
                 let tag = array_elem_tag(&elem);
                 Ok(Some((Expr::Call(format!("array_new${}", tag), Vec::new()), arr(elem))))
             }
@@ -749,7 +759,8 @@ impl<'a> Mono<'a> {
             "map_new" => {
                 let (k, v) = expected
                     .and_then(map_kv_of)
-                    .unwrap_or((Ty::Unit, Ty::Unit));
+                    .map(|(k, v)| (default_empty_elem(k), default_empty_elem(v)))
+                    .unwrap_or((Ty::Int, Ty::Int));
                 if !native_map_value_ok(&v) {
                     return Err(unsupported_map_value(&v));
                 }
@@ -863,7 +874,7 @@ impl<'a> Mono<'a> {
             }
             // ---- Set ----
             "set_new" => {
-                let t = expected.and_then(set_elem_of).unwrap_or(Ty::Unit);
+                let t = default_empty_elem(expected.and_then(set_elem_of).unwrap_or(Ty::Unit));
                 let suffix = array_elem_tag(&t);
                 Ok(Some((
                     Expr::Call(format!("set_new${}", suffix), Vec::new()),
@@ -1697,7 +1708,12 @@ impl<'a> Mono<'a> {
 /// array-builtin call names (`array_get$i`, …) and, reused, the map/set suffixes.
 fn array_elem_tag(elem: &Ty) -> &'static str {
     match elem {
-        Ty::Int | Ty::Bool => "i",
+        Ty::Int => "i",
+        // Bool is a first-class array element kind, tagged `o` (the same tag the
+        // map VALUE position already uses for Bool). It stores inline in the
+        // int64 slot like Int — no dup/drop — but the backends type it as Bool so
+        // `array_get` yields a usable Bool (e.g. in `if`).
+        Ty::Bool => "o",
         Ty::Float => "f",
         Ty::Str => "s",
         Ty::Named(n, _) if n == "Bytes" => "b",
@@ -1752,6 +1768,23 @@ fn map_suffix(k: &Ty, v: &Ty) -> String {
     // only ever Int/Str, so the key tag needs no Bool case.
     let vtag = if matches!(v, Ty::Bool) { "o" } else { array_elem_tag(v) };
     format!("{}_{}", array_elem_tag(k), vtag)
+}
+
+/// Default a TRULY-unconstrained collection element type to a harmless concrete
+/// type. An empty `array_new()`/`map_new()`/`set_new()` with no expected type
+/// leaves its element type as the `Unit` placeholder, which the compiled backends
+/// reject (a `Unit`-element container is outside their subset). A provably-empty
+/// container never stores an element, so pinning the placeholder to `Int` is
+/// semantically harmless and makes the compiled backends accept it and agree with
+/// the interpreter (empty container; fold returns its init). This ONLY rewrites
+/// the `Unit` placeholder — a genuine concrete element type (or a real mismatch)
+/// is left untouched, so it does not mask type errors.
+fn default_empty_elem(ty: Ty) -> Ty {
+    if matches!(ty, Ty::Unit) {
+        Ty::Int
+    } else {
+        ty
+    }
 }
 
 /// Whether a concrete Map value type round-trips faithfully through the COMPILED

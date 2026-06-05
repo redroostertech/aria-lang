@@ -789,7 +789,7 @@ fn run_wasm_live_str(bytes: &[u8]) -> Result<(String, i64), String> {
          const imp={{env:{{print_str:(p,n)=>{{\
          process.stdout.write(dec.decode(new Uint8Array(memref.buffer).subarray(p,p+n)));\
          process.stdout.write('\\n');}},\
-         print_float:(x)=>{{process.stdout.write(String(x));process.stdout.write('\\n');}},\
+         print_float:(x)=>{{process.stdout.write(Number.isNaN(x)?'NaN':x===Infinity?'inf':x===-Infinity?'-inf':(x===0&&1/x===-Infinity)?'-0':String(x));process.stdout.write('\\n');}},\
          print_int:(n)=>{{process.stdout.write(String(n));process.stdout.write('\\n');}},\
          print_bool:(b)=>{{process.stdout.write(b?'true':'false');process.stdout.write('\\n');}},\
          exp:Math.exp}}}};\
@@ -838,7 +838,7 @@ fn run_wasm_live(bytes: &[u8]) -> Result<(String, i64), String> {
          const imp={{env:{{print_str:(p,n)=>{{\
          process.stdout.write(dec.decode(new Uint8Array(memref.buffer).subarray(p,p+n)));\
          process.stdout.write('\\n');}},\
-         print_float:(x)=>{{process.stdout.write(String(x));process.stdout.write('\\n');}},\
+         print_float:(x)=>{{process.stdout.write(Number.isNaN(x)?'NaN':x===Infinity?'inf':x===-Infinity?'-inf':(x===0&&1/x===-Infinity)?'-0':String(x));process.stdout.write('\\n');}},\
          print_int:(n)=>{{process.stdout.write(String(n));process.stdout.write('\\n');}},\
          print_bool:(b)=>{{process.stdout.write(b?'true':'false');process.stdout.write('\\n');}},\
          exp:Math.exp}}}};\
@@ -1507,6 +1507,45 @@ fn wasm_gates_float_valued_map_show() {
     }
 }
 
+/// Regression for the wasm Node harness float-display divergence (BUG 4): the
+/// `print_float` import rendered `-0`/`inf`/`-inf` as JS `0`/`Infinity`/
+/// `-Infinity`. The interpreter (oracle) and native print `-0`/`inf`/`-inf`/`NaN`
+/// (shortest round-trip); the wasm Node harness must agree. Each program prints
+/// one special value; `run_wasm_live_str` captures the printed line (the program
+/// returns the empty string, so the captured text is exactly the printed value).
+#[test]
+fn wasm_float_display_special_values() {
+    if !node_available() {
+        return;
+    }
+    // (printed expression, oracle rendering)
+    let cases = [
+        ("0.0 * -1.0", "-0"),   // negative zero
+        ("1.0 / 0.0", "inf"),   // +infinity
+        ("-1.0 / 0.0", "-inf"), // -infinity
+        ("0.0 / 0.0", "NaN"),   // NaN
+        ("1.5", "1.5"),         // a finite control value (unchanged)
+    ];
+    for (expr, oracle) in cases {
+        let src = format!(
+            "fn main() -> String = {{ print_float({}); \"\" }}\n",
+            expr
+        );
+        let prog = parser::parse(lexer::lex(&src).expect("lex")).expect("parse");
+        assert!(typeck::check(&prog).is_ok(), "type error\n{}", src);
+        let bytes = wasm::compile(&prog).expect("wasm compile float print");
+        let (w, _live) = run_wasm_live_str(&bytes).expect("wasm run float print");
+        // The harness output is the printed line (ending in '\n') then the empty
+        // String result; trim the trailing newline.
+        let printed = w.trim_end_matches('\n');
+        assert_eq!(
+            printed, oracle,
+            "wasm float display for `{}`: got {:?}, expected {:?}",
+            expr, printed, oracle
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 9b) Collection enumeration differential: `map_keys` / `map_values` /
 //     `set_to_array` turn a Map/Set into a plain Array (in the same ascending,
@@ -1613,6 +1652,86 @@ fn enum_hof_diff_programs() -> Vec<(String, &'static str)> {
              }\n"
                 .to_string(),
             "1",
+        ),
+        // BUG 3: array_map producing an Array[Bool], folded. Of 0..4, two are even
+        // -> 2.
+        (
+            "fn main() -> Int = {\n\
+               let bs = array_map(range(4), \\(x: Int) -> x % 2 == 0);\n\
+               array_fold(bs, 0, \\(a: Int, b: Bool) -> if b { a + 1 } else { a })\n\
+             }\n"
+                .to_string(),
+            "2",
+        ),
+        // BUG 3: map_values(Map[Int,Bool]) yields an Array[Bool]; one true -> 1.
+        (
+            "fn main() -> Int = {\n\
+               let m = map_insert(map_insert(map_new(), 1, true), 2, false);\n\
+               array_fold(map_values(m), 0, \\(a: Int, b: Bool) -> if b { a + 1 } else { a })\n\
+             }\n"
+                .to_string(),
+            "1",
+        ),
+        // BUG 3: Bool-valued map_get_or through an Array[Bool] enumerated value.
+        (
+            "fn main() -> Int = {\n\
+               let xs = array_push(array_push(array_new(), true), false);\n\
+               (if array_get(xs, 0) { 1 } else { 0 }) + (if array_get(xs, 1) { 10 } else { 0 })\n\
+             }\n"
+                .to_string(),
+            "1",
+        ),
+        // BUG 5: folding/enumerating an UNANNOTATED empty container. Its element
+        // type used to default to `Unit` (outside the compiled subset); it now
+        // defaults to a harmless `Int`, so the provably-empty fold returns its
+        // init unchanged on all three backends.
+        (
+            "fn main() -> Int =\n\
+               array_fold(set_to_array(set_new()), 7, \\(a: Int, x: Int) -> a + x)\n"
+                .to_string(),
+            "7",
+        ),
+        (
+            "fn main() -> Int = array_len(map_values(map_new()))\n".to_string(),
+            "0",
+        ),
+        (
+            "fn main() -> Int = array_fold(array_new(), 42, \\(a: Int, x: Int) -> a + x)\n"
+                .to_string(),
+            "42",
+        ),
+        // BUG 2b (native + wasm): a Map built across SEPARATE `let` bindings — the
+        // empty `map_new()` carries a coarse default kind, but `map_insert` /
+        // `map_get_or` must use the inserted/default value's authoritative type.
+        // Float value:
+        (
+            "fn main() -> Int = {\n\
+               let m0 = map_new();\n\
+               let m1 = map_insert(m0, 1, 3.5);\n\
+               if map_get_or(m1, 1, 0.0) == 3.5 { 1 } else { 0 }\n\
+             }\n"
+                .to_string(),
+            "1",
+        ),
+        // Bool value, Str key:
+        (
+            "fn main() -> Int = {\n\
+               let m0 = map_new();\n\
+               let m1 = map_insert(m0, \"k\", true);\n\
+               if map_get_or(m1, \"k\", false) { 1 } else { 0 }\n\
+             }\n"
+                .to_string(),
+            "1",
+        ),
+        // Str value across separate lets:
+        (
+            "fn main() -> String = {\n\
+               let m0 = map_new();\n\
+               let m1 = map_insert(m0, 1, \"x\");\n\
+               map_get_or(m1, 1, \"d\")\n\
+             }\n"
+                .to_string(),
+            "x",
         ),
     ]
 }

@@ -52,7 +52,10 @@ use crate::ir::{self, Atom, Bind, IExpr, IFn};
 /// mirrors the one-char suffix the monomorphizer attaches to array builtins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ElemKind {
-    Int,    // Int/Bool — stored directly in an int64 slot
+    Int,    // Int — stored directly in an int64 slot
+    Bool,   // Bool — stored inline in the int64 slot like Int (no dup/drop), but
+            // typed as Bool so `array_get` yields a usable Bool. Tagged `o`,
+            // code 8 (aligned with `SlotKind::Bool`).
     Float,  // Float — f64 bit-reinterpreted into an int64 slot
     Str,    // heap String object (ref counted, recursive drop)
     Ref,    // boxed heap value: ADT cell / closure (recursive drop via aria_drop)
@@ -70,6 +73,7 @@ impl ElemKind {
     fn from_tag(c: char) -> Result<ElemKind, String> {
         match c {
             'i' => Ok(ElemKind::Int),
+            'o' => Ok(ElemKind::Bool),
             'f' => Ok(ElemKind::Float),
             's' => Ok(ElemKind::Str),
             'r' => Ok(ElemKind::Ref),
@@ -95,6 +99,7 @@ impl ElemKind {
             ElemKind::Array => 5,
             ElemKind::Map => 6,
             ElemKind::Set => 7,
+            ElemKind::Bool => 8,
             ElemKind::Vector => 9,
         }
     }
@@ -108,6 +113,7 @@ impl ElemKind {
     fn elem_ctype(self) -> CType {
         match self {
             ElemKind::Int => CType::Int,
+            ElemKind::Bool => CType::Bool,
             ElemKind::Float => CType::Float,
             ElemKind::Str => CType::Str,
             ElemKind::Ref => CType::Ref,
@@ -125,7 +131,8 @@ impl ElemKind {
     /// AriaCell).
     fn from_ctype(ct: &CType) -> ElemKind {
         match ct {
-            CType::Int | CType::Bool => ElemKind::Int,
+            CType::Int => ElemKind::Int,
+            CType::Bool => ElemKind::Bool,
             CType::Float => ElemKind::Float,
             CType::Str => ElemKind::Str,
             CType::Ref => ElemKind::Ref,
@@ -1598,7 +1605,8 @@ fn encode_elem_slot(kind: ElemKind, t: CType, ex: &str) -> Result<String, String
     // there (this is what makes `Array[Array[..]]` / `Array[String]` work). The
     // scalar kinds must match exactly so the encoding is correct.
     let ok = match kind {
-        ElemKind::Int => matches!(t, CType::Int | CType::Bool),
+        ElemKind::Int => matches!(t, CType::Int),
+        ElemKind::Bool => matches!(t, CType::Bool),
         ElemKind::Float => t == CType::Float,
         ElemKind::Str => t == CType::Str,
         ElemKind::Bytes => t == CType::Bytes,
@@ -1617,7 +1625,8 @@ fn encode_elem_slot(kind: ElemKind, t: CType, ex: &str) -> Result<String, String
         ));
     }
     Ok(match kind {
-        ElemKind::Int => format!("(int64_t)({})", ex),
+        // Bool stores inline in the int64 slot like Int (0/1), no dup/drop.
+        ElemKind::Int | ElemKind::Bool => format!("(int64_t)({})", ex),
         ElemKind::Float => format!("aria_f2i({})", ex),
         // every heap kind is stored as a pointer cast through uintptr_t.
         ElemKind::Str
@@ -1633,7 +1642,9 @@ fn encode_elem_slot(kind: ElemKind, t: CType, ex: &str) -> Result<String, String
 /// Decode an int64 slot C expression `slot` back to the element's C value type.
 fn decode_elem_slot(kind: ElemKind, slot: &str) -> String {
     match kind {
-        ElemKind::Int => slot.to_string(),
+        // Bool decodes like Int: the slot already holds 0/1 as an int64, usable
+        // directly as a C bool (`int`).
+        ElemKind::Int | ElemKind::Bool => slot.to_string(),
         ElemKind::Float => format!("aria_i2f({})", slot),
         ElemKind::Str
         | ElemKind::Ref
@@ -1977,15 +1988,19 @@ fn set_kind_of(t: CType) -> Result<SlotKind, String> {
     }
 }
 
-/// Prefer the PRECISE operand kind over a coarse `Ref` recovered from a stale
-/// header/suffix: when the container's recorded kind is the catch-all `Ref` but
-/// the operand carries a more specific heap kind (Bytes/Array/Map/Set), use the
-/// operand's. (For scalar kinds the two always agree for a well-typed program.)
+/// Reconcile a container's recorded slot kind with the actual key/value OPERAND
+/// kind for an op that has one (`map_insert`/`map_get_or`/...). The operand is
+/// post-typeck concrete and is the AUTHORITATIVE kind for the slot being
+/// stored/retrieved, so it wins whenever it is known. The container's recorded
+/// kind is only a fallback: an unannotated `map_new()` built across separate
+/// `let` bindings can carry a stale default kind (e.g. `Int`/`Ref` from
+/// `$i_i`/`$r_r`) that does NOT match the value actually inserted — trusting the
+/// container there mis-encodes the slot (the BUG-2b / empty-container-default
+/// interaction). For a well-typed program the operand and a precise container
+/// kind always agree, so preferring the operand is at least as correct.
 fn unify_slot(container: SlotKind, operand: SlotKind) -> SlotKind {
-    match (container, operand) {
-        (SlotKind::Ref, k) => k,
-        (k, _) => k,
-    }
+    let _ = container;
+    operand
 }
 
 fn check_ctor<'a>(
@@ -2363,7 +2378,8 @@ static void aria_array_drop_elem(int64_t kind, int64_t slot) {
 static void aria_array_drop(void* p) {
     AriaArray* a = (AriaArray*)p;
     if (--a->rc == 0) {
-        if (a->kind != 0 && a->kind != 1) {
+        /* Int(0)/Float(1)/Bool(8) elements store inline — nothing to drop. */
+        if (a->kind != 0 && a->kind != 1 && a->kind != 8) {
             for (int64_t i = 0; i < a->len; i++) aria_slot_drop(a->kind, a->elems[i]);
         }
         aria_live--;
@@ -4323,6 +4339,27 @@ mod tests {
             "fn main() -> String = {\n\
                let a = array_push([\"hello\", \"world\"], \"!\");\n\
                concat(concat(a[0], a[1]), a[2])\n\
+             }",
+        );
+    }
+
+    #[test]
+    fn array_of_bool_is_usable() {
+        // Regression for BUG 3: `Array[Bool]` collapsed Bool into the Int element
+        // kind, so `array_get` returned Int and `print_bool`/`if` rejected it.
+        // Bool is now a first-class array element kind (`o`, code 8, inline slot).
+        // build/get/use-in-if (and print_bool).
+        differential(
+            "fn main() -> Int = {\n\
+               let xs = array_push(array_push(array_new(), true), false);\n\
+               (if xs[0] { 1 } else { 0 }) + (if xs[1] { 10 } else { 0 })\n\
+             }",
+        );
+        // An array literal of Bools.
+        differential(
+            "fn main() -> Int = {\n\
+               let xs = [true, false, true];\n\
+               (if xs[0] { 1 } else { 0 }) + (if xs[2] { 100 } else { 0 })\n\
              }",
         );
     }

@@ -259,11 +259,17 @@ fn run_wasm_run(args: &[String]) -> ExitCode {
          const dv=new DataView(memref.buffer);\
          const len=Number(dv.getBigInt64(p+8,true));\
          return dec.decode(mem.subarray(p+16,p+16+len));}};\
+         const fmtFloat=(x)=>{{\
+         if(Number.isNaN(x)){{return 'NaN';}}\
+         if(x===Infinity){{return 'inf';}}\
+         if(x===-Infinity){{return '-inf';}}\
+         if(x===0&&1/x===-Infinity){{return '-0';}}\
+         return String(x);}};\
          const imp={{env:{{print_str:(p,n)=>{{\
          const mem=new Uint8Array(memref.buffer);\
          process.stdout.write(dec.decode(mem.subarray(p,p+n)));\
          process.stdout.write('\\n');}},\
-         print_float:(x)=>{{process.stdout.write(String(x));\
+         print_float:(x)=>{{process.stdout.write(fmtFloat(x));\
          process.stdout.write('\\n');}},\
          print_int:(n)=>{{process.stdout.write(String(n));\
          process.stdout.write('\\n');}},\

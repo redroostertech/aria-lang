@@ -61,7 +61,10 @@ use crate::ir::{self, Atom, Bind, IExpr, IFn};
 /// drop, and how each element is encoded into / decoded out of its 8-byte slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum ElemKind {
-    Int,   // Int/Bool — stored directly in an i64 slot
+    Int,   // Int — stored directly in an i64 slot
+    Bool,  // Bool — stored inline in the i64 slot (0/1) like Int, but typed on the
+           // operand stack as i32 so `array_get` yields a usable Bool. Tagged `o`,
+           // code 8 (aligned with `SlotKind::Bool` and the native `ElemKind::Bool`).
     Float, // Float — f64 bits reinterpreted into an i64 slot
     Str,   // heap String object (ref counted, recursive drop)
     Ref,   // boxed heap value: ADT cell / closure (recursive drop)
@@ -78,6 +81,7 @@ impl ElemKind {
     fn from_tag(c: char) -> Result<ElemKind, String> {
         match c {
             'i' => Ok(ElemKind::Int),
+            'o' => Ok(ElemKind::Bool),
             'f' => Ok(ElemKind::Float),
             's' => Ok(ElemKind::Str),
             'r' | 'a' | 'b' | 'm' | 'e' | 'v' => Ok(ElemKind::Ref),
@@ -93,6 +97,7 @@ impl ElemKind {
             ElemKind::Float => 1,
             ElemKind::Str => 2,
             ElemKind::Ref => 3,
+            ElemKind::Bool => 8,
         }
     }
 
@@ -100,6 +105,7 @@ impl ElemKind {
     fn elem_wtype(self) -> WType {
         match self {
             ElemKind::Int => WType::I64,
+            ElemKind::Bool => WType::I32,
             ElemKind::Float => WType::F64,
             ElemKind::Str => WType::Str,
             ElemKind::Ref => WType::Ref,
@@ -110,7 +116,8 @@ impl ElemKind {
     /// an i32 that lives in the Int/i64 slot family; a nested Array is a heap ref.)
     fn from_wtype(t: WType) -> ElemKind {
         match t {
-            WType::I64 | WType::I32 => ElemKind::Int,
+            WType::I64 => ElemKind::Int,
+            WType::I32 => ElemKind::Bool,
             WType::F64 => ElemKind::Float,
             WType::Str => ElemKind::Str,
             WType::Ref | WType::Array(_) | WType::Tensor | WType::Bytes | WType::Vector
@@ -329,21 +336,56 @@ impl CtorInfo {
             .filter_map(|(i, t)| if *t == WType::Str { Some(i) } else { None })
             .collect()
     }
-    /// Indices of the fields that are heap Arrays (dropped via `__array_drop`,
-    /// which is kind-aware from the array's own header).
+    /// Indices of the fields that are heap Arrays OR Bytes (both dropped via
+    /// `__array_drop`, which is kind-aware from the object's own header; a Bytes
+    /// is an Array(Int) heap object, so it shares the array dropper).
     fn array_fields(&self) -> Vec<usize> {
         self.field_types
             .iter()
             .enumerate()
-            .filter_map(|(i, t)| if matches!(t, WType::Array(_)) { Some(i) } else { None })
+            .filter_map(|(i, t)| {
+                if matches!(t, WType::Array(_) | WType::Bytes) {
+                    Some(i)
+                } else {
+                    None
+                }
+            })
             .collect()
     }
-    /// True if this constructor has any reference-managed field (Ref, Str, or
-    /// Array), i.e. dropping a dead cell of this tag must release children.
+    /// Indices of the fields that are heap Vectors (dropped via `__vec_drop`).
+    fn vec_fields(&self) -> Vec<usize> {
+        self.field_types
+            .iter()
+            .enumerate()
+            .filter_map(|(i, t)| if matches!(t, WType::Vector) { Some(i) } else { None })
+            .collect()
+    }
+    /// Indices of the fields that are heap Maps (dropped via `__map_drop`).
+    fn map_fields(&self) -> Vec<usize> {
+        self.field_types
+            .iter()
+            .enumerate()
+            .filter_map(|(i, t)| if matches!(t, WType::Map(..)) { Some(i) } else { None })
+            .collect()
+    }
+    /// Indices of the fields that are heap Sets (dropped via `__set_drop`).
+    fn set_fields(&self) -> Vec<usize> {
+        self.field_types
+            .iter()
+            .enumerate()
+            .filter_map(|(i, t)| if matches!(t, WType::Set(_)) { Some(i) } else { None })
+            .collect()
+    }
+    /// True if this constructor has any reference-managed field (Ref, Str,
+    /// Array, Bytes, Vector, Map, or Set), i.e. dropping a dead cell of this tag
+    /// must release children.
     fn has_managed_fields(&self) -> bool {
         !self.ref_fields().is_empty()
             || !self.str_fields().is_empty()
             || !self.array_fields().is_empty()
+            || !self.vec_fields().is_empty()
+            || !self.map_fields().is_empty()
+            || !self.set_fields().is_empty()
     }
 }
 
@@ -646,11 +688,14 @@ impl SlotKind {
             SlotKind::Bytes => WType::Bytes,
         }
     }
-    /// The Array element kind that holds the same value (Bool collapses to the
-    /// Int slot — a no-op for dup/drop — matching the native enumeration result).
+    /// The Array element kind that holds the same value. Bool maps to the
+    /// first-class `ElemKind::Bool` (inline in the i64 slot, no dup/drop, but
+    /// typed as Bool) so `map_values(Map[_,Bool])` / `set_to_array` yield a usable
+    /// `Array[Bool]`, matching native.
     fn elem_kind(self) -> ElemKind {
         match self {
-            SlotKind::Int | SlotKind::Bool => ElemKind::Int,
+            SlotKind::Int => ElemKind::Int,
+            SlotKind::Bool => ElemKind::Bool,
             SlotKind::Float => ElemKind::Float,
             SlotKind::Str => ElemKind::Str,
             SlotKind::Bytes => ElemKind::Ref, // a Bytes element is a heap ptr (Ref drop)
@@ -2145,18 +2190,36 @@ fn map_set_builtin_ret(
     Ok(match base {
         "map_new" => WType::Map(sk, sv),
         "set_new" => WType::Set(sk),
-        "map_insert" | "map_remove" => {
+        "map_remove" => {
             let (kk, vk) = operand_kinds()
                 .map(|(k, v)| (k, v.unwrap_or(sv)))
                 .unwrap_or((sk, sv));
+            WType::Map(kk, vk)
+        }
+        "map_insert" => {
+            // Precise kinds from the INSERTED operands (arg1=key, arg2=value),
+            // overriding a coarse operand-map header — mirroring native and
+            // `emit_map_set_builtin`.
+            let kk = args
+                .get(1)
+                .and_then(|a| atom_type(a, env).ok())
+                .map(SlotKind::from_wtype)
+                .unwrap_or(sk);
+            let vk = args
+                .get(2)
+                .and_then(|a| atom_type(a, env).ok())
+                .map(SlotKind::from_wtype)
+                .unwrap_or(sv);
             WType::Map(kk, vk)
         }
         "set_add" | "set_remove" => {
             let ek = operand_kinds().map(|(k, _)| k).unwrap_or(sk);
             WType::Set(ek)
         }
-        "map_get_or" => operand_kinds()
-            .and_then(|(_, v)| v)
+        "map_get_or" => args
+            .get(2)
+            .and_then(|a| atom_type(a, env).ok())
+            .map(SlotKind::from_wtype)
             .unwrap_or(sv)
             .wtype(),
         "map_has" | "set_has" => WType::I32,
@@ -2237,7 +2300,11 @@ fn encode_slot(got: WType, code: &mut Vec<u8>) -> Result<(), String> {
 /// `kind` (inverse of `encode_slot`).
 fn decode_slot(kind: SlotKind, code: &mut Vec<u8>) {
     match kind {
-        SlotKind::Int | SlotKind::Bool => {} // Bool stays in the i64/i32 slot family
+        SlotKind::Int => {} // stays an i64
+        // A Bool VALUE is an i32 (its `wtype()`), but the slot holds an i64.
+        // Narrow it so the operand stack type matches what the compiler expects
+        // (the symmetric `encode_slot` widened it with `i64.extend_i32_u`).
+        SlotKind::Bool => code.push(0xA7), // i32.wrap_i64 (i64 slot -> i32 Bool)
         SlotKind::Float => code.push(0xBF),  // f64.reinterpret_i64
         SlotKind::Str | SlotKind::Bytes => code.push(0xA7), // i32.wrap_i64 (ptr)
     }
@@ -2304,12 +2371,15 @@ fn emit_map_set_builtin(
             if args.len() != 3 {
                 return Err("wasm backend: map_insert expects (map, key, value)".into());
             }
-            let (_mt, kk, vk) = map_kinds(env, code)?;
+            let (_mt, _kk, _vk) = map_kinds(env, code)?;
             let kt = emit_atom(&args[1], env, code)?;
             encode_slot(kt, code)?;
             let vt = emit_atom(&args[2], env, code)?;
             encode_slot(vt, code)?;
-            // precise kinds from the operands (override coarse header on empty map)
+            // Precise kinds from the INSERTED operands (the authoritative
+            // monomorphized types), overriding the coarse header an unannotated
+            // `map_new()` operand may carry (e.g. `r_r`/`i_i`). This mirrors
+            // native's `map_insert` ret derivation (arg1=key, arg2=value).
             let kk2 = SlotKind::from_wtype(kt);
             let vk2 = SlotKind::from_wtype(vt);
             code.push(0x42);
@@ -2318,19 +2388,24 @@ fn emit_map_set_builtin(
             leb_s(vk2.code(), code);
             code.push(0x10);
             leb_u(env.heap_index(HeapHelper::MapInsert) as u64, code);
-            Ok(WType::Map(kk, vk))
+            Ok(WType::Map(kk2, vk2))
         }
         "map_get_or" => {
             if args.len() != 3 {
                 return Err("wasm backend: map_get_or expects (map, key, default)".into());
             }
-            let (_mt, _kk, vk) = map_kinds(env, code)?;
+            let (_mt, _kk, _vk) = map_kinds(env, code)?;
             let kt = emit_atom(&args[1], env, code)?;
             encode_slot(kt, code)?;
             let vt = emit_atom(&args[2], env, code)?;
             encode_slot(vt, code)?;
             code.push(0x10);
             leb_u(env.heap_index(HeapHelper::MapGetOr) as u64, code);
+            // The value kind comes from the DEFAULT (arg 2)'s precise type, not the
+            // operand map's possibly-coarse header — mirroring native's
+            // `map_get_or` (the stored slot kind already matches, since it was
+            // inserted with this same value type).
+            let vk = SlotKind::from_wtype(vt);
             decode_slot(vk, code);
             Ok(vk.wtype())
         }
@@ -2812,9 +2887,9 @@ fn encode_array_elem(kind: ElemKind, got: WType, code: &mut Vec<u8>) -> Result<(
             "wasm backend: nested Array[Array[..]] is outside the wasm subset".into(),
         );
     }
-    // Bool (i32) is accepted where Int is expected; both occupy the i64 slot.
     let ok = match kind {
-        ElemKind::Int => got == WType::I64 || got == WType::I32,
+        ElemKind::Int => got == WType::I64,
+        ElemKind::Bool => got == WType::I32,
         ElemKind::Float => got == WType::F64,
         ElemKind::Str => got == WType::Str,
         ElemKind::Ref => matches!(got, WType::Ref | WType::Tensor),
@@ -2826,11 +2901,9 @@ fn encode_array_elem(kind: ElemKind, got: WType, code: &mut Vec<u8>) -> Result<(
         ));
     }
     match kind {
-        ElemKind::Int => {
-            if got == WType::I32 {
-                code.push(0xAD); // i64.extend_i32_u (Bool -> i64 slot)
-            }
-        }
+        ElemKind::Int => {}
+        // Bool (i32 0/1) widens into the i64 slot.
+        ElemKind::Bool => code.push(0xAD), // i64.extend_i32_u
         ElemKind::Float => code.push(0xBD), // i64.reinterpret_f64
         ElemKind::Str | ElemKind::Ref => code.push(0xAD), // i64.extend_i32_u (ptr)
     }
@@ -2842,6 +2915,8 @@ fn encode_array_elem(kind: ElemKind, got: WType, code: &mut Vec<u8>) -> Result<(
 fn decode_array_elem(kind: ElemKind, code: &mut Vec<u8>) {
     match kind {
         ElemKind::Int => {}                  // already i64
+        // Bool narrows the i64 slot (0/1) back to an i32 Bool.
+        ElemKind::Bool => code.push(0xA7),   // i32.wrap_i64
         ElemKind::Float => code.push(0xBF),  // f64.reinterpret_i64
         ElemKind::Str | ElemKind::Ref => code.push(0xA7), // i32.wrap_i64 (ptr)
     }
@@ -4303,9 +4378,42 @@ fn emit_heap_helper(
                     body.push(LOCAL_GET);
                     leb_u(0, &mut body); // ptr
                     i64_load(CELL_HEADER + SLOT * fi as u64, &mut body);
-                    body.push(I32_WRAP_I64); // Array field address
+                    body.push(I32_WRAP_I64); // Array (or Bytes) field address
                     body.push(CALL);
                     leb_u(drop_array_idx as u64, &mut body);
+                    body.push(DROP); // dummy result
+                }
+                // drop each Vector field via __vec_drop. Omitting these leaked a
+                // Vector field of a dead ADT/record/tuple cell.
+                for fi in info.vec_fields() {
+                    body.push(LOCAL_GET);
+                    leb_u(0, &mut body); // ptr
+                    i64_load(CELL_HEADER + SLOT * fi as u64, &mut body);
+                    body.push(I32_WRAP_I64); // Vector field address
+                    body.push(CALL);
+                    leb_u(drop_vec_idx as u64, &mut body);
+                    body.push(DROP); // dummy result
+                }
+                // drop each Map field via __map_drop (kind-aware from the map's
+                // own header). Omitting these leaked a Map field.
+                for fi in info.map_fields() {
+                    body.push(LOCAL_GET);
+                    leb_u(0, &mut body); // ptr
+                    i64_load(CELL_HEADER + SLOT * fi as u64, &mut body);
+                    body.push(I32_WRAP_I64); // Map field address
+                    body.push(CALL);
+                    leb_u((heap_base + HeapHelper::DropMap.offset()) as u64, &mut body);
+                    body.push(DROP); // dummy result
+                }
+                // drop each Set field via __set_drop. Omitting these leaked a Set
+                // field.
+                for fi in info.set_fields() {
+                    body.push(LOCAL_GET);
+                    leb_u(0, &mut body); // ptr
+                    i64_load(CELL_HEADER + SLOT * fi as u64, &mut body);
+                    body.push(I32_WRAP_I64); // Set field address
+                    body.push(CALL);
+                    leb_u((heap_base + HeapHelper::DropSet.offset()) as u64, &mut body);
                     body.push(DROP); // dummy result
                 }
                 // free(ptr, arity)
@@ -4338,7 +4446,10 @@ fn emit_heap_helper(
                     body.push(CALL);
                     let idx = match t {
                         WType::Str => drop_str_idx,
-                        WType::Array(_) => drop_array_idx,
+                        // A Bytes is an Array(Int) heap object — drop via the
+                        // array drop helper, not the generic ADT `drop` (which
+                        // would treat it as the wrong cell kind and leak it).
+                        WType::Array(_) | WType::Bytes => drop_array_idx,
                         WType::Vector => drop_vec_idx,
                         WType::Map(..) => heap_base + HeapHelper::DropMap.offset(),
                         WType::Set(_) => heap_base + HeapHelper::DropSet.offset(),
@@ -4422,15 +4533,45 @@ fn emit_heap_helper(
                     leb_u(drop_str_idx as u64, &mut body);
                     body.push(DROP); // dummy result
                 }
-                // Array children: release via __array_drop (kind-aware), same as
-                // the full __drop path. The reused slot keeps the cell itself.
+                // Array/Bytes children: release via __array_drop (kind-aware),
+                // same as the full __drop path. The reused slot keeps the cell.
                 for fi in info.array_fields() {
                     body.push(LOCAL_GET);
                     leb_u(0, &mut body); // ptr
                     i64_load(CELL_HEADER + SLOT * fi as u64, &mut body);
-                    body.push(I32_WRAP_I64); // Array child address
+                    body.push(I32_WRAP_I64); // Array/Bytes child address
                     body.push(CALL);
                     leb_u(drop_array_idx as u64, &mut body);
+                    body.push(DROP); // dummy result
+                }
+                // Vector children: release via __vec_drop.
+                for fi in info.vec_fields() {
+                    body.push(LOCAL_GET);
+                    leb_u(0, &mut body); // ptr
+                    i64_load(CELL_HEADER + SLOT * fi as u64, &mut body);
+                    body.push(I32_WRAP_I64); // Vector child address
+                    body.push(CALL);
+                    leb_u(drop_vec_idx as u64, &mut body);
+                    body.push(DROP); // dummy result
+                }
+                // Map children: release via __map_drop.
+                for fi in info.map_fields() {
+                    body.push(LOCAL_GET);
+                    leb_u(0, &mut body); // ptr
+                    i64_load(CELL_HEADER + SLOT * fi as u64, &mut body);
+                    body.push(I32_WRAP_I64); // Map child address
+                    body.push(CALL);
+                    leb_u((heap_base + HeapHelper::DropMap.offset()) as u64, &mut body);
+                    body.push(DROP); // dummy result
+                }
+                // Set children: release via __set_drop.
+                for fi in info.set_fields() {
+                    body.push(LOCAL_GET);
+                    leb_u(0, &mut body); // ptr
+                    i64_load(CELL_HEADER + SLOT * fi as u64, &mut body);
+                    body.push(I32_WRAP_I64); // Set child address
+                    body.push(CALL);
+                    leb_u((heap_base + HeapHelper::DropSet.offset()) as u64, &mut body);
                     body.push(DROP); // dummy result
                 }
                 body.push(END); // end if tag==T
@@ -12976,7 +13117,10 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
                     leb_u(dup_str_idx as u64, &mut body_code);
                     body_code.push(0x1A); // drop dummy
                 }
-                WType::Array(_) => {
+                WType::Array(_) | WType::Bytes => {
+                    // A Bytes is an Array(Int) heap object, so it dup's via the
+                    // shared array dup helper (same as `Array(_)`). Omitting it
+                    // here leaked a captured Bytes.
                     body_code.push(0x20);
                     leb_u(slot as u64, &mut body_code);
                     body_code.push(0x10);
@@ -13058,6 +13202,7 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
                         WType::Ref
                             | WType::Str
                             | WType::Array(_)
+                            | WType::Bytes
                             | WType::Vector
                             | WType::Map(..)
                             | WType::Set(_)
@@ -14655,6 +14800,112 @@ mod tests {
              fn length(xs: L, acc: Int) -> Int = \
                 match xs { Nil => acc, Cons(_, r) => length(r, acc + 1), }\n\
              fn main() -> Int = length(build(300, Nil), 0)",
+        );
+    }
+
+    #[test]
+    fn heap_field_and_capture_kinds_are_garbage_free() {
+        // Regression for the wasm leak of the newer heap kinds (Bytes/Vector/
+        // Map/Set) when they appear as an ADT/record/tuple FIELD or a closure
+        // CAPTURE. Each program keeps two distinct containers live (so at least
+        // one cell is genuinely DROPPED, not in-place reused) and must end
+        // `__live == 0`, matching native.
+
+        // Bytes as an ADT field.
+        differential_heap(
+            "type Box = | B(Bytes)\n\
+             fn snd(a: Box, b: Box) -> Int = match b { B(inner) => bytes_len(inner) }\n\
+             fn main() -> Int = {\n\
+               let x = B(bytes_push(bytes_new(), 1));\n\
+               let y = B(bytes_push(bytes_push(bytes_new(), 2), 3));\n\
+               snd(x, y)\n\
+             }",
+        );
+        // Vector as an ADT field.
+        differential_heap(
+            "type Box = | B(Vector)\n\
+             fn snd(a: Box, b: Box) -> Int = match b { B(inner) => vec_len(inner) }\n\
+             fn main() -> Int = {\n\
+               let x = B(vec_push(vec_new(), 1.0));\n\
+               let y = B(vec_push(vec_push(vec_new(), 2.0), 3.0));\n\
+               snd(x, y)\n\
+             }",
+        );
+        // Map as an ADT field.
+        differential_heap(
+            "type Box = | B(Map[Int, Int])\n\
+             fn snd(a: Box, b: Box) -> Int = match b { B(m) => map_get_or(m, 1, 0) }\n\
+             fn main() -> Int = {\n\
+               let x = B(map_insert(map_new(), 1, 10));\n\
+               let y = B(map_insert(map_insert(map_new(), 1, 20), 2, 30));\n\
+               snd(x, y)\n\
+             }",
+        );
+        // Set as an ADT field.
+        differential_heap(
+            "type Box = | B(Set[Int])\n\
+             fn snd(a: Box, b: Box) -> Int = match b { B(s) => set_len(s) }\n\
+             fn main() -> Int = {\n\
+               let x = B(set_add(set_new(), 5));\n\
+               let y = B(set_add(set_add(set_new(), 7), 9));\n\
+               snd(x, y)\n\
+             }",
+        );
+        // Closure CAPTURING a Bytes — called.
+        differential_heap(
+            "fn main() -> Int = {\n\
+               let b = bytes_push(bytes_push(bytes_new(), 1), 2);\n\
+               let f = \\(n: Int) -> bytes_len(b) + n;\n\
+               f(10)\n\
+             }",
+        );
+        // Closure CAPTURING a Bytes — never called (cell + capture both freed).
+        differential_heap(
+            "fn main() -> Int = {\n\
+               let b = bytes_push(bytes_push(bytes_new(), 1), 2);\n\
+               let f = \\(n: Int) -> bytes_len(b) + n;\n\
+               7\n\
+             }",
+        );
+    }
+
+    #[test]
+    fn map_get_or_value_kind_across_separate_lets() {
+        // Regression for the wasm `map_get_or` value-kind bug. When a map is
+        // built across SEPARATE `let` bindings, the operand map's WType header
+        // can be coarse (`r_r`/`i_i`); the result kind must come from the
+        // monomorphized inserted/default value type, not that header.
+
+        // (a) Bool value built inline (decode_slot Bool must `i32.wrap_i64`).
+        differential(
+            "fn main() -> Int = {\n\
+               let m = map_insert(map_new(), 1, true);\n\
+               if map_get_or(m, 1, false) { 1 } else { 0 }\n\
+             }",
+        );
+        // (a') Bool value across separate lets, Str key.
+        differential(
+            "fn main() -> Int = {\n\
+               let m0 = map_new();\n\
+               let m1 = map_insert(m0, \"k\", true);\n\
+               if map_get_or(m1, \"k\", false) { 7 } else { 0 }\n\
+             }",
+        );
+        // (b) Str value across separate lets (was: `print_str expects one String`).
+        differential_str(
+            "fn main() -> String = {\n\
+               let m0 = map_new();\n\
+               let m1 = map_insert(m0, 1, \"x\");\n\
+               map_get_or(m1, 1, \"d\")\n\
+             }",
+        );
+        // (b') Float value across separate lets (was mistyped like Str).
+        differential_float(
+            "fn main() -> Float = {\n\
+               let m0 = map_new();\n\
+               let m1 = map_insert(m0, 1, 3.5);\n\
+               map_get_or(m1, 1, 0.0)\n\
+             }",
         );
     }
 
