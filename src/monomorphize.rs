@@ -1746,7 +1746,12 @@ fn set_elem_of(ty: &Ty) -> Option<Ty> {
 /// array element-kind tags (`i`/`f`/`s`/`r`). The key tag is always `i` or `s`
 /// (the checker restricts keys to Int/Str); the value tag is unrestricted.
 fn map_suffix(k: &Ty, v: &Ty) -> String {
-    format!("{}_{}", array_elem_tag(k), array_elem_tag(v))
+    // The VALUE position distinguishes Bool (`o`) from Int (`i`) so the backends
+    // render a Bool-valued map (`map_show`) as `true`/`false` rather than `1`/`0`
+    // (native parses the kind from this tag; wasm already accepts `o`). Keys are
+    // only ever Int/Str, so the key tag needs no Bool case.
+    let vtag = if matches!(v, Ty::Bool) { "o" } else { array_elem_tag(v) };
+    format!("{}_{}", array_elem_tag(k), vtag)
 }
 
 /// Whether a concrete Map value type round-trips faithfully through the COMPILED

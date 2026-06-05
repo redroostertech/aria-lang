@@ -1310,6 +1310,13 @@ fn map_set_diff_programs() -> Vec<(String, &'static str)> {
                 .to_string(),
             "Map[apple: 1, fig: 2, pear: 3]",
         ),
+        // Bool VALUES must render as `true`/`false` (not `1`/`0`) in every backend.
+        (
+            "fn main() -> String =\n\
+               map_show(map_insert(map_insert(map_new(), 1, true), 2, false))\n"
+                .to_string(),
+            "Map[1: true, 2: false]",
+        ),
         // Total read: present -> value, absent -> default; len after a replace.
         (
             "fn main() -> Int = {\n\

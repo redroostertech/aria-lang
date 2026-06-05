@@ -758,6 +758,7 @@ fn slot_kind_from_tag(c: char) -> SlotKind {
         'a' => SlotKind::Array,
         'm' => SlotKind::Map,
         'e' => SlotKind::Set,
+        'o' => SlotKind::Bool,
         _ => SlotKind::Ref,
     }
 }
