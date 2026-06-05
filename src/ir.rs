@@ -162,6 +162,22 @@ const IR_BUILTINS: &[&str] = &[
     "bytes_push",
     "bytes_from_str",
     "bytes_to_str",
+    // Vector / embedding builtins. The IR LOWERING lets them through to a
+    // `Bind::Call` so the native (C) backend (which lowers via this same path)
+    // can emit them. The IR tree-walking INTERPRETER (`aria mem`) does NOT
+    // implement them — it gates them with a clean error in `Bind::Call` dispatch
+    // (the tree-walking `interp::Interp` is the oracle for vectors instead).
+    "vec_new",
+    "vec_from_array",
+    "vec_to_array",
+    "vec_len",
+    "vec_get",
+    "vec_push",
+    "vec_dot",
+    "vec_norm",
+    "vec_cosine",
+    "vec_add",
+    "vec_scale",
 ];
 
 /// Heap-cell constructor tag for a functional array. Starts with `$` so it can
@@ -466,6 +482,7 @@ impl Lowerer {
                 if !name.starts_with("array_")
                     && !name.starts_with("map_")
                     && !name.starts_with("set_")
+                    && !name.starts_with("vec_")
                     && (self.bound.contains(name)
                         || (!self.fn_arities.contains_key(name)
                             && crate::builtins::lookup(name).is_none()))
@@ -1550,6 +1567,19 @@ impl IrInterp {
             Bind::Call(name, args) => {
                 let vals: Vec<IValue> =
                     args.iter().map(|a| self.atom(a, env)).collect::<Result<_, _>>()?;
+                // Vectors are FULLY supported by the tree-walking interpreter and
+                // the native (C) backend, but NOT by the IR memory path (`aria
+                // mem`). Lowering lets `vec_*` through (so the native backend, which
+                // shares this lowering, can emit them); reaching the IR interpreter
+                // here means we are on the `aria mem` path — gate with a clean error.
+                if name.starts_with("vec_") && crate::builtins::lookup(name).is_some() {
+                    return Err(format!(
+                        "vectors are not yet supported in the IR memory path \
+                         (`aria mem`) — use the interpreter `aria run` or the \
+                         native backend `aria native-run`: builtin `{}`",
+                        name
+                    ));
+                }
                 // Array builtins manage heap cells + reference counts directly
                 // (they need `&mut self`), so they are handled here rather than in
                 // the `&self` `builtin` helper used for the unboxed builtins.

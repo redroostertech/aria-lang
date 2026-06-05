@@ -203,6 +203,13 @@ impl WType {
                  `aria native-run`): type `{}`",
                 n
             )),
+            // The Vector / embedding type is supported by the interpreter and the
+            // native (C) backend, but NOT the wasm backend — gate cleanly.
+            Ty::Named(n, _) if n == "Vector" => Err(
+                "vectors are not yet supported in the wasm backend \
+                 (use the interpreter `aria run` or the native backend \
+                 `aria native-run`): type `Vector`".to_string(),
+            ),
             // A named ADT becomes a heap reference. (Generics — args present —
             // are out of the 2b subset and rejected below.)
             Ty::Named(_, args) if args.is_empty() => Ok(WType::Ref),
@@ -1016,6 +1023,14 @@ fn bind_type(bind: &Bind, env: &LocalEnv) -> Result<WType, String> {
                     name
                 ));
             }
+            if name.starts_with("vec_") && crate::builtins::lookup(name).is_some() {
+                return Err(format!(
+                    "vectors are not yet supported in the wasm backend \
+                     (use the interpreter `aria run` or the native backend \
+                     `aria native-run`): builtin `{}`",
+                    name
+                ));
+            }
             let sig = env
                 .sigs
                 .get(name)
@@ -1412,6 +1427,14 @@ fn emit_bind(bind: &Bind, env: &mut LocalEnv, code: &mut Vec<u8>) -> Result<WTyp
             if is_map_set_builtin(name) {
                 return Err(format!(
                     "maps/sets are not yet supported in the wasm backend \
+                     (use the interpreter `aria run` or the native backend \
+                     `aria native-run`): builtin `{}`",
+                    name
+                ));
+            }
+            if name.starts_with("vec_") && crate::builtins::lookup(name).is_some() {
+                return Err(format!(
+                    "vectors are not yet supported in the wasm backend \
                      (use the interpreter `aria run` or the native backend \
                      `aria native-run`): builtin `{}`",
                     name

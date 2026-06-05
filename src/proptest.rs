@@ -926,7 +926,7 @@ fn run_native_live(c_src: &str) -> Result<(String, i64), String> {
     let exe = dir.join(format!("aria_pte_{}_{}", std::process::id(), n));
     std::fs::write(&cpath, c_src).map_err(|e| e.to_string())?;
     let cc = std::process::Command::new("cc")
-        .arg("-O2").arg("-std=c11").arg("-o").arg(&exe).arg(&cpath)
+        .arg("-O2").arg("-std=c11").arg("-o").arg(&exe).arg(&cpath).arg("-lm")
         .output().map_err(|e| e.to_string())?;
     let _ = std::fs::remove_file(&cpath);
     if !cc.status.success() {
@@ -1432,5 +1432,200 @@ fn native_rejects_non_flat_map_values() {
             err,
             src
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 10) Vectors / embeddings differential: interp (oracle) vs native (cc-gated).
+//     Vectors are NOT supported by the wasm backend, so wasm is intentionally
+//     excluded (and asserted to be cleanly rejected). Each program exercises
+//     from_array/to_array round-trip, dot, cosine of parallel/orthogonal/zero-
+//     norm vectors, norm, add, scale, push/get/len, and the canonical
+//     `Vector[..]` display. The interpreter and the native backend must produce
+//     IDENTICAL results AND the native heap must be garbage-free (live == 0).
+//     Programs return an Int, a Float, or the canonical Vector display String;
+//     `run_native_live` compares the final value.
+// ---------------------------------------------------------------------------
+
+/// Hand-written Vector programs and their expected results (Int / Float-as-string
+/// / canonical `Vector[..]` String).
+fn vector_diff_programs() -> Vec<(String, &'static str)> {
+    vec![
+        // dot product.
+        (
+            "fn main() -> Float =\n\
+               vec_dot(vec_from_array([1.0, 2.0, 3.0]), vec_from_array([4.0, 5.0, 6.0]))\n"
+                .to_string(),
+            "32",
+        ),
+        // L2 norm (sqrt(9 + 16) = 5).
+        (
+            "fn main() -> Float = vec_norm(vec_from_array([3.0, 4.0]))\n".to_string(),
+            "5",
+        ),
+        // cosine of identical (parallel) vectors is 1.0.
+        (
+            "fn main() -> Float =\n\
+               vec_cosine(vec_from_array([1.0, 0.0]), vec_from_array([1.0, 0.0]))\n"
+                .to_string(),
+            "1",
+        ),
+        // cosine of orthogonal vectors is 0.0.
+        (
+            "fn main() -> Float =\n\
+               vec_cosine(vec_from_array([1.0, 0.0]), vec_from_array([0.0, 1.0]))\n"
+                .to_string(),
+            "0",
+        ),
+        // ZERO-NORM policy: cosine with an all-zero operand is 0.0, not NaN.
+        (
+            "fn main() -> Float =\n\
+               vec_cosine(vec_from_array([1.0, 2.0]), vec_from_array([0.0, 0.0]))\n"
+                .to_string(),
+            "0",
+        ),
+        // elementwise add -> canonical Vector display.
+        (
+            "fn main() -> Vector =\n\
+               vec_add(vec_from_array([1.0, 2.0, 3.0]), vec_from_array([4.0, 5.0, 6.0]))\n"
+                .to_string(),
+            "Vector[5, 7, 9]",
+        ),
+        // scale -> canonical Vector display (shortest-round-trip floats).
+        (
+            "fn main() -> Vector = vec_scale(vec_from_array([1.5, 2.0]), 2.0)\n".to_string(),
+            "Vector[3, 4]",
+        ),
+        // from_array/to_array round-trip + indexing (Float through Array).
+        (
+            "fn main() -> Float = {\n\
+               let a = vec_from_array([7.0, 8.0, 9.0]);\n\
+               let xs = vec_to_array(a);\n\
+               xs[1]\n\
+             }\n"
+                .to_string(),
+            "8",
+        ),
+        // push / len / get (FBIP push, then read back).
+        (
+            "fn main() -> Float = {\n\
+               let a = vec_push(vec_push(vec_new(), 1.5), 2.5);\n\
+               vec_get(a, 1)\n\
+             }\n"
+                .to_string(),
+            "2.5",
+        ),
+        // empty vector displays as `Vector[]`.
+        (
+            "fn main() -> Vector = vec_new()\n".to_string(),
+            "Vector[]",
+        ),
+        // equality of two equal vectors (as an Int).
+        (
+            "fn main() -> Int = {\n\
+               let a = vec_from_array([1.0, 2.0]);\n\
+               let b = vec_from_array([1.0, 2.0]);\n\
+               if a == b { 1 } else { 0 }\n\
+             }\n"
+                .to_string(),
+            "1",
+        ),
+        // A shared vector forces copy-on-write on scale (still garbage-free):
+        // the scaled copy and the original both contribute.
+        (
+            "fn use2(v: Vector) -> Float =\n\
+               vec_get(vec_scale(v, 10.0), 0) + vec_get(v, 0)\n\
+             fn main() -> Float = use2(vec_from_array([3.0, 0.0]))\n"
+                .to_string(),
+            // scaled copy idx0 = 30, original idx0 = 3 -> 33
+            "33",
+        ),
+    ]
+}
+
+#[test]
+fn vectors_interp_matches_compiled() {
+    let progs = vector_diff_programs();
+    let cc = cc_available();
+    let mut native_checked = 0u64;
+
+    for (src, expected) in &progs {
+        // Oracle: tree-walking interpreter.
+        let interp = ast_run(src).unwrap_or_else(|e| panic!("interp failed: {}\n{}", e, src));
+        assert_eq!(
+            &interp, expected,
+            "interpreter result mismatch\n{}\n got={} want={}",
+            src, interp, expected
+        );
+
+        let prog = parser::parse(lexer::lex(src).expect("lex")).expect("parse");
+        assert!(typeck::check(&prog).is_ok(), "type error\n{}", src);
+
+        // Native (C) backend: identical result + garbage-free (live == 0).
+        if cc {
+            let c_src = crate::c_backend::compile(&prog)
+                .unwrap_or_else(|e| panic!("c_backend failed: {}\n{}", e, src));
+            let (nat, live) = run_native_live(&c_src)
+                .unwrap_or_else(|e| panic!("native runner failed: {}\n{}", e, src));
+            assert_eq!(nat, *expected, "native != expected\n{}\n native={}", src, nat);
+            assert_eq!(live, 0, "native leaked {} cell(s)\n{}", live, src);
+            native_checked += 1;
+        }
+
+        // The wasm backend must cleanly REJECT vectors (never compile/panic).
+        let bytes = wasm::compile(&prog);
+        assert!(
+            bytes.is_err(),
+            "wasm backend unexpectedly accepted a vector program\n{}",
+            src
+        );
+        assert!(
+            bytes.unwrap_err().contains("vectors are not yet supported"),
+            "wasm rejection message should mention vectors\n{}",
+            src
+        );
+    }
+
+    eprintln!(
+        "vectors_interp_matches_compiled: {} programs ({} native)",
+        progs.len(),
+        native_checked
+    );
+}
+
+/// Error cases (length mismatch on dot/add/cosine, OOB vec_get) must surface as a
+/// CLEAN runtime error in the interpreter AND a CLEAN trap (`abort` -> "TRAP", no
+/// panic) in the native backend — never a panic or silent wrong answer.
+#[test]
+fn vector_error_cases_clean_on_interp_and_native() {
+    let cc = cc_available();
+    let cases = [
+        // length mismatch on dot.
+        "fn main() -> Float = vec_dot(vec_from_array([1.0, 2.0]), vec_from_array([1.0]))\n",
+        // length mismatch on add.
+        "fn main() -> Vector = vec_add(vec_from_array([1.0, 2.0]), vec_from_array([1.0]))\n",
+        // length mismatch on cosine.
+        "fn main() -> Float = vec_cosine(vec_from_array([1.0, 2.0]), vec_from_array([1.0]))\n",
+        // OOB vec_get.
+        "fn main() -> Float = vec_get(vec_from_array([1.0, 2.0]), 5)\n",
+    ];
+    for src in cases {
+        // Interpreter: a clean Err (no panic).
+        assert!(
+            ast_run(src).is_err(),
+            "interpreter should reject with a clean error\n{}",
+            src
+        );
+        // Native: compiles, then TRAPs at run time (clean abort), live accounting
+        // intact (the trap aborts before the leak check, surfaced as "TRAP").
+        if cc {
+            let prog = parser::parse(lexer::lex(src).expect("lex")).expect("parse");
+            assert!(typeck::check(&prog).is_ok(), "type error\n{}", src);
+            let c_src = crate::c_backend::compile(&prog)
+                .unwrap_or_else(|e| panic!("c_backend failed: {}\n{}", e, src));
+            let (nat, _live) = run_native_live(&c_src)
+                .unwrap_or_else(|e| panic!("native runner failed: {}\n{}", e, src));
+            assert_eq!(nat, "TRAP", "native should trap cleanly\n{}\n got={}", src, nat);
+        }
     }
 }

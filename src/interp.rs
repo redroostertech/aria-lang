@@ -30,6 +30,10 @@ pub enum Value {
     Map(Vec<(Value, Value)>),
     /// An ordered set (`Set[T]`), kept SORTED ascending. Elements are Int or Str.
     Set(Vec<Value>),
+    /// A dense, immutable float vector / embedding (`Vector`). A flat buffer of
+    /// `f64`. Distinct type tag from `Array[Float]`, so `==`/display never
+    /// conflate the two even with identical elements.
+    Vector(Vec<f64>),
     /// An opaque AI-runtime tensor handle, built and queried via builtins.
     Tensor(crate::tensor::Tensor),
     /// A first-class function value. A lambda captures the environment in which
@@ -79,6 +83,7 @@ impl Value {
                 let inner: Vec<String> = elems.iter().map(|v| v.display()).collect();
                 format!("Set[{}]", inner.join(", "))
             }
+            Value::Vector(xs) => render_vector(xs),
             Value::Closure(c) => {
                 format!("<closure/{}>", c.params.len())
             }
@@ -101,6 +106,27 @@ impl Value {
 pub fn render_bytes(bs: &[u8]) -> String {
     let inner: Vec<String> = bs.iter().map(|b| format!("{:02x}", b)).collect();
     format!("Bytes[{}]", inner.join(" "))
+}
+
+/// The ONE canonical textual rendering of a `Vector` value, emitted byte-for-byte
+/// identically by the interpreter and the native backend: the literal `Vector[`,
+/// then each element via the SAME shortest-round-trip float formatter used for a
+/// scalar `Float` (`format!("{}", f)` here; `aria_fmt_float` in native), comma +
+/// space separated, then `]`. Empty is `Vector[]`.
+pub fn render_vector(xs: &[f64]) -> String {
+    let inner: Vec<String> = xs.iter().map(|f| format!("{}", f)).collect();
+    format!("Vector[{}]", inner.join(", "))
+}
+
+/// Sum of elementwise products of two equal-length float slices (the caller
+/// guarantees equal lengths). The native backend uses the identical left-to-right
+/// summation order so the float result is byte-for-byte identical.
+fn dot(x: &[f64], y: &[f64]) -> f64 {
+    let mut acc = 0.0;
+    for (a, b) in x.iter().zip(y) {
+        acc += a * b;
+    }
+    acc
 }
 
 /// Total ordering on map keys / set elements. Keys are restricted to Int and Str
@@ -731,6 +757,12 @@ fn values_equal(a: &Value, b: &Value) -> bool {
         (Value::Set(x), Value::Set(y)) => {
             x.len() == y.len() && x.iter().zip(y).all(|(a, b)| values_equal(a, b))
         }
+        // A Vector compares by length + elements exactly (bitwise float `==`, so
+        // NaN != NaN, matching scalar Float equality). A Vector never equals an
+        // Array[Float] (distinct tags; falls through to `false`).
+        (Value::Vector(x), Value::Vector(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(a, b)| a == b)
+        }
         // Tensors compare structurally (shape + contents). Without this arm,
         // `t == t` fell through to `false`, silently disagreeing with the type
         // checker which accepts `==` on Tensor.
@@ -1068,6 +1100,118 @@ fn builtin(name: &str, args: &[Value]) -> Result<Option<Value>, String> {
             _ => Err("bytes_to_str expects (Bytes)".into()),
         },
 
+        // ---- Vector / Embedding (dense, immutable buffer of Float) ----------
+        // The interpreter is the reference oracle. `push`/`add`/`scale` are
+        // functional (a fresh Vec); the native backend's FBIP in-place reuse is a
+        // pure optimization. Length-mismatch on dot/cosine/add and OOB get are
+        // clean runtime errors; cosine of a zero-norm operand is 0.0 (no /0).
+        "vec_new" => match args {
+            [] => Ok(Some(Value::Vector(Vec::new()))),
+            _ => Err("vec_new expects no arguments".into()),
+        },
+        "vec_from_array" => match args {
+            [Value::Array(xs)] => {
+                let mut out = Vec::with_capacity(xs.len());
+                for v in xs {
+                    match v {
+                        Value::Float(f) => out.push(*f),
+                        _ => return Err("vec_from_array expects (Array[Float])".into()),
+                    }
+                }
+                Ok(Some(Value::Vector(out)))
+            }
+            _ => Err("vec_from_array expects (Array[Float])".into()),
+        },
+        "vec_to_array" => match args {
+            [Value::Vector(xs)] => {
+                Ok(Some(Value::Array(xs.iter().map(|f| Value::Float(*f)).collect())))
+            }
+            _ => Err("vec_to_array expects (Vector)".into()),
+        },
+        "vec_len" => match args {
+            [Value::Vector(xs)] => Ok(Some(Value::Int(xs.len() as i64))),
+            _ => Err("vec_len expects (Vector)".into()),
+        },
+        "vec_get" => match args {
+            [Value::Vector(xs), Value::Int(i)] => {
+                if *i < 0 || *i as usize >= xs.len() {
+                    return Err(format!(
+                        "vec_get index {} out of range for vector of length {}",
+                        i,
+                        xs.len()
+                    ));
+                }
+                Ok(Some(Value::Float(xs[*i as usize])))
+            }
+            _ => Err("vec_get expects (Vector, Int)".into()),
+        },
+        "vec_push" => match args {
+            [Value::Vector(xs), Value::Float(v)] => {
+                let mut out = xs.clone();
+                out.push(*v);
+                Ok(Some(Value::Vector(out)))
+            }
+            _ => Err("vec_push expects (Vector, Float)".into()),
+        },
+        "vec_dot" => match args {
+            [Value::Vector(x), Value::Vector(y)] => {
+                if x.len() != y.len() {
+                    return Err(format!(
+                        "vec_dot length mismatch: {} vs {}",
+                        x.len(),
+                        y.len()
+                    ));
+                }
+                Ok(Some(Value::Float(dot(x, y))))
+            }
+            _ => Err("vec_dot expects (Vector, Vector)".into()),
+        },
+        "vec_norm" => match args {
+            [Value::Vector(x)] => Ok(Some(Value::Float(dot(x, x).sqrt()))),
+            _ => Err("vec_norm expects (Vector)".into()),
+        },
+        "vec_cosine" => match args {
+            [Value::Vector(x), Value::Vector(y)] => {
+                if x.len() != y.len() {
+                    return Err(format!(
+                        "vec_cosine length mismatch: {} vs {}",
+                        x.len(),
+                        y.len()
+                    ));
+                }
+                let nx = dot(x, x).sqrt();
+                let ny = dot(y, y).sqrt();
+                // Zero-norm policy: return 0.0 (never divide by zero -> NaN).
+                if nx == 0.0 || ny == 0.0 {
+                    Ok(Some(Value::Float(0.0)))
+                } else {
+                    Ok(Some(Value::Float(dot(x, y) / (nx * ny))))
+                }
+            }
+            _ => Err("vec_cosine expects (Vector, Vector)".into()),
+        },
+        "vec_add" => match args {
+            [Value::Vector(x), Value::Vector(y)] => {
+                if x.len() != y.len() {
+                    return Err(format!(
+                        "vec_add length mismatch: {} vs {}",
+                        x.len(),
+                        y.len()
+                    ));
+                }
+                Ok(Some(Value::Vector(
+                    x.iter().zip(y).map(|(a, b)| a + b).collect(),
+                )))
+            }
+            _ => Err("vec_add expects (Vector, Vector)".into()),
+        },
+        "vec_scale" => match args {
+            [Value::Vector(x), Value::Float(s)] => {
+                Ok(Some(Value::Vector(x.iter().map(|a| a * s).collect())))
+            }
+            _ => Err("vec_scale expects (Vector, Float)".into()),
+        },
+
         // ---- Ordered Map ---------------------------------------------------
         // A Map is a Vec of (key, value) kept sorted by key. The interpreter is
         // the oracle, so it copies (the compiled backends reuse in place when
@@ -1271,6 +1415,10 @@ mod tests {
                 Value::Map(vec![(distinct_dummy_key(&args[0]), dummy(&args[1]))])
             }
             Named(n, args) if n == "Set" => Value::Set(vec![distinct_dummy_key(&args[0])]),
+            // A one-element float vector, so the vector builtins have something to
+            // index/operate on. `vec_from_array` is driven with `dummy(Array[Float])`
+            // (a one-element `Array` of `Float(0.0)`), so it succeeds.
+            Named(n, _) if n == "Vector" => Value::Vector(vec![0.0]),
             // A generic element position: any concrete value will do.
             Var(_) => Value::Int(0),
             other => panic!("drift test has no dummy for {}", crate::typeck::show(other)),
@@ -1315,6 +1463,7 @@ mod tests {
                 "Set".into(),
                 vec![elems.first().map(value_ty).unwrap_or(Var("T".into()))],
             ),
+            Value::Vector(_) => Named("Vector".into(), vec![]),
             Value::Data { ctor, .. } => Named(ctor.clone(), vec![]),
             Value::Closure(c) => {
                 Fn(c.params.iter().map(|_| Unit).collect(), Box::new(Unit))
@@ -1578,6 +1727,120 @@ mod tests {
             run_err("fn main() -> String = bytes_to_str(bytes_push(bytes_new(), 255))")
                 .contains("invalid UTF-8")
         );
+    }
+
+    // ---- Vector / Embedding (interpreter oracle behavior) ---------------
+
+    #[test]
+    fn vector_build_dot_norm_and_roundtrip() {
+        // from_array -> dot / norm; to_array round-trip preserves elements.
+        let v = run(r#"
+            fn main() -> Float = {
+                let a = vec_from_array([1.0, 2.0, 3.0]);
+                let b = vec_from_array([4.0, 5.0, 6.0]);
+                vec_dot(a, b)
+            }
+        "#);
+        // 1*4 + 2*5 + 3*6 = 32
+        assert!(matches!(v, Value::Float(f) if f == 32.0), "got {}", v.display());
+
+        let n = run("fn main() -> Float = vec_norm(vec_from_array([3.0, 4.0]))");
+        // sqrt(9 + 16) = 5
+        assert!(matches!(n, Value::Float(f) if f == 5.0), "got {}", n.display());
+
+        // to_array round-trip: index 1 of the array of a Vector.
+        let r = run(r#"
+            fn main() -> Float = {
+                let a = vec_from_array([7.0, 8.0, 9.0]);
+                let xs = vec_to_array(a);
+                xs[1]
+            }
+        "#);
+        assert!(matches!(r, Value::Float(f) if f == 8.0), "got {}", r.display());
+
+        // push / len / get.
+        let g = run(r#"
+            fn main() -> Float = {
+                let a = vec_push(vec_push(vec_new(), 1.5), 2.5);
+                vec_get(a, 1)
+            }
+        "#);
+        assert!(matches!(g, Value::Float(f) if f == 2.5), "got {}", g.display());
+    }
+
+    #[test]
+    fn vector_cosine_parallel_orthogonal_and_zero_norm() {
+        // cosine of identical (parallel) unit vectors is exactly 1.0.
+        let par = run(r#"fn main() -> Float =
+            vec_cosine(vec_from_array([1.0, 0.0]), vec_from_array([1.0, 0.0]))"#);
+        assert!(matches!(par, Value::Float(f) if f == 1.0), "got {}", par.display());
+
+        // cosine of orthogonal vectors is exactly 0.0.
+        let orth = run(r#"fn main() -> Float =
+            vec_cosine(vec_from_array([1.0, 0.0]), vec_from_array([0.0, 1.0]))"#);
+        assert!(matches!(orth, Value::Float(f) if f == 0.0), "got {}", orth.display());
+
+        // ZERO-NORM policy: an all-zero (or empty) operand yields 0.0, NOT NaN.
+        let zn = run(r#"fn main() -> Float =
+            vec_cosine(vec_from_array([1.0, 2.0]), vec_from_array([0.0, 0.0]))"#);
+        assert!(matches!(zn, Value::Float(f) if f == 0.0), "got {}", zn.display());
+        // The result must not be NaN.
+        if let Value::Float(f) = zn {
+            assert!(!f.is_nan(), "zero-norm cosine produced NaN");
+        }
+    }
+
+    #[test]
+    fn vector_add_scale_display_and_equality() {
+        // add (elementwise) + canonical `Vector[..]` display (shortest round-trip
+        // floats, comma+space separated; empty `Vector[]`).
+        let v = run(r#"fn main() -> Vector =
+            vec_add(vec_from_array([1.0, 2.0, 3.0]), vec_from_array([4.0, 5.0, 6.0]))"#);
+        assert_eq!(v.display(), "Vector[5, 7, 9]");
+        assert_eq!(run("fn main() -> Vector = vec_new()").display(), "Vector[]");
+
+        let s = run("fn main() -> Vector = vec_scale(vec_from_array([1.5, 2.0]), 2.0)");
+        assert_eq!(s.display(), "Vector[3, 4]");
+
+        // `==` compares length + elements exactly.
+        let eq = run(r#"fn main() -> Bool =
+            vec_from_array([1.0, 2.0]) == vec_from_array([1.0, 2.0])"#);
+        assert!(matches!(eq, Value::Bool(true)));
+        let ne = run(r#"fn main() -> Bool =
+            vec_from_array([1.0, 2.0]) == vec_from_array([1.0, 3.0])"#);
+        assert!(matches!(ne, Value::Bool(false)));
+        // Different length -> not equal.
+        let nl = run(r#"fn main() -> Bool =
+            vec_from_array([1.0]) == vec_from_array([1.0, 2.0])"#);
+        assert!(matches!(nl, Value::Bool(false)));
+        // Distinct tags: a Vector and an Array[Float] with identical elements are
+        // NOT equal (even though the type checker also rejects comparing them).
+        assert!(!values_equal(
+            &Value::Vector(vec![1.0, 2.0]),
+            &Value::Array(vec![Value::Float(1.0), Value::Float(2.0)])
+        ));
+    }
+
+    #[test]
+    fn vector_error_cases_are_clean_runtime_errors() {
+        // OOB index on get -> clean runtime error (not a panic).
+        assert!(run_err("fn main() -> Float = vec_get(vec_from_array([1.0, 2.0]), 5)")
+            .contains("out of range"));
+        assert!(run_err("fn main() -> Float = vec_get(vec_from_array([1.0]), -1)")
+            .contains("out of range"));
+        // Length mismatch on dot / cosine / add -> clean runtime error.
+        assert!(run_err(
+            "fn main() -> Float = vec_dot(vec_from_array([1.0, 2.0]), vec_from_array([1.0]))"
+        )
+        .contains("length mismatch"));
+        assert!(run_err(
+            "fn main() -> Float = vec_cosine(vec_from_array([1.0, 2.0]), vec_from_array([1.0]))"
+        )
+        .contains("length mismatch"));
+        assert!(run_err(
+            "fn main() -> Vector = vec_add(vec_from_array([1.0, 2.0]), vec_from_array([1.0]))"
+        )
+        .contains("length mismatch"));
     }
 
     // ---- Map / Set (interpreter oracle behavior) ------------------------

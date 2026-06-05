@@ -1913,6 +1913,88 @@ mod tests {
         );
     }
 
+    // ---- Vector builtin type & signatures -------------------------------
+
+    #[test]
+    fn vector_is_a_builtin_type_with_correct_signatures() {
+        use crate::ast::Ty::*;
+        use crate::builtins;
+        // `Vector` is a declared builtin (opaque) type name (nullary).
+        assert!(builtins::BUILTIN_TYPES.contains(&"Vector"));
+        let vector = Named("Vector".to_string(), vec![]);
+        let float_array = Named("Array".to_string(), vec![Float]);
+        // Each vector builtin has the expected (params, ret) signature.
+        let cases: &[(&str, Vec<Ty>, Ty)] = &[
+            ("vec_new", vec![], vector.clone()),
+            ("vec_from_array", vec![float_array.clone()], vector.clone()),
+            ("vec_to_array", vec![vector.clone()], float_array.clone()),
+            ("vec_len", vec![vector.clone()], Int),
+            ("vec_get", vec![vector.clone(), Int], Float),
+            ("vec_push", vec![vector.clone(), Float], vector.clone()),
+            ("vec_dot", vec![vector.clone(), vector.clone()], Float),
+            ("vec_norm", vec![vector.clone()], Float),
+            ("vec_cosine", vec![vector.clone(), vector.clone()], Float),
+            ("vec_add", vec![vector.clone(), vector.clone()], vector.clone()),
+            ("vec_scale", vec![vector.clone(), Float], vector.clone()),
+        ];
+        for (name, params, ret) in cases {
+            let (p, r) = builtins::lookup(name)
+                .unwrap_or_else(|| panic!("builtin `{}` missing from signature table", name));
+            assert_eq!(&p, params, "param mismatch for `{}`", name);
+            assert_eq!(&r, ret, "return mismatch for `{}`", name);
+        }
+    }
+
+    #[test]
+    fn vector_program_type_checks() {
+        // A representative Vector program type-checks: build via from_array and
+        // push, compute dot/cosine/norm (Float).
+        let ok = r#"
+            fn main() -> Float = {
+                let a = vec_from_array([1.0, 2.0, 3.0]);
+                let b = vec_push(vec_new(), 4.0);
+                vec_dot(a, a) + vec_norm(a) + vec_cosine(a, b)
+            }
+        "#;
+        assert!(check_src(ok).is_ok(), "got: {:?}", check_src(ok));
+
+        // `vec_to_array` round-trips to an Array[Float]; indexing yields Float.
+        let ok2 = r#"
+            fn main() -> Float = {
+                let a = vec_from_array([5.0, 6.0]);
+                let xs = vec_to_array(a);
+                xs[0]
+            }
+        "#;
+        assert!(check_src(ok2).is_ok(), "got: {:?}", check_src(ok2));
+    }
+
+    #[test]
+    fn vec_from_array_requires_float_array_not_int_array() {
+        // `vec_from_array` requires `Array[Float]`; an `Array[Int]` is a type
+        // error (the float-array parameter type does not unify with Array[Int]).
+        let bad = r#"fn main() -> Vector = vec_from_array([1, 2, 3])"#;
+        let errs = check_src(bad).unwrap_err();
+        assert!(
+            !errs.is_empty(),
+            "expected a type error for vec_from_array(Array[Int]), got OK"
+        );
+    }
+
+    #[test]
+    fn vector_neq_array_float_is_rejected() {
+        // A `Vector` and an `Array[Float]` are distinct types, so comparing them
+        // is a type error (the runtime distinct-tag invariant is enforced at the
+        // type level too).
+        let bad = r#"fn main() -> Bool = vec_from_array([1.0]) == [1.0]"#;
+        let errs = check_src(bad).unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains("cannot compare") || e.contains("compare")),
+            "expected a compare error, got: {:?}",
+            errs
+        );
+    }
+
     // ---- Map / Set builtin types, signatures & key restriction ----------
 
     #[test]

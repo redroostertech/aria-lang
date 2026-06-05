@@ -317,6 +317,8 @@ fn cc_build(c_src: &str, out_path: &std::path::Path) -> Result<(), String> {
         .arg("-o")
         .arg(out_path)
         .arg(&c_path)
+        // Link libm for the math functions used by the Vector runtime (sqrt).
+        .arg("-lm")
         .output();
     let _ = std::fs::remove_file(&c_path);
     match status {

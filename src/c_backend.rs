@@ -99,7 +99,8 @@ impl ElemKind {
             CType::Str => ElemKind::Str,
             // A Bytes/Map/Set buffer is a heap pointer, so an array element of one
             // is a boxed heap ref (recursive drop), like a nested Array/ADT.
-            CType::Ref | CType::Bytes | CType::Array(_) | CType::Map(..) | CType::Set(_) => {
+            CType::Ref | CType::Bytes | CType::Array(_) | CType::Map(..) | CType::Set(_)
+            | CType::Vector => {
                 ElemKind::Ref
             }
         }
@@ -124,6 +125,7 @@ enum SlotKind {
     Set,   // AriaSet* — aria_set_drop
     Bool,  // Bool — stored directly (0/1); distinct from Int so DISPLAY renders
            // `true`/`false` (matching the interpreter) rather than `1`/`0`.
+    Vector, // AriaVector* — aria_vec_drop
 }
 
 impl SlotKind {
@@ -138,6 +140,7 @@ impl SlotKind {
             SlotKind::Map => 6,
             SlotKind::Set => 7,
             SlotKind::Bool => 8,
+            SlotKind::Vector => 9,
         }
     }
     fn from_ctype(ct: CType) -> SlotKind {
@@ -151,6 +154,7 @@ impl SlotKind {
             CType::Array(_) => SlotKind::Array,
             CType::Map(..) => SlotKind::Map,
             CType::Set(_) => SlotKind::Set,
+            CType::Vector => SlotKind::Vector,
         }
     }
     /// Encode an evaluated C expression of value type `t` into an int64 slot.
@@ -186,6 +190,7 @@ enum CType {
     Array(ElemKind),     // void* — heap AriaArray of the given element kind
     Map(SlotKind, SlotKind), // void* — heap AriaMap (key kind, value kind)
     Set(SlotKind),       // void* — heap AriaSet (element kind)
+    Vector,              // void* — heap AriaVector buffer (flat f64 vector / embedding)
 }
 
 impl CType {
@@ -199,7 +204,8 @@ impl CType {
             | CType::Bytes
             | CType::Array(_)
             | CType::Map(..)
-            | CType::Set(_) => "void*",
+            | CType::Set(_)
+            | CType::Vector => "void*",
         }
     }
 
@@ -216,6 +222,8 @@ impl CType {
                 Ok(CType::Array(ElemKind::from_ctype(elem)))
             }
             Ty::Named(n, _) if n == "Bytes" => Ok(CType::Bytes),
+            // The opaque, reference-counted dense float vector / embedding.
+            Ty::Named(n, _) if n == "Vector" => Ok(CType::Vector),
             Ty::Named(n, args) if n == "Map" && args.len() == 2 => {
                 let k = SlotKind::from_ctype(CType::from_ty(&args[0])?);
                 let v_ct = CType::from_ty(&args[1])?;
@@ -683,6 +691,13 @@ fn builtin_ret(name: &str) -> Option<CType> {
         // Bytes builtins (non-generic; no element-kind suffix).
         "bytes_new" | "bytes_set" | "bytes_push" | "bytes_from_str" => Some(CType::Bytes),
         "bytes_len" | "bytes_get" => Some(CType::Int),
+        // Vector / embedding builtins (non-generic; no element-kind suffix).
+        "vec_new" | "vec_from_array" | "vec_push" | "vec_add" | "vec_scale" => {
+            Some(CType::Vector)
+        }
+        "vec_to_array" => Some(CType::Array(ElemKind::Float)),
+        "vec_len" => Some(CType::Int),
+        "vec_get" | "vec_dot" | "vec_norm" | "vec_cosine" => Some(CType::Float),
         _ => None,
     }
 }
@@ -796,6 +811,7 @@ fn slot_kind_ctype(k: SlotKind) -> CType {
         SlotKind::Array => CType::Array(ElemKind::Ref),
         SlotKind::Map => CType::Map(SlotKind::Ref, SlotKind::Ref),
         SlotKind::Set => CType::Set(SlotKind::Ref),
+        SlotKind::Vector => CType::Vector,
         SlotKind::Ref => CType::Ref,
     }
 }
@@ -859,6 +875,9 @@ fn emit_iexpr(
                 CType::Set(_) => {
                     let _ = writeln!(out, "{}aria_set_dup({});", ind, cvar(v));
                 }
+                CType::Vector => {
+                    let _ = writeln!(out, "{}aria_vec_dup({});", ind, cvar(v));
+                }
                 _ => {}
             }
             emit_iexpr(body, result, result_ty, env, ind, out)
@@ -882,6 +901,9 @@ fn emit_iexpr(
                 }
                 CType::Set(_) => {
                     let _ = writeln!(out, "{}aria_set_drop({});", ind, cvar(v));
+                }
+                CType::Vector => {
+                    let _ = writeln!(out, "{}aria_vec_drop({});", ind, cvar(v));
                 }
                 _ => {}
             }
@@ -1000,7 +1022,7 @@ fn emit_make_closure(
             CType::Float => {
                 let _ = writeln!(out, "{}aria_field({}, {}) = aria_f2i({});", ind, dst, i, ex);
             }
-            CType::Ref | CType::Str | CType::Bytes | CType::Array(_) | CType::Map(..) | CType::Set(_) => {
+            CType::Ref | CType::Str | CType::Bytes | CType::Array(_) | CType::Map(..) | CType::Set(_) | CType::Vector => {
                 let _ = writeln!(out, "{}aria_field({}, {}) = (int64_t)(uintptr_t)({});", ind, dst, i, ex);
             }
         }
@@ -1152,6 +1174,11 @@ fn emit_prim(
             if matches!(lt, CType::Set(_)) && matches!(rt, CType::Set(_)) {
                 let cmp = if op == BinOp::Eq { "" } else { "!" };
                 let _ = writeln!(out, "{}{} = {}aria_set_eq_consume({}, {});", ind, dst, cmp, lx, rx);
+                return Ok(());
+            }
+            if lt == CType::Vector && rt == CType::Vector {
+                let cmp = if op == BinOp::Eq { "" } else { "!" };
+                let _ = writeln!(out, "{}{} = {}aria_veceq_consume({}, {});", ind, dst, cmp, lx, rx);
                 return Ok(());
             }
             // Scalar ==/!= (Int/Bool/Float) — direct C comparison.
@@ -1391,6 +1418,118 @@ fn emit_builtin(
             let _ = writeln!(out, "{}{} = aria_bytes_to_str({});", ind, dst, b);
             Ok(())
         }
+        // ---- Vector builtins (each helper consumes its Vector argument(s)) ----
+        "vec_new" => {
+            if !args.is_empty() {
+                return Err("c backend: vec_new expects no arguments".into());
+            }
+            let _ = writeln!(out, "{}{} = aria_vec_new();", ind, dst);
+            Ok(())
+        }
+        "vec_from_array" => {
+            if args.len() != 1 || atom_type(&args[0], env)? != CType::Array(ElemKind::Float) {
+                return Err("c backend: vec_from_array expects one Array[Float]".into());
+            }
+            let (_, a) = emit_atom(&args[0], env, out)?;
+            let _ = writeln!(out, "{}{} = aria_vec_from_array({});", ind, dst, a);
+            Ok(())
+        }
+        "vec_to_array" => {
+            if args.len() != 1 || atom_type(&args[0], env)? != CType::Vector {
+                return Err("c backend: vec_to_array expects one Vector".into());
+            }
+            let (_, v) = emit_atom(&args[0], env, out)?;
+            let _ = writeln!(out, "{}{} = aria_vec_to_array({});", ind, dst, v);
+            Ok(())
+        }
+        "vec_len" => {
+            if args.len() != 1 || atom_type(&args[0], env)? != CType::Vector {
+                return Err("c backend: vec_len expects one Vector".into());
+            }
+            let (_, v) = emit_atom(&args[0], env, out)?;
+            let _ = writeln!(out, "{}{} = aria_vec_len({});", ind, dst, v);
+            Ok(())
+        }
+        "vec_get" => {
+            if args.len() != 2 || atom_type(&args[0], env)? != CType::Vector {
+                return Err("c backend: vec_get expects (Vector, Int)".into());
+            }
+            let (_, v) = emit_atom(&args[0], env, out)?;
+            let (it, idx) = emit_atom(&args[1], env, out)?;
+            if it != CType::Int {
+                return Err("c backend: vec_get index must be Int".into());
+            }
+            let _ = writeln!(out, "{}{} = aria_vec_get({}, {});", ind, dst, v, idx);
+            Ok(())
+        }
+        "vec_push" => {
+            if args.len() != 2 || atom_type(&args[0], env)? != CType::Vector {
+                return Err("c backend: vec_push expects (Vector, Float)".into());
+            }
+            let (_, v) = emit_atom(&args[0], env, out)?;
+            let (ft, f) = emit_atom(&args[1], env, out)?;
+            if ft != CType::Float {
+                return Err("c backend: vec_push value must be Float".into());
+            }
+            let _ = writeln!(out, "{}{} = aria_vec_push({}, {});", ind, dst, v, f);
+            Ok(())
+        }
+        "vec_dot" => {
+            if args.len() != 2
+                || atom_type(&args[0], env)? != CType::Vector
+                || atom_type(&args[1], env)? != CType::Vector
+            {
+                return Err("c backend: vec_dot expects (Vector, Vector)".into());
+            }
+            let (_, a) = emit_atom(&args[0], env, out)?;
+            let (_, b) = emit_atom(&args[1], env, out)?;
+            let _ = writeln!(out, "{}{} = aria_vec_dot({}, {});", ind, dst, a, b);
+            Ok(())
+        }
+        "vec_norm" => {
+            if args.len() != 1 || atom_type(&args[0], env)? != CType::Vector {
+                return Err("c backend: vec_norm expects one Vector".into());
+            }
+            let (_, v) = emit_atom(&args[0], env, out)?;
+            let _ = writeln!(out, "{}{} = aria_vec_norm({});", ind, dst, v);
+            Ok(())
+        }
+        "vec_cosine" => {
+            if args.len() != 2
+                || atom_type(&args[0], env)? != CType::Vector
+                || atom_type(&args[1], env)? != CType::Vector
+            {
+                return Err("c backend: vec_cosine expects (Vector, Vector)".into());
+            }
+            let (_, a) = emit_atom(&args[0], env, out)?;
+            let (_, b) = emit_atom(&args[1], env, out)?;
+            let _ = writeln!(out, "{}{} = aria_vec_cosine({}, {});", ind, dst, a, b);
+            Ok(())
+        }
+        "vec_add" => {
+            if args.len() != 2
+                || atom_type(&args[0], env)? != CType::Vector
+                || atom_type(&args[1], env)? != CType::Vector
+            {
+                return Err("c backend: vec_add expects (Vector, Vector)".into());
+            }
+            let (_, a) = emit_atom(&args[0], env, out)?;
+            let (_, b) = emit_atom(&args[1], env, out)?;
+            let _ = writeln!(out, "{}{} = aria_vec_add({}, {});", ind, dst, a, b);
+            Ok(())
+        }
+        "vec_scale" => {
+            if args.len() != 2 || atom_type(&args[0], env)? != CType::Vector {
+                return Err("c backend: vec_scale expects (Vector, Float)".into());
+            }
+            let (_, v) = emit_atom(&args[0], env, out)?;
+            let (ft, s) = emit_atom(&args[1], env, out)?;
+            if ft != CType::Float {
+                return Err("c backend: vec_scale factor must be Float".into());
+            }
+            let _ = writeln!(out, "{}{} = aria_vec_scale({}, {});", ind, dst, v, s);
+            Ok(())
+        }
         _ => Err(format!("c backend: unsupported builtin `{}`", name)),
     }
 }
@@ -1406,7 +1545,7 @@ fn encode_elem_slot(kind: ElemKind, t: CType, ex: &str) -> Result<String, String
         ElemKind::Int => matches!(t, CType::Int | CType::Bool),
         ElemKind::Float => t == CType::Float,
         ElemKind::Str => t == CType::Str,
-        ElemKind::Ref => matches!(t, CType::Ref | CType::Str | CType::Bytes | CType::Array(_) | CType::Map(..) | CType::Set(_)),
+        ElemKind::Ref => matches!(t, CType::Ref | CType::Str | CType::Bytes | CType::Array(_) | CType::Map(..) | CType::Set(_) | CType::Vector),
     };
     if !ok {
         return Err(format!(
@@ -1783,7 +1922,7 @@ fn emit_store_fields(
             CType::Float => {
                 let _ = writeln!(out, "{}aria_field({}, {}) = aria_f2i({});", ind, cellptr, i, ex);
             }
-            CType::Ref | CType::Str | CType::Bytes | CType::Array(_) | CType::Map(..) | CType::Set(_) => {
+            CType::Ref | CType::Str | CType::Bytes | CType::Array(_) | CType::Map(..) | CType::Set(_) | CType::Vector => {
                 let _ = writeln!(out, "{}aria_field({}, {}) = (int64_t)(uintptr_t)({});", ind, cellptr, i, ex);
             }
         }
@@ -1892,7 +2031,7 @@ fn emit_arm_body(
                         format!("aria_field({}, {})", sv, idx)
                     }
                     CType::Float => format!("aria_i2f(aria_field({}, {}))", sv, idx),
-                    CType::Ref | CType::Str | CType::Bytes | CType::Array(_) | CType::Map(..) | CType::Set(_) => {
+                    CType::Ref | CType::Str | CType::Bytes | CType::Array(_) | CType::Map(..) | CType::Set(_) | CType::Vector => {
                         format!("(void*)(uintptr_t)aria_field({}, {})", sv, idx)
                     }
                 };
@@ -1980,6 +2119,7 @@ const RUNTIME: &str = r#"#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 /* ---- live-cell accounting (the native analogue of wasm __live) ---- */
 static int64_t aria_live = 0;
@@ -2330,6 +2470,173 @@ static void aria_print_bytes_value(void* p) {
     for (int64_t i = 0; i < b->len; i++) {
         if (i > 0) fputc(' ', stdout);
         printf("%02x", (unsigned)b->bytes[i]);
+    }
+    fputs("]\n", stdout);
+}
+
+/* ---- Vector / Embedding (dense, immutable buffer of f64) ------------------
+   An AriaVector is a flat heap buffer of `double`, modeled exactly on AriaBytes
+   but with f64 elements. push/add/scale are FBIP: they mutate in place when
+   rc==1, else copy-on-write — always garbage-free. dot/cosine/add on two vectors
+   of UNEQUAL length trap (clean runtime error, matching the interpreter). cosine
+   returns 0.0 when either operand has L2 norm 0 (no divide-by-zero -> NaN). The
+   `Vector[..]` display uses the SAME shortest-round-trip `aria_fmt_float` as a
+   scalar Float, so it is byte-for-byte identical to the interpreter. */
+typedef struct { int64_t rc; int64_t len; int64_t cap; double elems[]; } AriaVector;
+static void aria_fmt_float(double d, char* buf, size_t cap);            /* fwd */
+
+static void* aria_vec_alloc(int64_t cap) {
+    AriaVector* v = (AriaVector*)malloc(sizeof(AriaVector) + (size_t)cap * sizeof(double));
+    if (!v) aria_trap();
+    v->rc = 1; v->len = 0; v->cap = cap;
+    aria_live++;
+    return (void*)v;
+}
+static void* aria_vec_new(void) { return aria_vec_alloc(0); }
+static inline void aria_vec_dup(void* p) { ((AriaVector*)p)->rc++; }
+static void aria_vec_drop(void* p) {
+    AriaVector* v = (AriaVector*)p;
+    if (--v->rc == 0) { aria_live--; free(v); }
+}
+static int64_t aria_vec_len(void* p) {
+    int64_t n = ((AriaVector*)p)->len;
+    aria_vec_drop(p);  /* vec_len consumes its argument */
+    return n;
+}
+static double aria_vec_get(void* p, int64_t i) {
+    AriaVector* v = (AriaVector*)p;
+    if (i < 0 || i >= v->len) aria_trap();
+    double x = v->elems[i];
+    aria_vec_drop(p);  /* vec_get consumes its argument */
+    return x;
+}
+static AriaVector* aria_vec_clone(AriaVector* v) {
+    int64_t cap = v->len > 0 ? v->len : 1;
+    AriaVector* n = (AriaVector*)aria_vec_alloc(cap);
+    n->len = v->len;
+    memcpy(n->elems, v->elems, (size_t)v->len * sizeof(double));
+    return n;
+}
+static AriaVector* aria_vec_grow(AriaVector* v) {
+    if (v->len < v->cap) return v;
+    int64_t ncap = v->cap > 0 ? v->cap * 2 : 4;
+    AriaVector* g = (AriaVector*)realloc(v, sizeof(AriaVector) + (size_t)ncap * sizeof(double));
+    if (!g) aria_trap();
+    g->cap = ncap;
+    return g;
+}
+static void* aria_vec_push(void* p, double x) {
+    AriaVector* v = (AriaVector*)p;
+    if (v->rc == 1) {
+        v = aria_vec_grow(v);
+        v->elems[v->len++] = x;
+        aria_reuses++;
+        return (void*)v;
+    }
+    AriaVector* n = aria_vec_clone(v);
+    n = aria_vec_grow(n);
+    n->elems[n->len++] = x;
+    aria_vec_drop(p);
+    return (void*)n;
+}
+/* Build a Vector from an Array[Float] (kind code 1). Consumes the array. */
+static void* aria_vec_from_array(void* p) {
+    AriaArray* a = (AriaArray*)p;
+    AriaVector* v = (AriaVector*)aria_vec_alloc(a->len > 0 ? a->len : 0);
+    v->len = a->len;
+    for (int64_t i = 0; i < a->len; i++) v->elems[i] = aria_i2f(a->elems[i]);
+    aria_array_drop(p);  /* the Array argument is consumed */
+    return (void*)v;
+}
+/* Build an Array[Float] (kind code 1) from a Vector. Consumes the vector. */
+static void* aria_vec_to_array(void* p) {
+    AriaVector* v = (AriaVector*)p;
+    void* a = aria_array_new(INT64_C(1));
+    for (int64_t i = 0; i < v->len; i++) a = aria_array_push(a, aria_f2i(v->elems[i]), INT64_C(1));
+    aria_vec_drop(p);  /* the Vector argument is consumed */
+    return a;
+}
+/* Sum of elementwise products (left-to-right, matching the interpreter's order
+   so the float result is byte-for-byte identical). */
+static double aria_vec_dot_raw(AriaVector* x, AriaVector* y) {
+    double acc = 0.0;
+    for (int64_t i = 0; i < x->len; i++) acc += x->elems[i] * y->elems[i];
+    return acc;
+}
+static double aria_vec_dot(void* a, void* b) {
+    AriaVector* x = (AriaVector*)a; AriaVector* y = (AriaVector*)b;
+    if (x->len != y->len) aria_trap();  /* length mismatch -> clean trap */
+    double r = aria_vec_dot_raw(x, y);
+    aria_vec_drop(a); aria_vec_drop(b);  /* both operands consumed */
+    return r;
+}
+static double aria_vec_norm(void* a) {
+    AriaVector* x = (AriaVector*)a;
+    double r = sqrt(aria_vec_dot_raw(x, x));
+    aria_vec_drop(a);
+    return r;
+}
+static double aria_vec_cosine(void* a, void* b) {
+    AriaVector* x = (AriaVector*)a; AriaVector* y = (AriaVector*)b;
+    if (x->len != y->len) aria_trap();  /* length mismatch -> clean trap */
+    double nx = sqrt(aria_vec_dot_raw(x, x));
+    double ny = sqrt(aria_vec_dot_raw(y, y));
+    double r;
+    /* Zero-norm policy: return 0.0 (never divide by zero -> NaN). */
+    if (nx == 0.0 || ny == 0.0) r = 0.0;
+    else r = aria_vec_dot_raw(x, y) / (nx * ny);
+    aria_vec_drop(a); aria_vec_drop(b);
+    return r;
+}
+/* Elementwise add. FBIP: reuse the first operand in place when it is unique. */
+static void* aria_vec_add(void* a, void* b) {
+    AriaVector* x = (AriaVector*)a; AriaVector* y = (AriaVector*)b;
+    if (x->len != y->len) aria_trap();  /* length mismatch -> clean trap */
+    if (x->rc == 1) {
+        for (int64_t i = 0; i < x->len; i++) x->elems[i] += y->elems[i];
+        aria_reuses++;
+        aria_vec_drop(b);
+        return a;
+    }
+    AriaVector* n = aria_vec_clone(x);
+    for (int64_t i = 0; i < n->len; i++) n->elems[i] += y->elems[i];
+    aria_vec_drop(a); aria_vec_drop(b);
+    return (void*)n;
+}
+/* Multiply every element by a scalar. FBIP when the operand is unique. */
+static void* aria_vec_scale(void* a, double s) {
+    AriaVector* x = (AriaVector*)a;
+    if (x->rc == 1) {
+        for (int64_t i = 0; i < x->len; i++) x->elems[i] *= s;
+        aria_reuses++;
+        return a;
+    }
+    AriaVector* n = aria_vec_clone(x);
+    for (int64_t i = 0; i < n->len; i++) n->elems[i] *= s;
+    aria_vec_drop(a);
+    return (void*)n;
+}
+/* Structural Vector equality (length + exact element bits). Does NOT consume. */
+static int64_t aria_veceq(void* a, void* b) {
+    AriaVector* x = (AriaVector*)a; AriaVector* y = (AriaVector*)b;
+    if (x->len != y->len) return 0;
+    for (int64_t i = 0; i < x->len; i++) if (x->elems[i] != y->elems[i]) return 0;
+    return 1;
+}
+static int64_t aria_veceq_consume(void* a, void* b) {
+    int64_t r = aria_veceq(a, b);
+    aria_vec_drop(a); aria_vec_drop(b);
+    return r;
+}
+/* Print the canonical `Vector[..]` rendering (does NOT consume the buffer). */
+static void aria_print_vec_value(void* p) {
+    AriaVector* v = (AriaVector*)p;
+    char tmp[320];
+    fputs("Vector[", stdout);
+    for (int64_t i = 0; i < v->len; i++) {
+        if (i > 0) fputs(", ", stdout);
+        aria_fmt_float(v->elems[i], tmp, sizeof tmp);
+        fputs(tmp, stdout);
     }
     fputs("]\n", stdout);
 }
@@ -2923,8 +3230,13 @@ pub fn compile(program: &Program) -> Result<String, String> {
             return Err("c backend: `main` must take no parameters".into());
         }
         // main may return Int, Float, Bool, String, or Bytes; the runner prints it.
-        if !matches!(m.ret, CType::Int | CType::Float | CType::Bool | CType::Str | CType::Bytes) {
-            return Err("c backend: `main` must return Int, Bool, Float, String, or Bytes".into());
+        if !matches!(
+            m.ret,
+            CType::Int | CType::Float | CType::Bool | CType::Str | CType::Bytes | CType::Vector
+        ) {
+            return Err(
+                "c backend: `main` must return Int, Bool, Float, String, Bytes, or Vector".into(),
+            );
         }
     }
 
@@ -3135,6 +3447,13 @@ pub fn compile(program: &Program) -> Result<String, String> {
             let _ = writeln!(src, "    aria_print_set_value(r);");
             let _ = writeln!(src, "    aria_set_drop(r);");
         }
+        CType::Vector => {
+            // Print the canonical `Vector[..]` rendering (byte-for-byte identical
+            // to the interpreter), then consume the buffer.
+            let _ = writeln!(src, "    void* r = {}();", cfn("main"));
+            let _ = writeln!(src, "    aria_print_vec_value(r);");
+            let _ = writeln!(src, "    aria_vec_drop(r);");
+        }
         CType::Ref | CType::Array(_) => {
             // An ADT / Array result is outside the printed-result subset (it has
             // no canonical printed form in this backend). Clean error, no panic.
@@ -3190,6 +3509,10 @@ fn emit_eq_helper(ctors: &CtorTable, out: &mut String) {
                     // Set fields compare structurally (ordered contents).
                     let _ = writeln!(out, "        eq = eq && aria_set_eq((void*)(uintptr_t)aria_field(a, {}), (void*)(uintptr_t)aria_field(b, {}));", i, i);
                 }
+                CType::Vector => {
+                    // Vector fields compare structurally (length + elements).
+                    let _ = writeln!(out, "        eq = eq && aria_veceq((void*)(uintptr_t)aria_field(a, {}), (void*)(uintptr_t)aria_field(b, {}));", i, i);
+                }
             }
         }
         out.push_str("        return eq;\n");
@@ -3241,7 +3564,7 @@ fn emit_lambda(
         let load = match ct {
             CType::Int | CType::Bool => format!("(int64_t)aria_field(__aria_clo, {})", i),
             CType::Float => format!("aria_i2f(aria_field(__aria_clo, {}))", i),
-            CType::Ref | CType::Str | CType::Bytes | CType::Array(_) | CType::Map(..) | CType::Set(_) => format!("(void*)(uintptr_t)aria_field(__aria_clo, {})", i),
+            CType::Ref | CType::Str | CType::Bytes | CType::Array(_) | CType::Map(..) | CType::Set(_) | CType::Vector => format!("(void*)(uintptr_t)aria_field(__aria_clo, {})", i),
         };
         let _ = writeln!(out, "    {} {} = {};", ct.decl(), cvar(cn), load);
         match ct {
@@ -3266,6 +3589,9 @@ fn emit_lambda(
             }
             CType::Set(_) => {
                 let _ = writeln!(out, "    aria_set_dup({});", cvar(cn));
+            }
+            CType::Vector => {
+                let _ = writeln!(out, "    aria_vec_dup({});", cvar(cn));
             }
             _ => {}
         }
@@ -3305,7 +3631,7 @@ fn emit_drop_children_helper(
             .field_types
             .iter()
             .enumerate()
-            .filter(|(_, t)| matches!(t, CType::Ref | CType::Str | CType::Bytes | CType::Array(_) | CType::Map(..) | CType::Set(_)))
+            .filter(|(_, t)| matches!(t, CType::Ref | CType::Str | CType::Bytes | CType::Array(_) | CType::Map(..) | CType::Set(_) | CType::Vector))
             .map(|(i, t)| (i, *t))
             .collect();
         if managed.is_empty() {
@@ -3327,7 +3653,7 @@ fn emit_drop_children_helper(
         let managed: Vec<(usize, CType)> = cap_cts
             .iter()
             .enumerate()
-            .filter(|(_, t)| matches!(t, CType::Ref | CType::Str | CType::Bytes | CType::Array(_) | CType::Map(..) | CType::Set(_)))
+            .filter(|(_, t)| matches!(t, CType::Ref | CType::Str | CType::Bytes | CType::Array(_) | CType::Map(..) | CType::Set(_) | CType::Vector))
             .map(|(i, t)| (i, *t))
             .collect();
         if managed.is_empty() {
@@ -3366,6 +3692,9 @@ fn emit_drop_managed_field(t: CType, i: usize, out: &mut String) {
         }
         CType::Set(_) => {
             let _ = writeln!(out, "        aria_set_drop((void*)(uintptr_t)aria_field(p, {}));", i);
+        }
+        CType::Vector => {
+            let _ = writeln!(out, "        aria_vec_drop((void*)(uintptr_t)aria_field(p, {}));", i);
         }
         _ => {}
     }

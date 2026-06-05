@@ -1,0 +1,27 @@
+-- Vector: a first-class, dense, immutable float vector / embedding.
+-- Backed by a flat heap buffer of Float (f64). `push`/`add`/`scale` return a new
+-- Vector but reuse the buffer in place when it is uniquely owned (FBIP) — mutable
+-- speed with immutable semantics, exactly like Array and Bytes.
+-- `vec_from_array` / `vec_to_array` round-trip through an Array[Float].
+-- dot / norm / cosine give the core embedding-similarity primitives; cosine of a
+-- zero-norm vector is 0.0 (never NaN), and dot/cosine/add on UNEQUAL lengths is a
+-- clean runtime error.
+-- Identical output via `aria run` AND `aria native-run` (the wasm / `aria mem`
+-- paths cleanly report that vectors are not yet supported there).
+
+fn main() -> Vector = {
+  let a = vec_from_array([1.0, 2.0, 3.0]);
+  let b = vec_from_array([4.0, 5.0, 6.0]);
+  print_int(vec_len(a));              -- 3
+  print_float(vec_get(a, 2));         -- 3
+  print_float(vec_dot(a, b));         -- 1*4 + 2*5 + 3*6 = 32
+  print_float(vec_norm(a));           -- sqrt(1+4+9) = 3.7416573867739413
+  -- cosine of identical vectors is 1; of orthogonal vectors is 0.
+  print_float(vec_cosine(vec_from_array([1.0, 0.0]), vec_from_array([1.0, 0.0])));  -- 1
+  print_float(vec_cosine(vec_from_array([1.0, 0.0]), vec_from_array([0.0, 1.0])));  -- 0
+  -- zero-norm operand -> 0.0 (no divide-by-zero / NaN).
+  print_float(vec_cosine(a, vec_from_array([0.0, 0.0, 0.0])));                      -- 0
+  print_float(vec_dot(vec_scale(a, 2.0), b));  -- 2*32 = 64
+  -- a Vector value displays as `Vector[..]` (the returned value below).
+  vec_add(a, b)                       -- Vector[5, 7, 9]
+}

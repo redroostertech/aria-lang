@@ -16,7 +16,7 @@ use std::sync::OnceLock;
 /// Built-in (opaque) type names that need no user `type` declaration.
 /// `Array` is generic (`Array[T]`); `Tensor` and `Bytes` are nullary opaque
 /// handles. `Bytes` is a flat, growable byte buffer (a byte = Int 0..255).
-pub const BUILTIN_TYPES: &[&str] = &["Tensor", "Array", "Bytes", "Map", "Set"];
+pub const BUILTIN_TYPES: &[&str] = &["Tensor", "Array", "Bytes", "Map", "Set", "Vector"];
 
 /// Cached signature table, built once on first access. The table is on a hot
 /// path (`lookup`/`names` are called per call-expression during lowering and
@@ -57,6 +57,10 @@ fn build_signatures() -> Vec<(&'static str, Vec<Ty>, Ty)> {
     let map = || Named("Map".to_string(), vec![mkey(), mval()]);
     let setelem = || Var("T".to_string());
     let set = || Named("Set".to_string(), vec![setelem()]);
+    // The nullary opaque dense-float-vector / embedding handle, shared across the
+    // vector builtins. A `Vector` is an immutable dense buffer of `Float` (f64).
+    let vector = || Named("Vector".to_string(), vec![]);
+    let float_array = || Named("Array".to_string(), vec![Float]);
     vec![
         ("print_int", vec![Int], Unit),
         ("print_float", vec![Float], Unit),
@@ -116,6 +120,23 @@ fn build_signatures() -> Vec<(&'static str, Vec<Ty>, Ty)> {
         ("set_remove", vec![set(), setelem()], set()),
         // Canonical textual rendering `Set[a, b, c]` (ascending order).
         ("set_show", vec![set()], Str),
+        // ---- Vector / Embedding (dense, immutable buffer of Float) ----------
+        // A flat heap buffer of f64. `push`/`add`/`scale` are functional (the
+        // oracle copies; the native backend reuses in place when unique).
+        // `dot`/`cosine`/`add` on two vectors of UNEQUAL length is a clean
+        // runtime error/trap in every backend. `cosine` returns 0.0 when either
+        // operand has L2 norm 0 (never divides by zero). Out-of-range `get` traps.
+        ("vec_new", vec![], vector()),
+        ("vec_from_array", vec![float_array()], vector()),
+        ("vec_to_array", vec![vector()], float_array()),
+        ("vec_len", vec![vector()], Int),
+        ("vec_get", vec![vector(), Int], Float),
+        ("vec_push", vec![vector(), Float], vector()),
+        ("vec_dot", vec![vector(), vector()], Float),
+        ("vec_norm", vec![vector()], Float),
+        ("vec_cosine", vec![vector(), vector()], Float),
+        ("vec_add", vec![vector(), vector()], vector()),
+        ("vec_scale", vec![vector(), Float], vector()),
     ]
 }
 
