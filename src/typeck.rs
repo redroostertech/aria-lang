@@ -83,6 +83,27 @@ struct CtorSig {
     field_names: Option<Vec<String>>, // Some iff a record constructor
 }
 
+/// A concrete (or partly-wildcard) value witnessing a non-exhaustive match,
+/// used to produce a helpful "missing case `...`" error.
+#[derive(Clone, Debug)]
+enum Witness {
+    Wild,
+    Ctor(String, Vec<Witness>),
+}
+
+/// Build a column-witness vector from a freshly-constructed `head` witness and
+/// the (optional) witness `tail` for the remaining columns. If the tail is
+/// `None` (remaining columns were exhaustive), pad with wildcards so the
+/// returned vector still has one entry per remaining column.
+fn extend_witness(head: Witness, tail: Option<Vec<Witness>>, rest: usize) -> Vec<Witness> {
+    let mut out = vec![head];
+    match tail {
+        Some(t) => out.extend(t),
+        None => out.extend(std::iter::repeat(Witness::Wild).take(rest)),
+    }
+    out
+}
+
 // A function's declared signature, retaining its generic parameters.
 #[derive(Clone)]
 struct FnSig {
@@ -269,6 +290,30 @@ pub fn check(program: &Program) -> Result<(), Vec<String>> {
                     &mut errors,
                     &format!("function `{}` return type", f.name),
                 );
+
+                // BUG E (backend parity): a declared type parameter that appears
+                // in NONE of the parameter types can never be inferred at a call
+                // site — typeck would silently leave it free while the compiled
+                // backends reject it at monomorphization. Reject it up front for
+                // parity. (Trait-method dispatchers, synthesized by lowering, are
+                // exempt: their `Self` param is rigid, not call-site-inferred.)
+                let is_dispatcher = f.bounds.iter().any(|(p, _)| f.type_params.contains(p));
+                if !is_dispatcher {
+                    for tp in &f.type_params {
+                        if !f.params.iter().any(|p| ty_mentions_var(&p.ty, tp)) {
+                            errors.push(format!(
+                                "type parameter `{}` of `{}` is unused (cannot be inferred)",
+                                tp, f.name
+                            ));
+                        }
+                    }
+                }
+
+                // `main` is the entry point: it is called with no type arguments,
+                // so it must not be generic.
+                if f.name == "main" && !f.type_params.is_empty() {
+                    errors.push("`main` must take no type parameters".to_string());
+                }
             }
             Item::Type(t) => {
                 for v in &t.variants {
@@ -391,9 +436,23 @@ pub fn check(program: &Program) -> Result<(), Vec<String>> {
     // annotated `pure` whose inferred effect set contains IO. Effects are erased
     // after this pass: it changes no runtime behavior and no backend codegen.
     let io = infer_io(program);
+    // The set of top-level function names — a callee in this set has its effects
+    // tracked by `infer_io`; any *other* applied callee is a function value of
+    // unknown effect (BUG D).
+    let fnset: HashSet<String> = program
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Fn(f) => Some(f.name.clone()),
+            _ => None,
+        })
+        .collect();
     for item in &program.items {
         if let Item::Fn(f) = item {
-            if f.pure && io.contains(&f.name) {
+            if !f.pure {
+                continue;
+            }
+            if io.contains(&f.name) {
                 // Report a concrete cause: a directly-called `print_*` builtin if
                 // there is one, otherwise the transitive nature of the violation.
                 let reason = match direct_io_builtin(&f.body) {
@@ -403,6 +462,14 @@ pub fn check(program: &Program) -> Result<(), Vec<String>> {
                 errors.push(format!(
                     "function `{}` is declared `pure` but performs IO ({})",
                     f.name, reason
+                ));
+            } else if let Some(callee) = higher_order_effect_witness(&f.body, &fnset) {
+                // Sound, conservative: Aria has no effect polymorphism, so a
+                // `pure` function that applies a function VALUE cannot be proven
+                // pure — the value's effects are unknown.
+                errors.push(format!(
+                    "cannot prove `{}` pure: it calls a function value `{}` whose effects are unknown",
+                    f.name, callee
                 ));
             }
         }
@@ -584,6 +651,18 @@ fn annotate_expr(e: &mut Expr, resolved: &HashMap<String, Ty>) {
 /// Names of the IO-producing builtins. Everything else is pure.
 const IO_BUILTINS: &[&str] = &["print_int", "print_float", "print_bool", "print_str"];
 
+/// Does the declared type `ty` syntactically mention the type variable `v`?
+/// Used to detect phantom/unused function type parameters (BUG E): a parameter
+/// that appears in no argument type cannot be inferred at a call site.
+fn ty_mentions_var(ty: &Ty, v: &str) -> bool {
+    match ty {
+        Ty::Var(n) => n == v,
+        Ty::Named(_, args) => args.iter().any(|a| ty_mentions_var(a, v)),
+        Ty::Fn(ps, r) => ps.iter().any(|p| ty_mentions_var(p, v)) || ty_mentions_var(r, v),
+        _ => false,
+    }
+}
+
 /// Collect the names called (directly) inside an expression, into `out`. This is
 /// a pure syntactic walk over calls; it records both builtin and user-function
 /// callees by name.
@@ -697,6 +776,95 @@ fn infer_io(program: &Program) -> HashSet<String> {
         }
     }
     io
+}
+
+/// Find the first application of a function *value* with unknown effects inside
+/// `e`, returning a name for the offending callee. Aria has no effect
+/// polymorphism: when a `pure` function applies a function it received as a
+/// parameter (or any captured/let-bound closure), the callee's effects are not
+/// statically known, so the `pure` claim is unsound (the closure could perform
+/// IO — see BUG D). We therefore treat *any* application of a non-top-level,
+/// non-builtin callee as a potential effect.
+///
+/// Known-pure-or-tracked callees that do NOT count:
+///   * a direct `Expr::Call` to a top-level function (its IO-ness is tracked by
+///     `infer_io`) or to a builtin (IO builtins are caught separately),
+///   * a directly-applied lambda literal `(\x -> ...)(a)` — its body is walked
+///     in place, so its effects are visible.
+fn higher_order_effect_witness(
+    e: &Expr,
+    fnset: &HashSet<String>,
+) -> Option<String> {
+    match e {
+        Expr::Call(name, args) => {
+            // A callee that is neither a top-level function nor a builtin must be
+            // a function *value* in scope (a parameter or a let-bound closure):
+            // applying it has unknown effects.
+            if !fnset.contains(name) && builtin_sig(name).is_none() {
+                return Some(name.clone());
+            }
+            for a in args {
+                if let Some(w) = higher_order_effect_witness(a, fnset) {
+                    return Some(w);
+                }
+            }
+            None
+        }
+        Expr::Apply(callee, args, _) => {
+            // Applying anything other than a lambda literal applies an unknown
+            // function value.
+            if !matches!(callee.as_ref(), Expr::Lambda(..)) {
+                let who = match callee.as_ref() {
+                    Expr::Var(n) => n.clone(),
+                    _ => "<closure value>".to_string(),
+                };
+                return Some(who);
+            }
+            if let Some(w) = higher_order_effect_witness(callee, fnset) {
+                return Some(w);
+            }
+            for a in args {
+                if let Some(w) = higher_order_effect_witness(a, fnset) {
+                    return Some(w);
+                }
+            }
+            None
+        }
+        Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Unit
+        | Expr::Var(_) => None,
+        Expr::Ctor(_, args) => args.iter().find_map(|a| higher_order_effect_witness(a, fnset)),
+        Expr::Lambda(_, body, _) => higher_order_effect_witness(body, fnset),
+        Expr::Record(_, fields) => fields
+            .iter()
+            .find_map(|(_, v)| higher_order_effect_witness(v, fnset)),
+        Expr::Field(obj, _) => higher_order_effect_witness(obj, fnset),
+        Expr::Update(base, updates) => higher_order_effect_witness(base, fnset).or_else(|| {
+            updates
+                .iter()
+                .find_map(|(_, v)| higher_order_effect_witness(v, fnset))
+        }),
+        Expr::Unary(_, x) => higher_order_effect_witness(x, fnset),
+        Expr::Binary(_, a, b) => {
+            higher_order_effect_witness(a, fnset).or_else(|| higher_order_effect_witness(b, fnset))
+        }
+        Expr::If(c, t, e2) => higher_order_effect_witness(c, fnset)
+            .or_else(|| higher_order_effect_witness(t, fnset))
+            .or_else(|| higher_order_effect_witness(e2, fnset)),
+        Expr::Match(scrut, arms) => higher_order_effect_witness(scrut, fnset)
+            .or_else(|| arms.iter().find_map(|a| higher_order_effect_witness(&a.body, fnset))),
+        Expr::Block(stmts, tail) => {
+            for s in stmts {
+                let inner = match s {
+                    Stmt::Let(_, _, x) => x,
+                    Stmt::Expr(x) => x,
+                };
+                if let Some(w) = higher_order_effect_witness(inner, fnset) {
+                    return Some(w);
+                }
+            }
+            higher_order_effect_witness(tail, fnset)
+        }
+    }
 }
 
 // Built-in nullary types that need no user declaration but must pass the
@@ -1460,22 +1628,8 @@ impl Checker {
     fn synth_match(&self, scrut: &Expr, arms: &[Arm], scope: &mut Scope) -> Result<Ty, String> {
         let s = self.synth(scrut, scope)?;
         let mut result: Option<Ty> = None;
-        let mut covered_ctors: Vec<String> = Vec::new();
-        let (mut saw_true, mut saw_false, mut saw_wild) = (false, false, false);
 
         for arm in arms {
-            match &arm.pat {
-                Pattern::Wild | Pattern::Var(_) => saw_wild = true,
-                // A record pattern covers its sole constructor (same as `Ctor`),
-                // so matching it is automatically exhaustive.
-                Pattern::Ctor(name, _) | Pattern::Record(name, _) => {
-                    covered_ctors.push(name.clone())
-                }
-                Pattern::Bool(true) => saw_true = true,
-                Pattern::Bool(false) => saw_false = true,
-                Pattern::Int(_) => {}
-            }
-
             let mut binds = HashMap::new();
             self.check_pattern(&arm.pat, &s, &mut binds)?;
             scope.push(binds);
@@ -1497,42 +1651,255 @@ impl Checker {
             }
         }
 
-        // Exhaustiveness. Keys on constructor names, so generics are unaffected.
-        if !saw_wild {
-            match self.prune(&s) {
-                Ty::Named(tn, _) => {
-                    if let Some((_, variants)) = self.types.get(&tn) {
-                        let missing: Vec<String> = variants
-                            .iter()
-                            .filter(|v| !covered_ctors.contains(v))
-                            .cloned()
-                            .collect();
-                        if !missing.is_empty() {
-                            return Err(format!(
-                                "non-exhaustive match on {}: missing case(s) {}",
-                                tn,
-                                missing.join(", ")
-                            ));
-                        }
-                    }
-                }
-                Ty::Bool => {
-                    if !(saw_true && saw_false) {
-                        return Err("non-exhaustive match on Bool: handle both true and false (or add `_`)".into());
-                    }
-                }
-                other => {
-                    return Err(format!(
-                        "non-exhaustive match on {}: add a wildcard `_` arm",
-                        show(&self.resolve(&other))
-                    ));
-                }
-            }
+        // Exhaustiveness via a recursive "matrix" usefulness check. This is
+        // sound for *nested* patterns: a constructor arm only covers its
+        // constructor when its sub-patterns are themselves exhaustive. We build
+        // a one-column matrix (one row per arm) typed by the scrutinee type and
+        // ask whether a wildcard row would still be useful — i.e. whether some
+        // value escapes every arm. If so, we synthesize a witness for the error.
+        let rows: Vec<Vec<Pattern>> = arms.iter().map(|a| vec![a.pat.clone()]).collect();
+        let col_ty = self.resolve(&s);
+        if let Some(witness) = self.missing_witness(&rows, &[col_ty.clone()]) {
+            let wstr = witness
+                .first()
+                .map(Self::show_witness)
+                .unwrap_or_else(|| "_".to_string());
+            return Err(format!(
+                "non-exhaustive match on {}: missing case `{}`",
+                show(&col_ty),
+                wstr
+            ));
         }
 
         result
             .map(|t| self.resolve(&t))
             .ok_or_else(|| "match needs at least one arm".to_string())
+    }
+
+    /// The closed constructor space of a type, for exhaustiveness checking.
+    /// Returns `Some(vec)` of `(ctor_name, field_types)` when the type has a
+    /// *finite, known* set of constructors (a user ADT, or Bool encoded as the
+    /// pseudo-ctors `true`/`false`). Field types are instantiated for the given
+    /// type arguments. Returns `None` for "open" types whose value space is
+    /// effectively infinite or unknown (Int, Float, Str, type variables,
+    /// function types, builtin generics like List/Array/Map without variant
+    /// constructors) — such columns are only covered by a wildcard.
+    fn ctor_space(&self, ty: &Ty) -> Option<Vec<(String, Vec<Ty>)>> {
+        match self.prune(ty) {
+            Ty::Bool => Some(vec![
+                ("true".to_string(), vec![]),
+                ("false".to_string(), vec![]),
+            ]),
+            Ty::Named(tn, args) => {
+                let (params, variants) = self.types.get(&tn)?;
+                if variants.is_empty() {
+                    return None;
+                }
+                let map: HashMap<String, Ty> = params
+                    .iter()
+                    .cloned()
+                    .zip(args.iter().cloned())
+                    .collect();
+                let mut out = Vec::new();
+                for cname in variants {
+                    let sig = self.ctors.get(cname)?;
+                    let fields = sig
+                        .fields
+                        .iter()
+                        .map(|f| Self::apply_map(f, &map))
+                        .collect();
+                    out.push((cname.clone(), fields));
+                }
+                Some(out)
+            }
+            _ => None,
+        }
+    }
+
+    /// The "head constructor" of a pattern for the matrix algorithm, or `None`
+    /// for wildcard/variable patterns (which match any value). Record patterns
+    /// are normalized to positional `Ctor` form so they share the ADT logic.
+    fn pat_head(&self, pat: &Pattern) -> Option<(String, Vec<Pattern>)> {
+        match pat {
+            Pattern::Wild | Pattern::Var(_) => None,
+            Pattern::Bool(b) => {
+                Some((if *b { "true" } else { "false" }.to_string(), vec![]))
+            }
+            Pattern::Int(_) => Some((format!("{:?}", pat), vec![])),
+            Pattern::Ctor(name, subs) => Some((name.clone(), subs.clone())),
+            Pattern::Record(name, sub_fields) => {
+                // Reorder named sub-patterns into declared field order, filling
+                // omitted fields with wildcards.
+                let decl = self
+                    .ctors
+                    .get(name)
+                    .and_then(|s| s.field_names.clone())
+                    .unwrap_or_default();
+                let subs = decl
+                    .iter()
+                    .map(|fname| {
+                        sub_fields
+                            .iter()
+                            .find(|(n, _)| n == fname)
+                            .map(|(_, p)| p.clone())
+                            .unwrap_or(Pattern::Wild)
+                    })
+                    .collect();
+                Some((name.clone(), subs))
+            }
+        }
+    }
+
+    /// Recursive exhaustiveness: given a pattern `matrix` (each row has one
+    /// pattern per column) and the `col_types` of those columns, return
+    /// `Some(witness)` describing a value matched by no row, or `None` if the
+    /// matrix is exhaustive. The standard usefulness algorithm (Maranget).
+    fn missing_witness(
+        &self,
+        matrix: &[Vec<Pattern>],
+        col_types: &[Ty],
+    ) -> Option<Vec<Witness>> {
+        // Base case: no columns left.
+        if col_types.is_empty() {
+            // A value reaches here iff some row exists (matches everything);
+            // if no rows remain, the value is unmatched.
+            return if matrix.is_empty() { Some(vec![]) } else { None };
+        }
+
+        let head_ty = &col_types[0];
+        let rest_types = &col_types[1..];
+
+        match self.ctor_space(head_ty) {
+            // Closed, finite constructor space (ADT or Bool).
+            Some(space) => {
+                // The constructors that appear as a *concrete* pattern head in
+                // this column (wildcards/vars are not roots — they are handled
+                // by the default matrix).
+                let present: std::collections::HashSet<String> = matrix
+                    .iter()
+                    .filter_map(|row| self.pat_head(&row[0]).map(|(n, _)| n))
+                    .collect();
+                let complete = space.iter().all(|(c, _)| present.contains(c));
+
+                if complete {
+                    // Complete signature: a value is unmatched iff it is
+                    // unmatched under some specific constructor. Recurse per
+                    // constructor (this terminates: each `specialize` is driven
+                    // by the finite set of concrete sub-patterns).
+                    for (cname, fields) in &space {
+                        let spec = self.specialize(matrix, cname, fields.len());
+                        let mut sub_types = fields.clone();
+                        sub_types.extend_from_slice(rest_types);
+                        if let Some(w) = self.missing_witness(&spec, &sub_types) {
+                            let (sub, tail) = w.split_at(fields.len());
+                            let head_w = Witness::Ctor(cname.clone(), sub.to_vec());
+                            let mut out = vec![head_w];
+                            out.extend_from_slice(tail);
+                            return Some(out);
+                        }
+                    }
+                    None
+                } else {
+                    // Incomplete signature: the column is exhaustive only via
+                    // the *default* matrix (rows whose head is a wildcard). If
+                    // the default matrix is non-exhaustive, build a witness whose
+                    // head is a missing constructor (so the error names a real
+                    // missing case) when one exists; otherwise a wildcard. This
+                    // recursion drops a column and only keeps wildcard rows, so
+                    // it always terminates — even on recursive types.
+                    let default = self.default_matrix(matrix);
+                    let tail = self.missing_witness(&default, rest_types)?;
+                    let head_w = match space.iter().find(|(c, _)| !present.contains(c)) {
+                        Some((cname, fields)) => Witness::Ctor(
+                            cname.clone(),
+                            fields.iter().map(|_| Witness::Wild).collect(),
+                        ),
+                        None => Witness::Wild,
+                    };
+                    let mut out = vec![head_w];
+                    out.extend(tail);
+                    Some(out)
+                }
+            }
+            // Open / infinite column: only a wildcard row covers everything.
+            None => {
+                let has_wild = matrix
+                    .iter()
+                    .any(|row| self.pat_head(&row[0]).is_none());
+                let default = self.default_matrix(matrix);
+                let tail = self.missing_witness(&default, rest_types);
+                if has_wild {
+                    // Wildcards present: the column is covered for those rows;
+                    // exhaustiveness depends purely on the remaining columns of
+                    // the default matrix.
+                    tail.map(|t| {
+                        let mut out = vec![Witness::Wild];
+                        out.extend(t);
+                        out
+                    })
+                } else {
+                    // No wildcard row: some value of this open column escapes.
+                    Some(extend_witness(Witness::Wild, tail, rest_types.len()))
+                }
+            }
+        }
+    }
+
+    /// Specialize the matrix to constructor `cname` with `arity` fields: keep
+    /// rows whose head is `cname` (expanding sub-patterns into new leading
+    /// columns) or a wildcard (expanding into `arity` wildcards).
+    fn specialize(
+        &self,
+        matrix: &[Vec<Pattern>],
+        cname: &str,
+        arity: usize,
+    ) -> Vec<Vec<Pattern>> {
+        let mut out = Vec::new();
+        for row in matrix {
+            match self.pat_head(&row[0]) {
+                Some((n, subs)) if n == cname => {
+                    let mut new_row = subs;
+                    new_row.extend_from_slice(&row[1..]);
+                    out.push(new_row);
+                }
+                Some(_) => {} // different constructor: drop
+                None => {
+                    // wildcard/var head: expands to `arity` wildcards
+                    let mut new_row = vec![Pattern::Wild; arity];
+                    new_row.extend_from_slice(&row[1..]);
+                    out.push(new_row);
+                }
+            }
+        }
+        out
+    }
+
+    /// The default matrix: keep only rows whose first pattern is a wildcard or
+    /// variable, dropping that first column.
+    fn default_matrix(&self, matrix: &[Vec<Pattern>]) -> Vec<Vec<Pattern>> {
+        matrix
+            .iter()
+            .filter(|row| self.pat_head(&row[0]).is_none())
+            .map(|row| row[1..].to_vec())
+            .collect()
+    }
+
+    /// Render a witness value as readable source-like text for error messages.
+    fn show_witness(w: &Witness) -> String {
+        match w {
+            Witness::Wild => "_".to_string(),
+            Witness::Ctor(name, subs) => {
+                if subs.is_empty() {
+                    name.clone()
+                } else {
+                    format!(
+                        "{}({})",
+                        name,
+                        subs.iter().map(Self::show_witness).collect::<Vec<_>>().join(", ")
+                    )
+                }
+            }
+        }
     }
 
     fn check_pattern(
@@ -1750,6 +2117,130 @@ mod tests {
         "#;
         let errs = check_src(src).unwrap_err();
         assert!(errs.iter().any(|e| e.contains("non-exhaustive") && e.contains("Blue")));
+    }
+
+    // --- BUG A: nested-pattern exhaustiveness (soundness) ---
+
+    #[test]
+    fn nested_non_exhaustive_match_rejected() {
+        // Previously accepted as exhaustive because only the TOP-level ctor
+        // `Wrap` was counted; `Wrap(F)` then crashed the interpreter at runtime.
+        let src = r#"
+            type B = | T | F
+            type W = | Wrap(B)
+            fn f(w: W) -> Int = match w { Wrap(T) => 1, }
+            fn main() -> Int = f(Wrap(F))
+        "#;
+        let errs = check_src(src).unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains("non-exhaustive") && e.contains("Wrap(F)")),
+            "expected a non-exhaustive error naming Wrap(F), got: {:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn nested_non_exhaustive_two_field_rejected() {
+        let src = r#"
+            type B = | T | F
+            type W = | Wrap(B, B)
+            fn f(w: W) -> Int = match w { Wrap(T, T) => 1, Wrap(F, _) => 3 }
+            fn main() -> Int = f(Wrap(F, T))
+        "#;
+        let errs = check_src(src).unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains("non-exhaustive") && e.contains("Wrap(T, F)")),
+            "expected missing Wrap(T, F), got: {:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn nested_recursive_non_exhaustive_rejected() {
+        let src = r#"
+            type Tree = | Leaf | Node(Tree, Tree)
+            fn f(t: Tree) -> Int = match t { Node(Leaf, _) => 1, Node(_, _) => 2 }
+            fn main() -> Int = f(Leaf)
+        "#;
+        let errs = check_src(src).unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains("non-exhaustive") && e.contains("Leaf")),
+            "expected missing Leaf, got: {:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn valid_nested_matches_still_accepted() {
+        // Fully enumerated nested ctors.
+        assert!(check_src(
+            "type B = | T | F\n\
+             type W = | Wrap(B)\n\
+             fn f(w: W) -> Int = match w { Wrap(T) => 1, Wrap(F) => 2 }\n\
+             fn main() -> Int = f(Wrap(F))"
+        )
+        .is_ok());
+        // Wildcard sub-pattern covers all of B.
+        assert!(check_src(
+            "type B = | T | F\n\
+             type W = | Wrap(B)\n\
+             fn f(w: W) -> Int = match w { Wrap(_) => 1 }\n\
+             fn main() -> Int = f(Wrap(F))"
+        )
+        .is_ok());
+        // Two-field nested coverage with a wildcard tail.
+        assert!(check_src(
+            "type B = | T | F\n\
+             type W = | Wrap(B, B)\n\
+             fn f(w: W) -> Int = match w { Wrap(T, T) => 1, Wrap(T, F) => 2, Wrap(F, _) => 3 }\n\
+             fn main() -> Int = f(Wrap(F, T))"
+        )
+        .is_ok());
+        // Recursive type, exhaustively covered.
+        assert!(check_src(
+            "type Tree = | Leaf | Node(Tree, Tree)\n\
+             fn f(t: Tree) -> Int = match t { Leaf => 0, Node(Leaf, _) => 1, Node(_, _) => 2 }\n\
+             fn main() -> Int = f(Leaf)"
+        )
+        .is_ok());
+    }
+
+    // --- BUG E: phantom/unused type parameters (backend parity) ---
+
+    #[test]
+    fn unused_type_parameter_rejected() {
+        // `U` appears in no parameter type, so it can't be inferred at a call
+        // site — the backends reject it at monomorphization; typeck must too.
+        let src = "fn f[T, U](x: T) -> T = x\nfn main() -> Int = f(5)";
+        let errs = check_src(src).unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains("type parameter `U`")
+                && e.contains("unused")
+                && e.contains("`f`")),
+            "got: {:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn main_with_type_parameters_rejected() {
+        let src = "fn main[T]() -> Int = 5";
+        let errs = check_src(src).unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains("`main` must take no type parameters")),
+            "got: {:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn used_type_parameter_still_ok() {
+        // Every type parameter appears in a parameter type — inferable, accepted.
+        assert!(check_src("fn id[T](x: T) -> T = x\nfn main() -> Int = id(5)").is_ok());
+        assert!(check_src(
+            "fn pair[A, B](a: A, b: B) -> A = a\nfn main() -> Int = pair(1, 2)"
+        )
+        .is_ok());
     }
 
     #[test]
@@ -2240,6 +2731,58 @@ mod tests {
         assert!(io.contains("logger"));
         assert!(io.contains("caller"));
         assert!(check(&prog).is_err());
+    }
+
+    // --- BUG D: `pure` must not be preserved under higher-order calls ---
+
+    #[test]
+    fn pure_applying_function_value_is_rejected() {
+        // `run` is declared `pure` but applies its function PARAMETER `f`, whose
+        // effects are unknown (the caller passes an IO-performing lambda). Aria
+        // has no effect polymorphism, so this `pure` claim is unsound.
+        let src = "pure fn run(f: (Int) -> Int, x: Int) -> Int = f(x)";
+        let errs = check_src(src).unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains("cannot prove `run` pure")
+                && e.contains("function value `f`")),
+            "got: {:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn pure_applying_let_bound_closure_is_rejected() {
+        // Even a `let`-bound closure has unknown effects when applied (Aria does
+        // not yet prove let-bound closure purity), so be conservatively sound.
+        let src = "pure fn run(x: Int) -> Int = { let g = \\y -> y + 1; g(x) }";
+        let errs = check_src(src).unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains("cannot prove `run` pure")),
+            "got: {:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn pure_hof_free_function_still_ok() {
+        // A genuinely pure function (no applied function values, only arithmetic
+        // and a pure top-level call / pure builtin) must still pass.
+        assert!(check_src(
+            "pure fn add(a: Int, b: Int) -> Int = a + b\n\
+             pure fn area(w: Float, h: Float) -> Float = w * h\n\
+             pure fn use_them(a: Int, b: Int) -> Int = add(a, b)\n\
+             pure fn len(xs: Array[Int]) -> Int = array_len(xs)"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn non_pure_hof_is_fine() {
+        // The same higher-order function WITHOUT the `pure` annotation is
+        // perfectly legal — we only reject the unsound `pure` claim.
+        let src = "fn run(f: (Int) -> Int, x: Int) -> Int = f(x)\n\
+             fn main() -> Int = { print_int(run(\\x -> { print_int(x); x }, 5)); 0 }";
+        assert!(check_src(src).is_ok(), "got: {:?}", check_src(src));
     }
 
     #[test]

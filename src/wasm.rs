@@ -13843,6 +13843,35 @@ mod tests {
     use crate::{interp, lexer, parser, typeck};
     use std::process::Command;
 
+    /// Engineering guard: the `HeapHelper` runtime is dispatched by index, and
+    /// the invariant `ALL[i].offset() == i` is otherwise maintained ENTIRELY BY
+    /// HAND across three parallel structures (`ALL`, `offset()`, `sig()`). A
+    /// single careless edit would silently route every later helper call to the
+    /// WRONG function. Assert the invariant (and that every variant has a `sig()`
+    /// arm) so such a mistake fails the build instead of miscompiling.
+    #[test]
+    fn heap_helper_offsets_match_all_order() {
+        assert_eq!(
+            HeapHelper::ALL.len(),
+            81,
+            "HeapHelper::ALL length changed — update offset()/sig() and this count together"
+        );
+        for (i, h) in HeapHelper::ALL.iter().enumerate() {
+            assert_eq!(
+                h.offset() as usize,
+                i,
+                "HeapHelper::{:?} is at ALL index {} but offset() reports {} — \
+                 dispatch table is out of sync",
+                h,
+                i,
+                h.offset()
+            );
+            // Touch sig() so a missing/incorrect arm is exercised (the match is
+            // compile-time exhaustive; this guards against a stray catch-all).
+            let _ = h.sig();
+        }
+    }
+
     fn node_available() -> bool {
         Command::new("node")
             .arg("--version")
@@ -14139,6 +14168,28 @@ mod tests {
             let r = compile_src(src);
             assert!(r.is_err(), "expected Err (no panic) for:\n{}", src);
         }
+    }
+
+    #[test]
+    fn polymorphic_recursion_yields_clean_err_not_overflow() {
+        // BUG B: `go` instantiates go$Int, go$Pair$Int, go$Pair$Pair$Int, …
+        // unboundedly. The monomorphizer must report a clean compile error
+        // rather than overflowing the compiler's stack (exit 134 in the CLI).
+        let src = "type Pair[T] = | P(T, T)\n\
+             fn go[T](x: T, n: Int) -> Int = if n == 0 { 0 } else { go(P(x, x), n - 1) }\n\
+             fn main() -> Int = go(1, 5)";
+        let r = std::thread::Builder::new()
+            .stack_size(1 << 30)
+            .spawn(move || compile_src(src))
+            .expect("spawn")
+            .join()
+            .expect("compile thread must not overflow/panic");
+        let err = r.expect_err("expected a clean monomorphization Err");
+        assert!(
+            err.contains("monomorphization limit exceeded"),
+            "expected a monomorphization-limit error, got: {}",
+            err
+        );
     }
 
     // ---- Float (f64) support --------------------------------------------
@@ -14945,23 +14996,29 @@ mod tests {
     #[test]
     fn generic_true_phantom_is_clean_err() {
         // A genuinely-unresolvable phantom: `A` is mentioned in `mk`'s signature
-        // but used by NO constructor of `Phantom[A]` and fixed by no argument or
-        // return context. Monomorphization must reject it with a clean `Err`
-        // (not a panic), while the interpreter — which never needs `A` concrete
-        // — still runs.
+        // but used by NO parameter (it appears only in the return type) and is
+        // fixed by no argument context. Per BUG E, type-checking now rejects this
+        // up front (for backend parity) with a clean error — no panic — while the
+        // interpreter, which never needs `A` concrete, still runs the same source
+        // with `check` skipped.
         let src = "type Phantom[A] = | Only(Int)\n\
                    fn mk[A]() -> Phantom[A] = Only(1)\n\
                    fn main() -> Int = match mk() { Only(n) => n, }";
-        // Interpreter handles the unconstrained parameter dynamically.
-        assert!(interp_result(src).is_ok());
-        // The wasm pipeline must surface a clean error, not panic.
+        // The interpreter, run WITHOUT the static phantom-parameter check, still
+        // executes (it never needs `A` concrete) — confirming the program is only
+        // rejected by the static check, not the dynamics.
+        let prog = parser::parse(lexer::lex(src).expect("lex")).expect("parse");
+        let it = interp::Interp::new(&prog).expect("interp build");
+        assert!(it.run_main().is_ok(), "interpreter should run the phantom program");
+        // The compiled pipeline (typeck-gated) must surface a clean error.
         match compile_src(src) {
             Err(msg) => assert!(
-                msg.contains("could not infer type parameter"),
+                msg.contains("unused (cannot be inferred)")
+                    || msg.contains("could not infer type parameter"),
                 "expected a clean phantom-parameter error, got: {}",
                 msg
             ),
-            Ok(_) => panic!("expected monomorphization to reject the true phantom"),
+            Ok(_) => panic!("expected the true phantom parameter to be rejected"),
         }
     }
 

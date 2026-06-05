@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # `cc` (gcc) and `node` are preinstalled on GitHub's ubuntu runners, so the
+      # native/wasm differential tests run; if either were absent the tests skip
+      # those legs gracefully. Make the C compiler explicit for clarity.
+      - name: Show toolchain versions
+        run: |
+          rustc --version
+          cargo --version
+          cc --version
+          node --version
+
+      - name: Build (release)
+        run: cargo build --release
+
+      # A large stack mirrors local runs: the compiler pipeline is deeply
+      # recursive and some tests intentionally exercise deep (but finite)
+      # recursion.
+      - name: Test
+        env:
+          RUST_MIN_STACK: "536870912"
+        run: cargo test

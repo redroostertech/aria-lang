@@ -92,6 +92,15 @@ struct Mono<'a> {
     type_order: Vec<String>,
     fn_seen: std::collections::HashSet<String>,
     type_seen: std::collections::HashSet<String>,
+    /// Total number of distinct function specializations emitted so far. Guards
+    /// against unbounded monomorphization from polymorphic recursion (e.g.
+    /// `go(P(x, x), n - 1)`), where every call mangles to a fresh, deeper name
+    /// so `fn_seen` never dedups.
+    fn_instantiations: usize,
+    /// Current nesting depth of `specialize_fn` (incremented on entry, decremented
+    /// on exit). Bounds the *compiler's* own recursion so a polymorphic-recursion
+    /// blow-up reports a clean error well before it overflows the stack.
+    specialize_depth: usize,
     /// Maps a mangled monomorphic type name back to its generic origin
     /// `(original_name, concrete_args)`, so inference can unify a concrete
     /// argument type (already mangled) against a declared generic type.
@@ -139,6 +148,8 @@ impl<'a> Mono<'a> {
             type_order: Vec::new(),
             fn_seen: std::collections::HashSet::new(),
             type_seen: std::collections::HashSet::new(),
+            fn_instantiations: 0,
+            specialize_depth: 0,
             demangle: HashMap::new(),
             traits: crate::traits::index(program),
         }
@@ -387,6 +398,37 @@ impl<'a> Mono<'a> {
         if self.fn_seen.contains(&mangled) {
             return Ok(mangled);
         }
+
+        // Guard against unbounded monomorphization (polymorphic recursion).
+        // With a recursive generic call like `go(P(x, x), n - 1)`, each instance
+        // mangles to a strictly deeper, distinct name (`go$Int`,
+        // `go$Pair$Int`, `go$Pair$Pair$Int`, …) so `fn_seen` never dedups and the
+        // monomorphizer recurses forever, overflowing the *compiler's* stack.
+        // Two complementary caps turn this into a clean compile error:
+        //   * a recursion-DEPTH cap that bounds the compiler's own call depth
+        //     (the depth equals the type-nesting depth, which is what blows the
+        //     stack), and
+        //   * a total-instantiation cap as a secondary backstop (e.g. a wide,
+        //     non-recursive explosion of distinct instantiations).
+        // The limits are far above anything a real program reaches.
+        const MAX_SPECIALIZE_DEPTH: usize = 300;
+        const MAX_INSTANTIATIONS: usize = 50_000;
+        if self.specialize_depth > MAX_SPECIALIZE_DEPTH {
+            return Err(format!(
+                "monomorphization limit exceeded (specialization nesting depth > {}) \
+                 — possible polymorphic recursion in `{}`",
+                MAX_SPECIALIZE_DEPTH, name
+            ));
+        }
+        self.fn_instantiations += 1;
+        if self.fn_instantiations > MAX_INSTANTIATIONS {
+            return Err(format!(
+                "monomorphization limit exceeded ({} specializations) \
+                 — possible polymorphic recursion involving `{}`",
+                MAX_INSTANTIATIONS, name
+            ));
+        }
+
         self.fn_seen.insert(mangled.clone());
 
         if info.decl.type_params.len() != targs.len() {
@@ -422,7 +464,12 @@ impl<'a> Mono<'a> {
         // calls/ctors can be specialized) and rewrite ctor/call names. The
         // declared return type provides the expected type, letting nullary
         // generic constructors (e.g. `Nil`) recover their type args from context.
-        let (body, _bt) = self.rewrite_expr(&info.decl.body, &mut env, &map, Some(&ret))?;
+        // Bracket this (the only mutually-recursive descent back into
+        // `specialize_fn`) with the depth counter so the cap above can fire.
+        self.specialize_depth += 1;
+        let rewritten = self.rewrite_expr(&info.decl.body, &mut env, &map, Some(&ret));
+        self.specialize_depth -= 1;
+        let (body, _bt) = rewritten?;
 
         let decl = FnDecl {
             name: mangled.clone(),
@@ -1832,6 +1879,7 @@ fn contains_var(ty: &Ty) -> bool {
         _ => false,
     }
 }
+
 
 /// Does `ty` mention the type variable named `v`? Used as an occurs check before
 /// inserting a substitution, so `unify_decl` never creates a cyclic binding that

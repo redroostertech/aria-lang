@@ -4337,6 +4337,27 @@ mod tests {
         compile(&typed_program(src)?)
     }
 
+    #[test]
+    fn polymorphic_recursion_yields_clean_err_not_overflow() {
+        // BUG B: unbounded monomorphization (go$Int, go$Pair$Int, …) must yield a
+        // clean compile Err rather than overflowing the compiler stack.
+        let src = "type Pair[T] = | P(T, T)\n\
+             fn go[T](x: T, n: Int) -> Int = if n == 0 { 0 } else { go(P(x, x), n - 1) }\n\
+             fn main() -> Int = go(1, 5)";
+        let r = std::thread::Builder::new()
+            .stack_size(1 << 30)
+            .spawn(move || compile_src(src))
+            .expect("spawn")
+            .join()
+            .expect("compile thread must not overflow/panic");
+        let err = r.expect_err("expected a clean monomorphization Err");
+        assert!(
+            err.contains("monomorphization limit exceeded"),
+            "expected a monomorphization-limit error, got: {}",
+            err
+        );
+    }
+
     /// Build the C source with `cc`, run it, and return `(stdout, stderr)`.
     fn build_and_run(c_src: &str) -> Result<(String, String), String> {
         static SEQ: AtomicU64 = AtomicU64::new(0);

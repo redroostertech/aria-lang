@@ -45,6 +45,26 @@ mod wasm;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
+    // Run the real work on a worker thread with a large stack. The compiler
+    // pipeline (parser, type-checker, monomorphizer) is deeply recursive on
+    // nested types/expressions; the default 8 MiB main-thread stack can
+    // overflow on legitimately-large inputs and — more importantly — would
+    // overflow *before* the monomorphizer's polymorphic-recursion guard can
+    // fire and report a clean error. A 512 MiB stack gives those guards room to
+    // trip (mirroring `RUST_MIN_STACK=536870912` used for the test suite).
+    let stack_size = std::env::var("RUST_MIN_STACK")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(512 * 1024 * 1024);
+    std::thread::Builder::new()
+        .stack_size(stack_size)
+        .spawn(real_main)
+        .expect("spawn worker thread")
+        .join()
+        .expect("worker thread panicked")
+}
+
+fn real_main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         eprintln!("usage: aria <run|check|ast|pack|unpack|npack|nunpack|bench|demo|mem|wasm|wasm-run|native|native-run|gbnf> [args...]");
@@ -263,8 +283,17 @@ fn run_wasm_run(args: &[String]) -> ExitCode {
          if(Number.isNaN(x)){{return 'NaN';}}\
          if(x===Infinity){{return 'inf';}}\
          if(x===-Infinity){{return '-inf';}}\
-         if(x===0&&1/x===-Infinity){{return '-0';}}\
-         return String(x);}};\
+         if(x===0){{return (1/x===-Infinity)?'-0':'0';}}\
+         const neg=x<0;const a=Math.abs(x);\
+         const e=a.toExponential();const mi=e.indexOf('e');\
+         let mant=e.slice(0,mi);let exp=parseInt(e.slice(mi+1),10);\
+         let dot=mant.indexOf('.');\
+         let digits=dot===-1?mant:mant.slice(0,dot)+mant.slice(dot+1);\
+         let pp=(dot===-1?mant.length:dot)+exp;let out;\
+         if(pp<=0){{out='0.'+'0'.repeat(-pp)+digits;}}\
+         else if(pp>=digits.length){{out=digits+'0'.repeat(pp-digits.length);}}\
+         else{{out=digits.slice(0,pp)+'.'+digits.slice(pp);}}\
+         return neg?'-'+out:out;}};\
          const imp={{env:{{print_str:(p,n)=>{{\
          const mem=new Uint8Array(memref.buffer);\
          process.stdout.write(dec.decode(mem.subarray(p,p+n)));\

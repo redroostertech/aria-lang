@@ -8,12 +8,14 @@ type List =
   | Nil
   | Cons(Int, List)
 
--- Build [0, 1, ..., n-1] (allocates n Cons cells).
-fn range(n: Int, acc: List) -> List =
+-- Build [0, 1, ..., n-1] as a cons-list (allocates n Cons cells). Named
+-- `list_range` to avoid colliding with the prelude's `range` (which builds an
+-- `Array[Int]`); this benchmark exercises the ADT/cons-cell reuse path.
+fn list_range(n: Int, acc: List) -> List =
   if n == 0 {
     acc
   } else {
-    range(n - 1, Cons(n - 1, acc))
+    list_range(n - 1, Cons(n - 1, acc))
   }
 
 -- Functional map (+1): allocates a fresh Cons per element under naive RC;
@@ -31,7 +33,7 @@ fn sum(xs: List) -> Int =
   }
 
 fn main() -> Int = {
-  let xs = range(1000, Nil);
+  let xs = list_range(1000, Nil);
   let ys = inc_all(xs);
   print_int(sum(ys));
   0

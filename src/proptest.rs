@@ -786,10 +786,25 @@ fn run_wasm_live_str(bytes: &[u8]) -> Result<(String, i64), String> {
         "const fs=require('fs');\
          const dec=new TextDecoder();\
          let memref=null;\
+         const fmtFloat=(x)=>{{\
+         if(Number.isNaN(x)){{return 'NaN';}}\
+         if(x===Infinity){{return 'inf';}}\
+         if(x===-Infinity){{return '-inf';}}\
+         if(x===0){{return (1/x===-Infinity)?'-0':'0';}}\
+         const neg=x<0;const a=Math.abs(x);\
+         const e=a.toExponential();const mi=e.indexOf('e');\
+         let mant=e.slice(0,mi);let exp=parseInt(e.slice(mi+1),10);\
+         let dot=mant.indexOf('.');\
+         let digits=dot===-1?mant:mant.slice(0,dot)+mant.slice(dot+1);\
+         let pp=(dot===-1?mant.length:dot)+exp;let out;\
+         if(pp<=0){{out='0.'+'0'.repeat(-pp)+digits;}}\
+         else if(pp>=digits.length){{out=digits+'0'.repeat(pp-digits.length);}}\
+         else{{out=digits.slice(0,pp)+'.'+digits.slice(pp);}}\
+         return neg?'-'+out:out;}};\
          const imp={{env:{{print_str:(p,n)=>{{\
          process.stdout.write(dec.decode(new Uint8Array(memref.buffer).subarray(p,p+n)));\
          process.stdout.write('\\n');}},\
-         print_float:(x)=>{{process.stdout.write(Number.isNaN(x)?'NaN':x===Infinity?'inf':x===-Infinity?'-inf':(x===0&&1/x===-Infinity)?'-0':String(x));process.stdout.write('\\n');}},\
+         print_float:(x)=>{{process.stdout.write(fmtFloat(x));process.stdout.write('\\n');}},\
          print_int:(n)=>{{process.stdout.write(String(n));process.stdout.write('\\n');}},\
          print_bool:(b)=>{{process.stdout.write(b?'true':'false');process.stdout.write('\\n');}},\
          exp:Math.exp}}}};\
@@ -835,10 +850,25 @@ fn run_wasm_live(bytes: &[u8]) -> Result<(String, i64), String> {
         "const fs=require('fs');\
          const dec=new TextDecoder();\
          let memref=null;\
+         const fmtFloat=(x)=>{{\
+         if(Number.isNaN(x)){{return 'NaN';}}\
+         if(x===Infinity){{return 'inf';}}\
+         if(x===-Infinity){{return '-inf';}}\
+         if(x===0){{return (1/x===-Infinity)?'-0':'0';}}\
+         const neg=x<0;const a=Math.abs(x);\
+         const e=a.toExponential();const mi=e.indexOf('e');\
+         let mant=e.slice(0,mi);let exp=parseInt(e.slice(mi+1),10);\
+         let dot=mant.indexOf('.');\
+         let digits=dot===-1?mant:mant.slice(0,dot)+mant.slice(dot+1);\
+         let pp=(dot===-1?mant.length:dot)+exp;let out;\
+         if(pp<=0){{out='0.'+'0'.repeat(-pp)+digits;}}\
+         else if(pp>=digits.length){{out=digits+'0'.repeat(pp-digits.length);}}\
+         else{{out=digits.slice(0,pp)+'.'+digits.slice(pp);}}\
+         return neg?'-'+out:out;}};\
          const imp={{env:{{print_str:(p,n)=>{{\
          process.stdout.write(dec.decode(new Uint8Array(memref.buffer).subarray(p,p+n)));\
          process.stdout.write('\\n');}},\
-         print_float:(x)=>{{process.stdout.write(Number.isNaN(x)?'NaN':x===Infinity?'inf':x===-Infinity?'-inf':(x===0&&1/x===-Infinity)?'-0':String(x));process.stdout.write('\\n');}},\
+         print_float:(x)=>{{process.stdout.write(fmtFloat(x));process.stdout.write('\\n');}},\
          print_int:(n)=>{{process.stdout.write(String(n));process.stdout.write('\\n');}},\
          print_bool:(b)=>{{process.stdout.write(b?'true':'false');process.stdout.write('\\n');}},\
          exp:Math.exp}}}};\
@@ -1521,13 +1551,29 @@ fn wasm_float_display_special_values() {
     if !node_available() {
         return;
     }
-    // (printed expression, oracle rendering)
+    // (printed expression, oracle rendering). The oracle is Rust's `{}` shortest
+    // round-trip, which ALWAYS expands (never exponential); the wasm Node harness
+    // must agree byte-for-byte — including the magnitudes (`< 1e-6`, `>= 1e21`)
+    // where JS `String(x)` would otherwise switch to exponential notation
+    // (BUG C: `1e-7`, `1e+21`, …).
     let cases = [
         ("0.0 * -1.0", "-0"),   // negative zero
         ("1.0 / 0.0", "inf"),   // +infinity
         ("-1.0 / 0.0", "-inf"), // -infinity
         ("0.0 / 0.0", "NaN"),   // NaN
         ("1.5", "1.5"),         // a finite control value (unchanged)
+        // --- BUG C: exponential-range magnitudes must print expanded ---
+        ("0.0000001", "0.0000001"),
+        ("0.0000000000000001", "0.0000000000000001"),
+        (
+            "1000000000000000000000.0",
+            "1000000000000000000000",
+        ),
+        (
+            "1000000000000000000000000000000.0",
+            "1000000000000000000000000000000",
+        ),
+        ("0.0000123", "0.0000123"),
     ];
     for (expr, oracle) in cases {
         let src = format!(
@@ -1546,6 +1592,79 @@ fn wasm_float_display_special_values() {
             "wasm float display for `{}`: got {:?}, expected {:?}",
             expr, printed, oracle
         );
+    }
+}
+
+/// BUG C, cross-backend: the SAME float prints byte-for-byte identically on the
+/// interpreter (oracle, Rust `{}`), the native C backend (`aria_fmt_float`), and
+/// the wasm Node harness (`fmtFloat`). Covers the exponential-range magnitudes
+/// and the special values. The native leg is cc-gated, the wasm leg node-gated;
+/// each runs the same multi-print program and we compare the full printed output.
+#[test]
+fn float_print_agrees_across_backends() {
+    // One program that prints every interesting magnitude / special value.
+    let src = "fn main() -> Int = {\n\
+        print_float(0.0000001);\n\
+        print_float(0.0000000000000001);\n\
+        print_float(1000000000000000000000.0);\n\
+        print_float(1000000000000000000000000000000.0);\n\
+        print_float(0.0000123);\n\
+        print_float(1.5);\n\
+        print_float(0.0 * -1.0);\n\
+        print_float(1.0 / 0.0);\n\
+        print_float(-1.0 / 0.0);\n\
+        print_float(0.0 / 0.0);\n\
+        0\n\
+    }\n";
+    // The oracle: exactly what the interpreter/native print (Rust `{}` expanded).
+    let oracle = "0.0000001\n\
+        0.0000000000000001\n\
+        1000000000000000000000\n\
+        1000000000000000000000000000000\n\
+        0.0000123\n\
+        1.5\n\
+        -0\n\
+        inf\n\
+        -inf\n\
+        NaN\n";
+    let prog = parser::parse(lexer::lex(src).expect("lex")).expect("parse");
+    assert!(typeck::check(&prog).is_ok(), "type error\n{}", src);
+
+    // Native leg: compile to C, build, run, compare full stdout.
+    if cc_available() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let c_src = crate::c_backend::compile(&prog).expect("native compile float print");
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir();
+        let cpath = dir.join(format!("aria_fdiff_{}_{}.c", std::process::id(), n));
+        let exe = dir.join(format!("aria_fdiff_{}_{}", std::process::id(), n));
+        std::fs::write(&cpath, &c_src).expect("write c");
+        let cc = std::process::Command::new("cc")
+            .arg("-O2").arg("-std=c11").arg("-ffp-contract=off")
+            .arg("-o").arg(&exe).arg(&cpath).arg("-lm")
+            .output().expect("cc");
+        let _ = std::fs::remove_file(&cpath);
+        assert!(cc.status.success(), "cc failed: {}", String::from_utf8_lossy(&cc.stderr));
+        let run = std::process::Command::new(&exe).output().expect("run native");
+        let _ = std::fs::remove_file(&exe);
+        // The C runtime also prints `main`'s Int result on a final line; the
+        // float lines are the leading prefix.
+        let native_out = String::from_utf8_lossy(&run.stdout);
+        assert!(
+            native_out.starts_with(oracle),
+            "native float printing != oracle:\n{:?}",
+            native_out
+        );
+    }
+
+    // Wasm leg: run under Node, compare the printed lines (the program returns
+    // Int 0, which the str harness renders as a trailing "0" line — drop it).
+    if node_available() {
+        let bytes = wasm::compile(&prog).expect("wasm compile float print");
+        let (w, live) = run_wasm_live_str(&bytes).expect("wasm run float print");
+        assert!(w.starts_with(oracle), "wasm float printing != oracle:\n{:?}", w);
+        assert_eq!(live, 0, "wasm leaked on float print");
     }
 }
 
