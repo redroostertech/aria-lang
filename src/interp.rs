@@ -1266,6 +1266,20 @@ fn builtin(name: &str, args: &[Value]) -> Result<Option<Value>, String> {
             [m @ Value::Map(_)] => Ok(Some(Value::Str(m.display()))),
             _ => Err("map_show expects (Map)".into()),
         },
+        // Enumerate the map's keys / values into an Array, in ascending key order
+        // (entries are already kept sorted by key), so the two are index-aligned.
+        "map_keys" => match args {
+            [Value::Map(entries)] => {
+                Ok(Some(Value::Array(entries.iter().map(|(k, _)| k.clone()).collect())))
+            }
+            _ => Err("map_keys expects (Map)".into()),
+        },
+        "map_values" => match args {
+            [Value::Map(entries)] => {
+                Ok(Some(Value::Array(entries.iter().map(|(_, v)| v.clone()).collect())))
+            }
+            _ => Err("map_values expects (Map)".into()),
+        },
 
         // ---- Ordered Set ---------------------------------------------------
         "set_new" => match args {
@@ -1305,6 +1319,12 @@ fn builtin(name: &str, args: &[Value]) -> Result<Option<Value>, String> {
         "set_show" => match args {
             [s @ Value::Set(_)] => Ok(Some(Value::Str(s.display()))),
             _ => Err("set_show expects (Set)".into()),
+        },
+        // Enumerate the set's elements into an Array, in ascending order (the set
+        // is already kept sorted by element).
+        "set_to_array" => match args {
+            [Value::Set(elems)] => Ok(Some(Value::Array(elems.clone()))),
+            _ => Err("set_to_array expects (Set)".into()),
         },
         _ => Ok(None),
     }
@@ -1947,6 +1967,60 @@ mod tests {
             }
         "#);
         assert!(matches!(eq, Value::Bool(true)));
+    }
+
+    #[test]
+    fn map_keys_values_set_to_array_enumeration() {
+        // map_keys / map_values come out in ASCENDING key order (entries are kept
+        // sorted), regardless of insertion order, and are index-aligned.
+        let keys = run(r#"
+            fn main() -> Array[Int] =
+                map_keys(map_insert(map_insert(map_insert(map_new(), 30, 3), 10, 1), 20, 2))
+        "#);
+        assert_eq!(keys.display(), "[10, 20, 30]");
+        let vals = run(r#"
+            fn main() -> Array[Int] =
+                map_values(map_insert(map_insert(map_insert(map_new(), 30, 3), 10, 1), 20, 2))
+        "#);
+        assert_eq!(vals.display(), "[1, 2, 3]"); // index-aligned with sorted keys
+        // Str keys sort lexicographically; values follow the same order.
+        let skeys = run(r#"
+            fn main() -> Array[String] =
+                map_keys(map_insert(map_insert(map_insert(map_new(), "pear", 9), "apple", 7), "fig", 8))
+        "#);
+        assert_eq!(skeys.display(), "[apple, fig, pear]");
+        let svals = run(r#"
+            fn main() -> Array[Int] =
+                map_values(map_insert(map_insert(map_insert(map_new(), "pear", 9), "apple", 7), "fig", 8))
+        "#);
+        assert_eq!(svals.display(), "[7, 8, 9]");
+        // set_to_array: ascending, deduped.
+        let elems = run(r#"
+            fn main() -> Array[Int] =
+                set_to_array(set_add(set_add(set_add(set_add(set_new(), 30), 10), 20), 10))
+        "#);
+        assert_eq!(elems.display(), "[10, 20, 30]");
+        let strs = run(r#"
+            fn main() -> Array[String] =
+                set_to_array(set_add(set_add(set_add(set_new(), "b"), "a"), "c"))
+        "#);
+        assert_eq!(strs.display(), "[a, b, c]");
+        // A non-Int/Str value type is fine for map_values (the oracle supports
+        // any value type): Float values preserved in key order.
+        let fvals = run(r#"
+            fn main() -> Array[Float] =
+                map_values(map_insert(map_insert(map_new(), 2, 2.5), 1, 1.5))
+        "#);
+        assert_eq!(fvals.display(), "[1.5, 2.5]");
+    }
+
+    #[test]
+    fn enumeration_of_empty_map_set_is_empty_array() {
+        // An empty map/set enumerates to an empty array (not a crash).
+        assert_eq!(run("fn main() -> Array[Int] = map_keys(map_new())").display(), "[]");
+        assert_eq!(run("fn main() -> Array[Int] = map_values(map_new())").display(), "[]");
+        assert_eq!(run("fn main() -> Array[Int] = set_to_array(set_new())").display(), "[]");
+        assert_eq!(run("fn main() -> Int = array_len(map_keys(map_new()))").display(), "0");
     }
 
     #[test]

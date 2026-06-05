@@ -1399,6 +1399,158 @@ fn maps_sets_interp_matches_compiled() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// 9b) Collection enumeration differential: `map_keys` / `map_values` /
+//     `set_to_array` turn a Map/Set into a plain Array (in the same ascending,
+//     deterministic order used for display/equality) so it can be iterated with
+//     the prelude array HOFs (`array_fold`/`array_map`). Each program is wrapped
+//     with the real prelude (so the HOFs are in scope) and run through interp
+//     (oracle) vs native (cc-gated); results must be IDENTICAL and the native
+//     heap garbage-free (live == 0). Wasm/IR reject these (covered by the gate
+//     tests above), so they are intentionally excluded here.
+// ---------------------------------------------------------------------------
+
+/// User programs (prelude appended at run time) combining the enumeration
+/// builtins with the array HOFs, plus their expected Int / String results.
+fn enum_hof_diff_programs() -> Vec<(String, &'static str)> {
+    vec![
+        // map_values folded: sum of an out-of-order Int->Int map = 1+2+3+4 = 10.
+        (
+            "fn main() -> Int = {\n\
+               let m = map_insert(map_insert(map_insert(map_insert(map_new(), 30, 3), 10, 1), 20, 2), 40, 4);\n\
+               array_fold(map_values(m), 0, \\(a: Int, x: Int) -> a + x)\n\
+             }\n"
+                .to_string(),
+            "10",
+        ),
+        // map_keys folded: keys come out ASCENDING regardless of insert order;
+        // sum 10+20+30+40 = 100.
+        (
+            "fn main() -> Int = {\n\
+               let m = map_insert(map_insert(map_insert(map_insert(map_new(), 30, 3), 10, 1), 20, 2), 40, 4);\n\
+               array_fold(map_keys(m), 0, \\(a: Int, x: Int) -> a + x)\n\
+             }\n"
+                .to_string(),
+            "100",
+        ),
+        // map_keys mapped then folded: double each key, sum = 200.
+        (
+            "fn main() -> Int = {\n\
+               let m = map_insert(map_insert(map_insert(map_insert(map_new(), 30, 3), 10, 1), 20, 2), 40, 4);\n\
+               array_fold(array_map(map_keys(m), \\x -> x * 2), 0, \\(a: Int, x: Int) -> a + x)\n\
+             }\n"
+                .to_string(),
+            "200",
+        ),
+        // Str-keyed map: keys ASCENDING -> concat = "applefigpear".
+        (
+            "fn main() -> String = {\n\
+               let m = map_insert(map_insert(map_insert(map_new(), \"pear\", 9), \"apple\", 7), \"fig\", 8);\n\
+               array_fold(map_keys(m), \"\", \\(a: String, x: String) -> concat(a, x))\n\
+             }\n"
+                .to_string(),
+            "applefigpear",
+        ),
+        // Str-keyed map: values index-aligned with the sorted keys, sum = 24.
+        (
+            "fn main() -> Int = {\n\
+               let m = map_insert(map_insert(map_insert(map_new(), \"pear\", 9), \"apple\", 7), \"fig\", 8);\n\
+               array_fold(map_values(m), 0, \\(a: Int, x: Int) -> a + x)\n\
+             }\n"
+                .to_string(),
+            "24",
+        ),
+        // Int set (out of order, with a duplicate) -> ascending array, sum = 18.
+        (
+            "fn main() -> Int = {\n\
+               let s = set_add(set_add(set_add(set_add(set_add(set_new(), 5), 1), 3), 1), 9);\n\
+               array_fold(set_to_array(s), 0, \\(a: Int, x: Int) -> a + x)\n\
+             }\n"
+                .to_string(),
+            "18",
+        ),
+        // Str set -> ASCENDING array -> concat = "alphacharliedelta".
+        (
+            "fn main() -> String = {\n\
+               let s = set_add(set_add(set_add(set_add(set_new(), \"delta\"), \"alpha\"), \"charlie\"), \"alpha\");\n\
+               array_fold(set_to_array(s), \"\", \\(a: String, x: String) -> concat(a, x))\n\
+             }\n"
+                .to_string(),
+            "alphacharliedelta",
+        ),
+        // Empty map/set -> empty array -> fold returns the seed unchanged. The
+        // element type is pinned via an annotated builder fn (an UNANNOTATED bare
+        // `map_new()` whose value type is never determined is the usual
+        // whole-language `array_new()`-style limitation, out of scope here).
+        (
+            "fn empty_im() -> Map[Int, Int] = map_new()\n\
+             fn main() -> Int =\n\
+               array_fold(map_values(empty_im()), 7, \\(a: Int, x: Int) -> a + x)\n"
+                .to_string(),
+            "7",
+        ),
+        (
+            "fn empty_is() -> Set[Int] = set_new()\n\
+             fn main() -> Int =\n\
+               array_fold(set_to_array(empty_is()), 5, \\(a: Int, x: Int) -> a + x) + array_len(set_to_array(empty_is()))\n"
+                .to_string(),
+            "5",
+        ),
+        // Float-valued map: map_values yields an Array[Float]; sum = 1.5+2.5 = 4.0.
+        (
+            "fn main() -> Int = {\n\
+               let m = map_insert(map_insert(map_new(), 2, 2.5), 1, 1.5);\n\
+               let xs = map_values(m);\n\
+               if array_get(xs, 0) + array_get(xs, 1) == 4.0 { 1 } else { 0 }\n\
+             }\n"
+                .to_string(),
+            "1",
+        ),
+    ]
+}
+
+#[test]
+fn enum_hofs_match_across_backends() {
+    let progs = enum_hof_diff_programs();
+    let cc = cc_available();
+    let mut native_checked = 0u64;
+
+    for (user_src, expected) in &progs {
+        // Wrap with the real prelude (exactly as the CLI does) so the array HOFs
+        // are in scope.
+        let src = crate::prelude::wrap(user_src);
+
+        // Oracle: tree-walking interpreter.
+        let interp =
+            ast_run(&src).unwrap_or_else(|e| panic!("interp failed: {}\n{}", e, user_src));
+        assert_eq!(
+            &interp, expected,
+            "interpreter result mismatch\n{}\n got={} want={}",
+            user_src, interp, expected
+        );
+
+        let prog = parser::parse(lexer::lex(&src).expect("lex")).expect("parse");
+        assert!(typeck::check(&prog).is_ok(), "type error\n{}", user_src);
+
+        // Native (C) backend: identical result + garbage-free (live == 0).
+        if cc {
+            let c_src = crate::c_backend::compile(&prog)
+                .unwrap_or_else(|e| panic!("c_backend failed: {}\n{}", e, user_src));
+            let (nat, live) = run_native_live(&c_src)
+                .unwrap_or_else(|e| panic!("native runner failed: {}\n{}", e, user_src));
+            assert_eq!(nat, *expected, "native != expected\n{}\n native={}", user_src, nat);
+            assert_eq!(live, 0, "native leaked {} cell(s)\n{}", live, user_src);
+            native_checked += 1;
+        }
+    }
+
+    eprintln!(
+        "enum_hofs_match_across_backends: {} programs ({} native)",
+        progs.len(),
+        native_checked
+    );
+}
+
 /// A Map whose VALUE type is non-flat (Array, nested Map, tuple/ADT) is not
 /// faithfully representable in the native backend (coarse value slots), so the
 /// compiled path must REJECT it cleanly — but the interpreter still supports it.

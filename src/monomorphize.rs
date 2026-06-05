@@ -835,6 +835,32 @@ impl<'a> Mono<'a> {
                     Ty::Str,
                 )))
             }
+            // Enumeration into an Array. The result element type is the map key
+            // (`map_keys` -> Array[K]) or value (`map_values` -> Array[V]); the
+            // suffix carries the map's `$<keytag>_<valtag>` so the native backend
+            // can build the result AriaArray with the correct element kind (and
+            // drop the source map). The expected `Array[..]` (if any) helps pin the
+            // map type when the argument is an unannotated `map_new()`.
+            "map_keys" | "map_values" => {
+                let want_v = expected.and_then(array_elem_of);
+                let map_hint = want_v.as_ref().map(|elem| {
+                    if name == "map_keys" {
+                        mapty(elem.clone(), Ty::Unit)
+                    } else {
+                        mapty(Ty::Unit, elem.clone())
+                    }
+                });
+                let (rmap, map_ty) = self.rewrite_expr(&args[0], env, tymap, map_hint.as_ref())?;
+                let (k, v) = map_kv_of(&map_ty)
+                    .or_else(|| map_hint.as_ref().and_then(map_kv_of))
+                    .unwrap_or((Ty::Unit, Ty::Unit));
+                let elem = if name == "map_keys" { k.clone() } else { v.clone() };
+                let suffix = map_suffix(&k, &v);
+                Ok(Some((
+                    Expr::Call(format!("{}${}", name, suffix), vec![rmap]),
+                    Ty::Named("Array".to_string(), vec![elem]),
+                )))
+            }
             // ---- Set ----
             "set_new" => {
                 let t = expected.and_then(set_elem_of).unwrap_or(Ty::Unit);
@@ -888,6 +914,22 @@ impl<'a> Mono<'a> {
                 Ok(Some((
                     Expr::Call(format!("set_show${}", suffix), vec![rset]),
                     Ty::Str,
+                )))
+            }
+            // Enumeration into an Array[T]. The suffix carries the set's element
+            // tag so the native backend builds the result AriaArray with the
+            // correct element kind (and drops the source set).
+            "set_to_array" => {
+                let want = expected.and_then(array_elem_of);
+                let set_hint = want.as_ref().map(|t| setty(t.clone()));
+                let (rset, set_ty) = self.rewrite_expr(&args[0], env, tymap, set_hint.as_ref())?;
+                let t = set_elem_of(&set_ty)
+                    .or_else(|| want.clone())
+                    .unwrap_or(Ty::Unit);
+                let suffix = array_elem_tag(&t);
+                Ok(Some((
+                    Expr::Call(format!("set_to_array${}", suffix), vec![rset]),
+                    Ty::Named("Array".to_string(), vec![t]),
                 )))
             }
             _ => Ok(None),

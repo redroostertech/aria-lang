@@ -112,6 +112,12 @@ fn build_signatures() -> Vec<(&'static str, Vec<Ty>, Ty)> {
         // order, empty `Map[]`) — identical byte-for-byte in every backend, so a
         // whole-map can be printed via `print_str(map_show(m))`.
         ("map_show", vec![map()], Str),
+        // Enumeration into a plain `Array` so a map can be iterated with the
+        // prelude array HOFs. Both arrays come out in ASCENDING key order (the
+        // same deterministic order used for display/equality), so `map_keys` and
+        // `map_values` are index-aligned. Consumes the map.
+        ("map_keys", vec![map()], Named("Array".to_string(), vec![mkey()])),
+        ("map_values", vec![map()], Named("Array".to_string(), vec![mval()])),
         // ---- Ordered Set[T] (sorted by element; T is Int or Str) ------------
         ("set_new", vec![], set()),
         ("set_add", vec![set(), setelem()], set()),
@@ -120,6 +126,10 @@ fn build_signatures() -> Vec<(&'static str, Vec<Ty>, Ty)> {
         ("set_remove", vec![set(), setelem()], set()),
         // Canonical textual rendering `Set[a, b, c]` (ascending order).
         ("set_show", vec![set()], Str),
+        // Enumeration into a plain `Array` (ascending element order, the same
+        // deterministic order used for display/equality) so a set can be iterated
+        // with the prelude array HOFs. Consumes the set.
+        ("set_to_array", vec![set()], Named("Array".to_string(), vec![setelem()])),
         // ---- Vector / Embedding (dense, immutable buffer of Float) ----------
         // A flat heap buffer of f64. `push`/`add`/`scale` are functional (the
         // oracle copies; the native backend reuses in place when unique).

@@ -738,8 +738,9 @@ fn builtin_type_params(params: &[Ty], ret: &Ty) -> Vec<String> {
 fn map_set_key_var(name: &str) -> Option<&'static str> {
     match name {
         "map_new" | "map_insert" | "map_get_or" | "map_has" | "map_len" | "map_remove"
-        | "map_show" => Some("K"),
-        "set_new" | "set_add" | "set_has" | "set_len" | "set_remove" | "set_show" => Some("T"),
+        | "map_show" | "map_keys" | "map_values" => Some("K"),
+        "set_new" | "set_add" | "set_has" | "set_len" | "set_remove" | "set_show"
+        | "set_to_array" => Some("T"),
         _ => None,
     }
 }
@@ -2017,6 +2018,10 @@ mod tests {
             ("set_has", vec![set.clone(), Var("T".into())], Bool),
             ("set_len", vec![set.clone()], Int),
             ("set_remove", vec![set.clone(), Var("T".into())], set.clone()),
+            // Enumeration builtins return a plain Array of the key/value/element.
+            ("map_keys", vec![map.clone()], Named("Array".into(), vec![Var("K".into())])),
+            ("map_values", vec![map.clone()], Named("Array".into(), vec![Var("V".into())])),
+            ("set_to_array", vec![set.clone()], Named("Array".into(), vec![Var("T".into())])),
         ];
         for (name, params, ret) in cases {
             let (p, r) = builtins::lookup(name)
@@ -2046,6 +2051,58 @@ mod tests {
             fn main() -> Bool = set_has(set_add(set_new(), "x"), "x")
         "#;
         assert!(check_src(ok_set).is_ok(), "got: {:?}", check_src(ok_set));
+    }
+
+    #[test]
+    fn enumeration_builtins_type_check() {
+        // map_keys yields Array[K] (Int), map_values Array[V] (here also Int),
+        // both usable with the array primitives.
+        let ok_int = r#"
+            fn main() -> Int = {
+                let m = map_insert(map_insert(map_new(), 1, 10), 2, 20);
+                array_len(map_keys(m)) + array_get(map_values(m), 0)
+            }
+        "#;
+        assert!(check_src(ok_int).is_ok(), "got: {:?}", check_src(ok_int));
+        // map_values preserves a non-key value type (Float) into Array[Float].
+        let ok_fval = r#"
+            fn main() -> Float =
+                array_get(map_values(map_insert(map_new(), 1, 2.5)), 0)
+        "#;
+        assert!(check_src(ok_fval).is_ok(), "got: {:?}", check_src(ok_fval));
+        // Str keys -> Array[String]; element used where a String is expected.
+        let ok_skeys = r#"
+            fn main() -> String =
+                array_get(map_keys(map_insert(map_new(), "a", 1)), 0)
+        "#;
+        assert!(check_src(ok_skeys).is_ok(), "got: {:?}", check_src(ok_skeys));
+        // set_to_array yields Array[T].
+        let ok_set = r#"
+            fn main() -> Int = array_len(set_to_array(set_add(set_new(), 3)))
+        "#;
+        assert!(check_src(ok_set).is_ok(), "got: {:?}", check_src(ok_set));
+    }
+
+    #[test]
+    fn enumeration_result_element_type_is_checked() {
+        // map_keys of an Int-keyed map is Array[Int]; treating an element as a
+        // String must be a type error (proves the element type is threaded).
+        let bad = r#"
+            fn main() -> String =
+                array_get(map_keys(map_insert(map_new(), 1, 10)), 0)
+        "#;
+        assert!(check_src(bad).is_err(), "expected an element-type error");
+        // A non-Int/Str key is still rejected through the enumeration builtin's
+        // Map argument (the key restriction is inherited).
+        let bad_key = r#"
+            fn main() -> Int = array_len(map_keys(map_insert(map_new(), true, 1)))
+        "#;
+        let errs = check_src(bad_key).unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains("must be Int or Str")),
+            "expected a key-restriction error, got: {:?}",
+            errs
+        );
     }
 
     #[test]

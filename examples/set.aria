@@ -28,5 +28,10 @@ fn main() -> Int = {
   print_str(set_show(s4));           -- Set[apple, fig, pear]
   print_bool(set_has(s4, "fig"));    -- true
   print_bool(set_new() == set_new());  -- true (two empty sets are equal)
+
+  -- `set_to_array` enumerates the elements into a plain Array (ascending order),
+  -- so a set can be iterated with the prelude array HOFs. Sum the Int set's
+  -- elements with `array_fold`: 10 + 30 = 40.
+  print_int(array_fold(set_to_array(a5), 0, \(acc: Int, x: Int) -> acc + x));  -- 40
   0
 }

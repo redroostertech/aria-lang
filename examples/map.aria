@@ -32,5 +32,11 @@ fn main() -> Int = {
   print_int(map_get_or(s3, "fig", 0));    -- 2
   print_int(map_get_or(s3, "kiwi", 0));   -- 0  (absent)
   print_bool(map_new() == map_new());     -- true  (two empty maps are equal)
+
+  -- `map_keys`/`map_values` enumerate the map into plain Arrays in ascending key
+  -- order (index-aligned), so a map can be iterated with the prelude array HOFs.
+  -- Sum m5's values (111 + 300 = 411) and its keys (10 + 30 = 40) with array_fold.
+  print_int(array_fold(map_values(m5), 0, \(acc: Int, x: Int) -> acc + x));  -- 411
+  print_int(array_fold(map_keys(m5), 0, \(acc: Int, x: Int) -> acc + x));    -- 40
   0
 }

@@ -325,12 +325,15 @@ fn parse_map_set_builtin(name: &str) -> Option<&'static str> {
         "map_len" => Some("map_len"),
         "map_remove" => Some("map_remove"),
         "map_show" => Some("map_show"),
+        "map_keys" => Some("map_keys"),
+        "map_values" => Some("map_values"),
         "set_new" => Some("set_new"),
         "set_add" => Some("set_add"),
         "set_has" => Some("set_has"),
         "set_len" => Some("set_len"),
         "set_remove" => Some("set_remove"),
         "set_show" => Some("set_show"),
+        "set_to_array" => Some("set_to_array"),
         _ => None,
     }
 }
@@ -819,6 +822,22 @@ fn map_set_builtin_ret(base: &str, name: &str, args: &[Atom], env: &Env) -> Resu
         "map_has" | "set_has" => Ok(CType::Bool),
         "map_len" | "set_len" => Ok(CType::Int),
         "map_show" | "set_show" => Ok(CType::Str),
+        // Enumeration into an Array. The element kind is the map key (`map_keys`),
+        // map value (`map_values`), or set element (`set_to_array`), recovered
+        // precisely from the container's static type (falling back to the coarse
+        // name-suffix kind for an empty constructor with no header info).
+        "map_keys" => {
+            let (k, _) = container_kinds(env).unwrap_or((sk, sv));
+            Ok(CType::Array(ElemKind::from_ctype(&slot_kind_ctype(k))))
+        }
+        "map_values" => {
+            let (_, v) = container_kinds(env).unwrap_or((sk, sv));
+            Ok(CType::Array(ElemKind::from_ctype(&slot_kind_ctype(v))))
+        }
+        "set_to_array" => {
+            let (e, _) = container_kinds(env).unwrap_or((sk, sv));
+            Ok(CType::Array(ElemKind::from_ctype(&slot_kind_ctype(e))))
+        }
         "set_new" => Ok(CType::Set(sk)),
         "set_add" => {
             let e = match args.get(1).map(|a| atom_type(a, env)) {
@@ -1813,6 +1832,41 @@ fn emit_map_set_builtin(
             }
             let (_, m) = emit_atom(&args[0], env, out)?;
             let _ = writeln!(out, "{}{} = aria_map_show({});", ind, dst, m);
+            Ok(())
+        }
+        "map_keys" | "map_values" => {
+            if args.len() != 1 {
+                return Err(format!("c backend: {} expects (map)", base));
+            }
+            let (mt, m) = emit_atom(&args[0], env, out)?;
+            let (kk, vk) = map_kinds_of(mt)?;
+            // The array's element kind: Bool collapses to the Int slot (no-op
+            // dup/drop), matching the result CType (ElemKind has no Bool).
+            let (src_kind, out_kind) = if base == "map_keys" {
+                (kk, ElemKind::from_ctype(&slot_kind_ctype(kk)).code())
+            } else {
+                (vk, ElemKind::from_ctype(&slot_kind_ctype(vk)).code())
+            };
+            let helper = if base == "map_keys" { "aria_map_keys" } else { "aria_map_values" };
+            let _ = writeln!(
+                out,
+                "{}{} = {}({}, INT64_C({}), INT64_C({}));",
+                ind, dst, helper, m, src_kind.code(), out_kind
+            );
+            Ok(())
+        }
+        "set_to_array" => {
+            if args.len() != 1 {
+                return Err("c backend: set_to_array expects (set)".into());
+            }
+            let (st, s) = emit_atom(&args[0], env, out)?;
+            let ek = set_kind_of(st)?;
+            let out_kind = ElemKind::from_ctype(&slot_kind_ctype(ek)).code();
+            let _ = writeln!(
+                out,
+                "{}{} = aria_set_to_array({}, INT64_C({}), INT64_C({}));",
+                ind, dst, s, ek.code(), out_kind
+            );
             Ok(())
         }
         "map_remove" => {
@@ -3158,6 +3212,48 @@ static void* aria_set_show(void* p) {
     AriaStr* s = aria_sb_finish(&b);
     aria_set_drop(p);
     return (void*)s;
+}
+
+/* ---- map_keys / map_values / set_to_array: enumerate into an AriaArray ----
+   Build a FRESH AriaArray of element kind `out_kind` from the map's keys /
+   values or the set's elements, IN ASCENDING (key-/element-sorted) order — the
+   same deterministic order as display/equality, so iteration is stable across
+   backends. Each element is dup'd into the new array using the source slot kind
+   (`src_kind`), then the source map/set is consumed (dropped), leaving no
+   garbage. `out_kind` is the array element kind (Bool collapses to Int(0), a
+   no-op for dup/drop). */
+static void* aria_map_keys(void* p, int64_t src_kind, int64_t out_kind) {
+    AriaMap* m = (AriaMap*)p;
+    void* a = aria_array_new(out_kind);
+    for (int64_t i = 0; i < m->len; i++) {
+        int64_t slot = m->slots[2*i];
+        aria_slot_dup(src_kind, slot);
+        a = aria_array_push(a, slot, out_kind);
+    }
+    aria_map_drop(p);  /* map_keys consumes its argument */
+    return a;
+}
+static void* aria_map_values(void* p, int64_t src_kind, int64_t out_kind) {
+    AriaMap* m = (AriaMap*)p;
+    void* a = aria_array_new(out_kind);
+    for (int64_t i = 0; i < m->len; i++) {
+        int64_t slot = m->slots[2*i+1];
+        aria_slot_dup(src_kind, slot);
+        a = aria_array_push(a, slot, out_kind);
+    }
+    aria_map_drop(p);  /* map_values consumes its argument */
+    return a;
+}
+static void* aria_set_to_array(void* p, int64_t src_kind, int64_t out_kind) {
+    AriaSet* s = (AriaSet*)p;
+    void* a = aria_array_new(out_kind);
+    for (int64_t i = 0; i < s->len; i++) {
+        int64_t slot = s->slots[i];
+        aria_slot_dup(src_kind, slot);
+        a = aria_array_push(a, slot, out_kind);
+    }
+    aria_set_drop(p);  /* set_to_array consumes its argument */
+    return a;
 }
 
 /* ---- structural equality (per-tag, emitted below) ---- */
