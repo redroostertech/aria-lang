@@ -2419,6 +2419,15 @@ const RUNTIME: &str = r#"#include <stdint.h>
 static int64_t aria_live = 0;
 static int64_t aria_reuses = 0;
 
+/* ---- recursion-depth guard (the native analogue of the interpreter's
+   MAX_CALL_DEPTH). Incremented at the start of every emitted Aria function /
+   lambda body and decremented immediately before its single return. Genuine
+   non-tail recursion grows this with the C stack; a self-tail-recursive
+   function is TCO'd into a `goto` loop (the increment sits ABOVE the loop
+   label) so it never trips the limit. ---- */
+static int64_t aria_depth = 0;
+#define ARIA_MAX_CALL_DEPTH 100000
+
 /* ---- ADT cell: { int64_t rc; int64_t tag; int64_t fields[]; } ---- */
 typedef struct { int64_t rc; int64_t tag; int64_t fields[]; } AriaCell;
 
@@ -3961,10 +3970,15 @@ pub fn compile(program: &Program) -> Result<String, String> {
             closures: &closures,
         };
         let _ = writeln!(src, "    {} aria_ret;", sig.ret.decl());
+        // Recursion-depth guard: increment ONCE on entry (above the tail-loop
+        // label so a TCO'd back-edge never re-counts), trap if too deep, and
+        // decrement at the single return below.
+        let _ = writeln!(src, "    if (++aria_depth > ARIA_MAX_CALL_DEPTH) aria_trap_msg(\"maximum recursion depth (100000) exceeded\");");
         if ifn.tail_recursive {
             let _ = writeln!(src, "    aria_loop_top:;");
         }
         emit_iexpr(&ifn.body, "aria_ret", sig.ret, &mut env, "    ", &mut src)?;
+        let _ = writeln!(src, "    aria_depth--;");
         let _ = writeln!(src, "    return aria_ret;");
         let _ = writeln!(src, "}}");
         src.push('\n');
@@ -4197,7 +4211,11 @@ fn emit_lambda(
         closures,
     };
     let _ = writeln!(out, "    {} aria_ret;", ret_ct.decl());
+    // Recursion-depth guard (lambdas are not TCO'd, so they recurse on the C
+    // stack and must be counted too). Single inc on entry, dec before return.
+    let _ = writeln!(out, "    if (++aria_depth > ARIA_MAX_CALL_DEPTH) aria_trap_msg(\"maximum recursion depth (100000) exceeded\");");
     emit_iexpr(&ifn.body, "aria_ret", ret_ct, &mut env, "    ", out)?;
+    let _ = writeln!(out, "    aria_depth--;");
     let _ = writeln!(out, "    return aria_ret;");
     let _ = writeln!(out, "}}");
     out.push('\n');
@@ -4900,6 +4918,100 @@ mod tests {
             "fn gcd(a: Int, b: Int) -> Int = \
                 if b == 0 { a } else { if a < b { gcd(b, a) } else { gcd(a - b, b) } }\n\
              fn main() -> Int = gcd(1071, 462)",
+        );
+    }
+
+    // ---- recursion-depth guard (GAP 1): native deep non-tail recursion must
+    // trap cleanly (matching the interpreter's MAX_CALL_DEPTH) instead of
+    // overflowing the C stack and SIGSEGV-ing. ------------------------------
+
+    /// Like `build_and_run`, but also returns the process's raw exit `status`
+    /// so a test can distinguish a clean trap (exit 70) from a SIGSEGV (139).
+    fn build_and_run_status(c_src: &str) -> Result<(String, String, std::process::ExitStatus), String> {
+        static SEQ: AtomicU64 = AtomicU64::new(1_000_000);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir();
+        let c_path = dir.join(format!("aria_ct_{}_{}.c", std::process::id(), n));
+        let exe = dir.join(format!("aria_ce_{}_{}", std::process::id(), n));
+        std::fs::write(&c_path, c_src).map_err(|e| e.to_string())?;
+        let cc = std::process::Command::new("cc")
+            .arg("-O2").arg("-std=c11").arg("-ffp-contract=off")
+            .arg("-o").arg(&exe).arg(&c_path).arg("-lm")
+            .output().map_err(|e| e.to_string())?;
+        let _ = std::fs::remove_file(&c_path);
+        if !cc.status.success() {
+            let _ = std::fs::remove_file(&exe);
+            return Err(format!("cc failed: {}", String::from_utf8_lossy(&cc.stderr)));
+        }
+        let run = std::process::Command::new(&exe).output().map_err(|e| e.to_string())?;
+        let _ = std::fs::remove_file(&exe);
+        Ok((
+            String::from_utf8_lossy(&run.stdout).into_owned(),
+            String::from_utf8_lossy(&run.stderr).into_owned(),
+            run.status,
+        ))
+    }
+
+    #[test]
+    fn deep_non_tail_recursion_traps_cleanly_native() {
+        // Genuine (non-tail) recursion 500_000 deep would overflow the C stack
+        // and SIGSEGV (exit 139) without the guard. With the depth guard it must
+        // instead print the interpreter-style `maximum recursion depth (100000)
+        // exceeded` and exit cleanly with a defined non-zero status (70), never a
+        // signal (139/134).
+        let src = "fn sumto(n: Int) -> Int = if n == 0 { 0 } else { n + sumto(n - 1) }\n\
+                   fn main() -> Int = sumto(500000)";
+        let c_src = compile_src(src).expect("c compile should succeed");
+        if !cc_available() {
+            return;
+        }
+        let (_stdout, stderr, status) = build_and_run_status(&c_src).expect("build+run native");
+        // Clean defined trap: exit code 70, NOT a signal/segfault.
+        assert_eq!(
+            status.code(),
+            Some(70),
+            "expected a clean trap (exit 70), got status {:?}; stderr `{}`",
+            status,
+            stderr.trim()
+        );
+        assert!(
+            stderr.contains("maximum recursion depth (100000) exceeded"),
+            "expected the recursion-depth trap message, got stderr `{}`",
+            stderr.trim()
+        );
+    }
+
+    #[test]
+    fn deep_tail_recursion_unbounded_does_not_trip_guard_native() {
+        // A 10_000_000-deep SELF-TAIL-recursive accumulator is TCO'd into a C
+        // `goto` loop: it runs in constant C stack and the depth-guard increment
+        // sits ABOVE the loop label, so it never trips the 100_000 limit. It must
+        // run to completion (no trap), agree with the interpreter, and be
+        // garbage-free.
+        let src = "fn go(n: Int, acc: Int) -> Int = if n == 0 { acc } else { go(n - 1, acc + n) }\n\
+                   fn main() -> Int = go(10000000, 0)";
+        let want = interp_result(src).expect("interpreter should succeed");
+        let c_src = compile_src(src).expect("c compile should succeed");
+        if !cc_available() {
+            return;
+        }
+        let (stdout, stderr, status) = build_and_run_status(&c_src).expect("build+run native");
+        assert_eq!(status.code(), Some(0), "deep tail loop should exit 0, got {:?}", status);
+        assert_eq!(want, stdout.lines().next().unwrap_or(""), "native tail loop != interp");
+        assert!(stderr.contains("aria_live=0"), "tail loop should be garbage-free, got `{}`", stderr.trim());
+    }
+
+    #[test]
+    fn sequential_under_limit_recursions_do_not_leak_depth_native() {
+        // Three sequential non-tail calls each 20_000 deep (under the limit) but
+        // cumulatively 60_000: they only succeed if the depth counter is
+        // decremented on return, so a later sibling call can't falsely trip the
+        // guard. (Depth kept at 20_000 because the interpreter oracle recurses on
+        // the Rust stack and tops out well below 100_000.) Differential +
+        // garbage-free.
+        differential(
+            "fn sumto(n: Int) -> Int = if n == 0 { 0 } else { n + sumto(n - 1) }\n\
+             fn main() -> Int = sumto(20000) + sumto(20000) + sumto(20000)",
         );
     }
 }

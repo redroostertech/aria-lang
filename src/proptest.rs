@@ -67,6 +67,15 @@ enum Ty {
     /// `(Int, Int)` — exercises tuple construction, the RC'd tuple cell, and
     /// destructuring patterns. (Tuples work in every backend.)
     Tuple,
+    /// `Map[Int, Int]` — the ordered-map runtime (interp / native / wasm). The
+    /// generator always SEEDS a map via `map_insert(map_new(), ..)` so `map_new`'s
+    /// element types are pinned to Int/Int (a bare `map_new()` is ambiguous).
+    Map,
+    /// `Set[Int]` — the ordered-set runtime. Seeded via `set_add(set_new(), ..)`.
+    Set,
+    /// `Vector` — fixed-length float vectors; reduced to a `Float` (compared
+    /// bit-for-bit across backends) or to an `Int` via `vec_len`.
+    Vector,
 }
 
 /// The fixed prelude prepended to every generated program. Only these functions
@@ -88,15 +97,27 @@ struct Gen<'a> {
     /// Int/Bool/IntList types are introduced (no Float/String). Used by the
     /// compiled-backend differential fuzz so most seeds actually reach codegen.
     wasm_subset: bool,
+    /// When true, the data-structure runtimes Map[Int,Int] / Set[Int] / Vector
+    /// are in the generated universe. They are fully supported on all three
+    /// COMPILED+interp paths, but the IR memory path (`aria mem`) gates them, so
+    /// the interp-vs-IR fuzzer turns this OFF while the native/wasm fuzzers turn
+    /// it ON.
+    data_types: bool,
 }
 
 impl<'a> Gen<'a> {
+    /// IR-safe generator: no Map/Set/Vector (the IR memory path gates them).
     fn new(rng: &'a mut Lcg) -> Self {
-        Gen { rng, scope: Vec::new(), fresh: 0, wasm_subset: false }
+        Gen { rng, scope: Vec::new(), fresh: 0, wasm_subset: false, data_types: false }
+    }
+
+    /// Full compiled-backend generator: includes Map/Set/Vector.
+    fn new_data(rng: &'a mut Lcg) -> Self {
+        Gen { rng, scope: Vec::new(), fresh: 0, wasm_subset: false, data_types: true }
     }
 
     fn new_wasm(rng: &'a mut Lcg) -> Self {
-        Gen { rng, scope: Vec::new(), fresh: 0, wasm_subset: true }
+        Gen { rng, scope: Vec::new(), fresh: 0, wasm_subset: true, data_types: true }
     }
 
     fn fresh_name(&mut self) -> String {
@@ -132,6 +153,9 @@ impl<'a> Gen<'a> {
             Ty::List => self.gen_list(fuel),
             Ty::Array => self.gen_array(fuel),
             Ty::Tuple => self.gen_tuple(fuel),
+            Ty::Map => self.gen_map(fuel),
+            Ty::Set => self.gen_set(fuel),
+            Ty::Vector => self.gen_vector(fuel),
         }
     }
 
@@ -192,7 +216,47 @@ impl<'a> Gen<'a> {
                     format!("({}, {})", self.rng.below(10), self.rng.below(10))
                 }
             }
+            Ty::Map => {
+                if let Some(v) = self.var_of(Ty::Map) {
+                    v
+                } else {
+                    // Seed a Map[Int, Int] so `map_new`'s K/V are pinned to Int.
+                    format!(
+                        "map_insert(map_new(), {}, {})",
+                        self.rng.below(10),
+                        self.rng.below(10)
+                    )
+                }
+            }
+            Ty::Set => {
+                if let Some(v) = self.var_of(Ty::Set) {
+                    v
+                } else {
+                    // Seed a Set[Int] so `set_new`'s element type is pinned.
+                    format!("set_add(set_new(), {})", self.rng.below(10))
+                }
+            }
+            Ty::Vector => {
+                if let Some(v) = self.var_of(Ty::Vector) {
+                    v
+                } else {
+                    // A fixed length-3 float vector. ALL generated vectors share
+                    // this length so `vec_dot`/`vec_add`/`vec_cosine` never hit a
+                    // length-mismatch trap.
+                    format!(
+                        "vec_from_array([{}, {}, {}])",
+                        self.float_lit(),
+                        self.float_lit(),
+                        self.float_lit()
+                    )
+                }
+            }
         }
+    }
+
+    /// A bare positive float literal `d.d` (no leading sign), for vector seeds.
+    fn float_lit(&mut self) -> String {
+        format!("{}.{}", self.rng.below(10), self.rng.below(10))
     }
 
     /// Generate inside a fresh `let`-block: `{ let <fresh> = <T>; <body:ty> }`.
@@ -209,17 +273,39 @@ impl<'a> Gen<'a> {
 
     fn random_ty(&mut self) -> Ty {
         if self.wasm_subset {
-            // Restricted universe: Int/Bool/IntList/String AND Array[Int]. No
-            // Float, which stays outside the wasm backend's compilable subset.
-            return match self.rng.below(6) {
+            // Restricted universe: Int/Bool/IntList/String, Array[Int], tuples,
+            // and the data-structure runtimes Map[Int,Int] / Set[Int] / Vector —
+            // all of which the wasm backend compiles. No bare Float (the float
+            // arithmetic productions stay outside the wasm-subset generator; a
+            // Vector still introduces floats but only inside the vector runtime,
+            // which the wasm backend supports end to end).
+            return match self.rng.below(9) {
                 0 => Ty::Int,
                 1 => Ty::Bool,
                 2 => Ty::Str,
                 3 => Ty::List,
                 4 => Ty::Array,
-                _ => Ty::Tuple,
+                5 => Ty::Tuple,
+                6 => Ty::Map,
+                7 => Ty::Set,
+                _ => Ty::Vector,
             };
         }
+        if self.data_types {
+            return match self.rng.below(10) {
+                0 => Ty::Int,
+                1 => Ty::Bool,
+                2 => Ty::Float,
+                3 => Ty::Str,
+                4 => Ty::List,
+                5 => Ty::Array,
+                6 => Ty::Tuple,
+                7 => Ty::Map,
+                8 => Ty::Set,
+                _ => Ty::Vector,
+            };
+        }
+        // IR-safe universe: no Map/Set/Vector.
         match self.rng.below(7) {
             0 => Ty::Int,
             1 => Ty::Bool,
@@ -233,9 +319,9 @@ impl<'a> Gen<'a> {
 
     fn gen_int(&mut self, fuel: u32) -> String {
         // Weighted toward leaves to keep programs small; `below` picks a rule.
-        // Arrays are now supported by every backend, so the array consumers run
-        // in both the full and wasm-subset generators.
-        match self.rng.below(12) {
+        // Arrays/Map/Set/Vector are supported by every backend, so their Int
+        // consumers run in both the full and wasm-subset generators.
+        match self.rng.below(16) {
             0 | 1 => self.leaf(Ty::Int),
             2 => {
                 let op = ["+", "-", "*"][self.rng.choice(3)];
@@ -281,12 +367,24 @@ impl<'a> Gen<'a> {
                 self.scope.pop();
                 format!("match {} {{ ({}, {}) => {}, }}", scrut, a, b, body)
             }
+            // Map consumers reducing to Int: length and keyed lookup-or-default.
+            11 if self.data_types => format!("map_len({})", self.expr(Ty::Map, fuel - 1)),
+            12 if self.data_types => format!(
+                "map_get_or({}, {}, {})",
+                self.expr(Ty::Map, fuel - 1),
+                self.rng.below(10),
+                self.expr(Ty::Int, fuel - 1)
+            ),
+            // Set length.
+            13 if self.data_types => format!("set_len({})", self.expr(Ty::Set, fuel - 1)),
+            // Vector length (the Int bridge out of a Vector).
+            14 if self.data_types => format!("vec_len({})", self.expr(Ty::Vector, fuel - 1)),
             _ => self.let_block(Ty::Int, fuel),
         }
     }
 
     fn gen_bool(&mut self, fuel: u32) -> String {
-        match self.rng.below(9) {
+        match self.rng.below(11) {
             0 | 1 => self.leaf(Ty::Bool),
             2 => {
                 let op = ["<", "<=", ">", ">=", "==", "!="][self.rng.choice(6)];
@@ -327,6 +425,17 @@ impl<'a> Gen<'a> {
                 self.expr(Ty::Bool, fuel - 1),
                 self.expr(Ty::Bool, fuel - 1)
             ),
+            // Map/Set membership tests -> Bool.
+            9 if self.data_types => format!(
+                "map_has({}, {})",
+                self.expr(Ty::Map, fuel - 1),
+                self.rng.below(10)
+            ),
+            10 if self.data_types => format!(
+                "set_has({}, {})",
+                self.expr(Ty::Set, fuel - 1),
+                self.rng.below(10)
+            ),
             _ => self.let_block(Ty::Bool, fuel),
         }
     }
@@ -342,9 +451,9 @@ impl<'a> Gen<'a> {
     }
 
     fn gen_float(&mut self, fuel: u32) -> String {
-        match self.rng.below(6) {
-            0 | 1 | 2 => self.leaf(Ty::Float),
-            3 => {
+        match self.rng.below(10) {
+            0 | 1 => self.leaf(Ty::Float),
+            2 => {
                 let op = ["+", "-", "*"][self.rng.choice(3)];
                 format!(
                     "({} {} {})",
@@ -353,7 +462,13 @@ impl<'a> Gen<'a> {
                     self.expr(Ty::Float, fuel - 1)
                 )
             }
-            4 => format!("-{}", self.leaf(Ty::Float)),
+            3 => format!("-{}", self.leaf(Ty::Float)),
+            // Vector -> Float reductions (compared bit-for-bit across backends).
+            4 if self.data_types => format!("vec_dot({}, {})", self.expr(Ty::Vector, fuel - 1), self.expr(Ty::Vector, fuel - 1)),
+            5 if self.data_types => format!("vec_norm({})", self.expr(Ty::Vector, fuel - 1)),
+            6 if self.data_types => format!("vec_cosine({}, {})", self.expr(Ty::Vector, fuel - 1), self.expr(Ty::Vector, fuel - 1)),
+            // Index 0 is always in range (all generated vectors have length 3).
+            7 if self.data_types => format!("vec_get({}, 0)", self.expr(Ty::Vector, fuel - 1)),
             _ => self.let_block(Ty::Float, fuel),
         }
     }
@@ -440,11 +555,86 @@ impl<'a> Gen<'a> {
             _ => self.let_block(Ty::Tuple, fuel),
         }
     }
+
+    /// Generate a `Map[Int, Int]` expression. Every rule yields a value whose
+    /// K/V are pinned to Int (the seed is always `map_insert(map_new(), .., ..)`),
+    /// so the program type-checks bottom-up. Exercises insert/remove/branch/bind.
+    fn gen_map(&mut self, fuel: u32) -> String {
+        match self.rng.below(6) {
+            0 | 1 => self.leaf(Ty::Map),
+            2 | 3 => format!(
+                "map_insert({}, {}, {})",
+                self.expr(Ty::Map, fuel - 1),
+                self.rng.below(10),
+                self.expr(Ty::Int, fuel - 1)
+            ),
+            4 => format!(
+                "map_remove({}, {})",
+                self.expr(Ty::Map, fuel - 1),
+                self.rng.below(10)
+            ),
+            _ => format!(
+                "if {} {{ {} }} else {{ {} }}",
+                self.expr(Ty::Bool, fuel - 1),
+                self.expr(Ty::Map, fuel - 1),
+                self.expr(Ty::Map, fuel - 1)
+            ),
+        }
+    }
+
+    /// Generate a `Set[Int]` expression (seeded via `set_add(set_new(), ..)`).
+    fn gen_set(&mut self, fuel: u32) -> String {
+        match self.rng.below(6) {
+            0 | 1 => self.leaf(Ty::Set),
+            2 | 3 => format!(
+                "set_add({}, {})",
+                self.expr(Ty::Set, fuel - 1),
+                self.rng.below(10)
+            ),
+            4 => format!(
+                "set_remove({}, {})",
+                self.expr(Ty::Set, fuel - 1),
+                self.rng.below(10)
+            ),
+            _ => format!(
+                "if {} {{ {} }} else {{ {} }}",
+                self.expr(Ty::Bool, fuel - 1),
+                self.expr(Ty::Set, fuel - 1),
+                self.expr(Ty::Set, fuel - 1)
+            ),
+        }
+    }
+
+    /// Generate a length-3 `Vector` expression. `vec_add` keeps the length at 3
+    /// (both operands are length 3), `vec_scale` preserves length, so no rule can
+    /// produce a length mismatch in a later `vec_dot`/`vec_add`/`vec_cosine`.
+    fn gen_vector(&mut self, fuel: u32) -> String {
+        match self.rng.below(6) {
+            0 | 1 | 2 => self.leaf(Ty::Vector),
+            3 => format!(
+                "vec_add({}, {})",
+                self.expr(Ty::Vector, fuel - 1),
+                self.expr(Ty::Vector, fuel - 1)
+            ),
+            4 => format!(
+                "vec_scale({}, {})",
+                self.expr(Ty::Vector, fuel - 1),
+                self.float_lit()
+            ),
+            _ => format!(
+                "if {} {{ {} }} else {{ {} }}",
+                self.expr(Ty::Bool, fuel - 1),
+                self.expr(Ty::Vector, fuel - 1),
+                self.expr(Ty::Vector, fuel - 1)
+            ),
+        }
+    }
 }
 
-/// Build a full, well-typed-by-construction program for a given seed. `main`
-/// always returns `Int` (chosen because the differential value comparison is
-/// then a plain integer string, but the body exercises every type internally).
+/// Build an IR-safe, well-typed-by-construction program for a given seed. `main`
+/// returns `Int`; the body exercises Int/Bool/Float/Str/List/Array/Tuple but NOT
+/// Map/Set/Vector (those are gated in the IR memory path). Used by the
+/// interp-vs-IR and reuse fuzzers.
 fn gen_program(seed: u64) -> String {
     let mut rng = Lcg::new(seed);
     let mut g = Gen::new(&mut rng);
@@ -452,14 +642,44 @@ fn gen_program(seed: u64) -> String {
     format!("{}fn main() -> Int = {}\n", PRELUDE, body)
 }
 
+/// Like [`gen_program`] but with the Map[Int,Int] / Set[Int] / Vector runtimes
+/// ENABLED. `main` returns `Int`, reaching Map/Set/Vector via the Int consumers
+/// `map_len`/`map_get_or`/`set_len`/`vec_len`. For the native fuzzer (all of
+/// which the native backend supports end to end).
+fn gen_program_data(seed: u64) -> String {
+    let mut rng = Lcg::new(seed);
+    let mut g = Gen::new_data(&mut rng);
+    let body = g.expr(Ty::Int, 4);
+    format!("{}fn main() -> Int = {}\n", PRELUDE, body)
+}
+
+/// Like [`gen_program_data`] but `main` returns a `Float`, so the Vector → Float
+/// reductions (`vec_dot`/`vec_norm`/`vec_cosine`/`vec_get`) are OBSERVED at the
+/// main boundary and compared BIT-FOR-BIT across interp / native / wasm.
+fn gen_program_float(seed: u64) -> String {
+    let mut rng = Lcg::new(seed);
+    let mut g = Gen::new_data(&mut rng);
+    let body = g.expr(Ty::Float, 4);
+    format!("{}fn main() -> Float = {}\n", PRELUDE, body)
+}
+
 /// Like [`gen_program`] but restricted to the wasm backend's compilable subset
-/// (Int/Bool/IntList only — no Float/String), so a large fraction of seeds
-/// actually reach codegen instead of being rejected as out-of-subset.
+/// (no bare Float/String at the top, but Map/Set/Vector ARE included since the
+/// wasm backend compiles them), so a large fraction of seeds reach codegen.
 fn gen_program_wasm(seed: u64) -> String {
     let mut rng = Lcg::new(seed);
     let mut g = Gen::new_wasm(&mut rng);
     let body = g.expr(Ty::Int, 4);
     format!("{}fn main() -> Int = {}\n", PRELUDE, body)
+}
+
+/// Float-returning wasm-subset program, so the Vector → Float reductions are
+/// observed at the boundary and compared bit-for-bit against the interpreter.
+fn gen_program_wasm_float(seed: u64) -> String {
+    let mut rng = Lcg::new(seed);
+    let mut g = Gen::new_wasm(&mut rng);
+    let body = g.expr(Ty::Float, 4);
+    format!("{}fn main() -> Float = {}\n", PRELUDE, body)
 }
 
 // ---------------------------------------------------------------------------
@@ -877,7 +1097,7 @@ fn run_wasm_live(bytes: &[u8]) -> Result<(String, i64), String> {
          const ex=r.instance.exports;memref=ex.memory;\
          const v=ex.main();\
          let m;if(typeof v==='bigint'){{m=String(v);}}\
-         else if(typeof v==='number'){{m=String(v);}}\
+         else if(typeof v==='number'){{m=fmtFloat(v);}}\
          else{{const dv=new DataView(ex.memory.buffer);\
          const len=Number(dv.getBigInt64(v+8,true));\
          m=dec.decode(new Uint8Array(ex.memory.buffer).subarray(v+16,v+16+len));}}\
@@ -906,68 +1126,81 @@ fn wasm_matches_interpreter_fuzz() {
 
     // Keep it fast: each compiled seed shells out to Node, so we sample a
     // bounded number of seeds. The wasm-subset generator keeps most of them
-    // compilable.
+    // compilable. Two passes: an Int-returning `main` (Map/Set/Vector reached via
+    // map_len/set_len/vec_len) and a Float-returning `main` (the Vector→Float
+    // reductions vec_dot/vec_norm/vec_cosine observed bit-for-bit, formatted by
+    // the same shortest-round-trip `fmtFloat` the interpreter/native use).
     const SEEDS: u64 = 120;
     let mut skipped = 0u64; // not well-typed, or out-of-wasm-subset
     let mut overflow = 0u64; // interpreter overflow -> wasm traps (expected)
     let mut checked = 0u64; // actually exercised through wasm + compared
+    let mut cov = DataCoverage::default();
 
-    for seed in 0..SEEDS {
-        let src = gen_program_wasm(seed);
-        if !well_typed(&src) {
-            skipped += 1;
-            continue;
-        }
+    let passes: [(&str, fn(u64) -> String); 2] =
+        [("int", gen_program_wasm), ("float", gen_program_wasm_float)];
 
-        let bytes = match wasm::compile(
-            &parser::parse(lexer::lex(&src).expect("lex")).expect("parse"),
-        ) {
-            Ok(b) => b,
-            // Out-of-subset (Float/String/etc.) is expected, not a failure.
-            Err(_) => {
+    for (tag, gen) in passes {
+        for seed in 0..SEEDS {
+            let src = gen(seed);
+            if !well_typed(&src) {
                 skipped += 1;
                 continue;
             }
-        };
 
-        // Oracle: the tree-walking interpreter. Overflow is a *defined error*
-        // in Aria; the interpreter returns Err while wasm traps. When the
-        // interpreter errors we can't meaningfully compare a value, so we skip
-        // (but still confirm wasm trapped rather than producing a bogus value).
-        let interp = ast_run(&src);
-        let (wasm_res, live) = run_wasm_live(&bytes)
-            .unwrap_or_else(|e| panic!("seed {}: node runner failed: {}\n{}", seed, e, src));
+            let bytes = match wasm::compile(
+                &parser::parse(lexer::lex(&src).expect("lex")).expect("parse"),
+            ) {
+                Ok(b) => b,
+                // Out-of-subset (e.g. a bound String) is expected, not a failure.
+                Err(_) => {
+                    skipped += 1;
+                    continue;
+                }
+            };
+            // Only count coverage for programs that actually reached wasm codegen.
+            cov.observe(&src);
 
-        match interp {
-            Ok(expected) => {
-                assert_eq!(
-                    expected, wasm_res,
-                    "seed {}: wasm != interpreter\n--- program ---\n{}\n--- interp={:?} wasm={:?}",
-                    seed, src, expected, wasm_res
-                );
-                assert_eq!(
-                    live, 0,
-                    "seed {}: wasm leaked {} live cell(s)\n--- program ---\n{}",
-                    seed, live, src
-                );
-                checked += 1;
-            }
-            Err(_) => {
-                // Interpreter errored (overflow). Wasm must trap, not silently
-                // return a wrapped value.
-                assert_eq!(
-                    wasm_res, "TRAP",
-                    "seed {}: interpreter errored but wasm did not trap (={:?})\n{}",
-                    seed, wasm_res, src
-                );
-                overflow += 1;
+            // Oracle: the tree-walking interpreter. Overflow is a *defined error*
+            // in Aria; the interpreter returns Err while wasm traps. When the
+            // interpreter errors we can't meaningfully compare a value, so we skip
+            // (but still confirm wasm trapped rather than producing a bogus value).
+            let interp = ast_run(&src);
+            let (wasm_res, live) = run_wasm_live(&bytes).unwrap_or_else(|e| {
+                panic!("{} seed {}: node runner failed: {}\n{}", tag, seed, e, src)
+            });
+
+            match interp {
+                Ok(expected) => {
+                    assert_eq!(
+                        expected, wasm_res,
+                        "{} seed {}: wasm != interpreter\n--- program ---\n{}\n--- interp={:?} wasm={:?}",
+                        tag, seed, src, expected, wasm_res
+                    );
+                    assert_eq!(
+                        live, 0,
+                        "{} seed {}: wasm leaked {} live cell(s)\n--- program ---\n{}",
+                        tag, seed, live, src
+                    );
+                    checked += 1;
+                }
+                Err(_) => {
+                    // Interpreter errored (overflow). Wasm must trap, not silently
+                    // return a wrapped value.
+                    assert_eq!(
+                        wasm_res, "TRAP",
+                        "{} seed {}: interpreter errored but wasm did not trap (={:?})\n{}",
+                        tag, seed, wasm_res, src
+                    );
+                    overflow += 1;
+                }
             }
         }
     }
 
     eprintln!(
-        "wasm_matches_interpreter_fuzz: {} seeds -> {} checked, {} overflow-trap, {} skipped",
-        SEEDS, checked, overflow, skipped
+        "wasm_matches_interpreter_fuzz: {} seeds x2 passes -> {} checked, {} overflow-trap, {} skipped; \
+         data coverage: {} map, {} set, {} vector programs",
+        SEEDS, checked, overflow, skipped, cov.map, cov.set, cov.vector
     );
 
     // Guard against vacuous success: a healthy number of seeds must have run
@@ -978,6 +1211,12 @@ fn wasm_matches_interpreter_fuzz() {
         checked,
         skipped,
         overflow
+    );
+    // The new productions must actually fire through wasm codegen.
+    assert!(
+        cov.map > 0 && cov.set > 0 && cov.vector > 0,
+        "wasm fuzzer did not generate all data types: {} map, {} set, {} vector",
+        cov.map, cov.set, cov.vector
     );
 }
 
@@ -1036,6 +1275,33 @@ fn run_native_live(c_src: &str) -> Result<(String, i64), String> {
     Ok((result, live))
 }
 
+/// Which of the newest data-structure runtimes a generated program text touches.
+/// Used so a fuzzer can assert its new Map/Set/Vector productions actually fired
+/// (guarding against a silently-disabled generator), the way the interp-vs-IR
+/// fuzzer guards against a too-weak generator with its `<50% skipped` check.
+#[derive(Default, Clone, Copy)]
+struct DataCoverage {
+    map: u64,
+    set: u64,
+    vector: u64,
+}
+
+impl DataCoverage {
+    fn observe(&mut self, src: &str) {
+        // `map_`/`set_`/`vec_` prefixes are unique to these builtins in a
+        // generated program (no user identifiers collide with them).
+        if src.contains("map_") {
+            self.map += 1;
+        }
+        if src.contains("set_") {
+            self.set += 1;
+        }
+        if src.contains("vec_") {
+            self.vector += 1;
+        }
+    }
+}
+
 #[test]
 fn native_matches_interpreter_fuzz() {
     // cc-gated: skip gracefully when no C compiler is available.
@@ -1043,61 +1309,80 @@ fn native_matches_interpreter_fuzz() {
         return;
     }
     // Each seed shells out to `cc` + runs a binary, so sample a bounded count.
+    // Two passes: an Int-returning `main` (reaches Map/Set/Vector via map_len/
+    // set_len/vec_len) and a Float-returning `main` (observes the Vector→Float
+    // reductions vec_dot/vec_norm/vec_cosine bit-for-bit at the boundary).
     const SEEDS: u64 = 80;
     let (mut skipped, mut overflow, mut checked) = (0u64, 0u64, 0u64);
+    let mut cov = DataCoverage::default();
 
-    for seed in 0..SEEDS {
-        let src = gen_program(seed); // full generator: includes arrays
-        if !well_typed(&src) {
-            skipped += 1;
-            continue;
-        }
-        let prog = parser::parse(lexer::lex(&src).expect("lex")).expect("parse");
-        let c_src = match crate::c_backend::compile(&prog) {
-            Ok(c) => c,
-            // Out of the native subset (e.g. compression builtins) — expected.
-            Err(_) => {
+    let passes: [(&str, fn(u64) -> String); 2] =
+        [("int", gen_program_data), ("float", gen_program_float)];
+
+    for (tag, gen) in passes {
+        for seed in 0..SEEDS {
+            let src = gen(seed); // data generator: arrays + Map/Set/Vector
+            if !well_typed(&src) {
                 skipped += 1;
                 continue;
             }
-        };
-        let interp = ast_run(&src);
-        let (nat, live) = run_native_live(&c_src)
-            .unwrap_or_else(|e| panic!("seed {}: native runner failed: {}\n{}", seed, e, src));
+            cov.observe(&src);
+            let prog = parser::parse(lexer::lex(&src).expect("lex")).expect("parse");
+            let c_src = match crate::c_backend::compile(&prog) {
+                Ok(c) => c,
+                // Out of the native subset (e.g. compression builtins) — expected.
+                Err(_) => {
+                    skipped += 1;
+                    continue;
+                }
+            };
+            let interp = ast_run(&src);
+            let (nat, live) = run_native_live(&c_src).unwrap_or_else(|e| {
+                panic!("{} seed {}: native runner failed: {}\n{}", tag, seed, e, src)
+            });
 
-        match interp {
-            Ok(expected) => {
-                assert_eq!(
-                    expected, nat,
-                    "seed {}: native != interpreter\n--- program ---\n{}\n--- interp={:?} native={:?}",
-                    seed, src, expected, nat
-                );
-                assert_eq!(
-                    live, 0,
-                    "seed {}: native leaked {} live cell(s)\n--- program ---\n{}",
-                    seed, live, src
-                );
-                checked += 1;
-            }
-            Err(_) => {
-                assert_eq!(
-                    nat, "TRAP",
-                    "seed {}: interpreter errored but native did not trap (={:?})\n{}",
-                    seed, nat, src
-                );
-                overflow += 1;
+            match interp {
+                Ok(expected) => {
+                    assert_eq!(
+                        expected, nat,
+                        "{} seed {}: native != interpreter\n--- program ---\n{}\n--- interp={:?} native={:?}",
+                        tag, seed, src, expected, nat
+                    );
+                    assert_eq!(
+                        live, 0,
+                        "{} seed {}: native leaked {} live cell(s)\n--- program ---\n{}",
+                        tag, seed, live, src
+                    );
+                    checked += 1;
+                }
+                Err(_) => {
+                    assert_eq!(
+                        nat, "TRAP",
+                        "{} seed {}: interpreter errored but native did not trap (={:?})\n{}",
+                        tag, seed, nat, src
+                    );
+                    overflow += 1;
+                }
             }
         }
     }
 
     eprintln!(
-        "native_matches_interpreter_fuzz: {} seeds -> {} checked, {} trap, {} skipped",
-        SEEDS, checked, overflow, skipped
+        "native_matches_interpreter_fuzz: {} seeds x2 passes -> {} checked, {} trap, {} skipped; \
+         data coverage: {} map, {} set, {} vector programs",
+        SEEDS, checked, overflow, skipped, cov.map, cov.set, cov.vector
     );
     assert!(
         checked >= 15,
         "too few programs exercised through native: {} (skipped {})",
         checked, skipped
+    );
+    // The new productions must actually fire — otherwise this fuzzer silently
+    // stops covering Map/Set/Vector.
+    assert!(
+        cov.map > 0 && cov.set > 0 && cov.vector > 0,
+        "native fuzzer did not generate all data types: {} map, {} set, {} vector",
+        cov.map, cov.set, cov.vector
     );
 }
 
