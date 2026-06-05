@@ -978,7 +978,10 @@ fn run_native_live(c_src: &str) -> Result<(String, i64), String> {
     let exe = dir.join(format!("aria_pte_{}_{}", std::process::id(), n));
     std::fs::write(&cpath, c_src).map_err(|e| e.to_string())?;
     let cc = std::process::Command::new("cc")
-        .arg("-O2").arg("-std=c11").arg("-o").arg(&exe).arg(&cpath).arg("-lm")
+        // `-ffp-contract=off`: no FMA contraction, so f32 multiply-then-add rounds
+        // exactly like the interpreter (Tensor matmul parity). `-lm` for expf/sqrt.
+        .arg("-O2").arg("-std=c11").arg("-ffp-contract=off")
+        .arg("-o").arg(&exe).arg(&cpath).arg("-lm")
         .output().map_err(|e| e.to_string())?;
     let _ = std::fs::remove_file(&cpath);
     if !cc.status.success() {
@@ -2487,4 +2490,149 @@ fn vector_error_cases_clean_on_interp_and_native() {
             assert_eq!(nat, "TRAP", "native should trap cleanly\n{}\n got={}", src, nat);
         }
     }
+}
+
+/// Tensor / neural primitives (matmul / softmax / transpose / relu / get / set /
+/// rows / cols / ==) run IDENTICALLY across the interpreter (oracle), the native
+/// C backend (cc-gated, built with `-ffp-contract=off` so f32 multiply-then-add
+/// matches the interpreter bit-for-bit), and — for scalar-returning programs —
+/// wasm (node-gated). Every value-result program must also be garbage-free
+/// (`aria_live`/`__live` == 0). Floating-point parity (the matmul i-p-j loop +
+/// f32 accumulation, and `expf` for softmax) is exercised with fractional inputs.
+#[test]
+fn tensors_run_in_native_and_wasm_match_interp() {
+    // Programs whose result is a SCALAR (Float/Int) — checked on all three
+    // backends. Each `expected` is the interpreter's exact rendering.
+    let scalar_cases: &[&str] = &[
+        // zeros/set/get round-trip a fractional element.
+        "fn main() -> Float = tensor_get(tensor_set(tensor_zeros(2, 2), 1, 1, 4.25), 1, 1)\n",
+        // an untouched element stays 0.
+        "fn main() -> Float = tensor_get(tensor_zeros(3, 4), 2, 3)\n",
+        // rows/cols reduce to Int.
+        "fn main() -> Int = tensor_rows(tensor_zeros(5, 7)) + tensor_cols(tensor_zeros(5, 7))\n",
+        // 2x2 * 2x2 matmul with FRACTIONAL inputs — exercises f32 fp parity.
+        "fn main() -> Float = {\n\
+           let a = tensor_set(tensor_set(tensor_set(tensor_set(tensor_zeros(2,2),0,0,1.0),0,1,2.0),1,0,3.0),1,1,4.0);\n\
+           let b = tensor_set(tensor_set(tensor_set(tensor_set(tensor_zeros(2,2),0,0,5.5),0,1,6.25),1,0,7.1),1,1,8.3);\n\
+           tensor_get(matmul(a, b), 1, 1)\n\
+         }\n",
+        // NON-SQUARE matmul (2x3 * 3x2), fractional — fp parity across shapes.
+        "fn main() -> Float = {\n\
+           let a = tensor_set(tensor_set(tensor_set(tensor_set(tensor_set(tensor_set(tensor_zeros(2,3),0,0,1.0),0,1,2.0),0,2,3.0),1,0,4.0),1,1,5.0),1,2,6.0);\n\
+           let b = tensor_set(tensor_set(tensor_set(tensor_set(tensor_set(tensor_set(tensor_zeros(3,2),0,0,0.5),0,1,1.5),1,0,2.5),1,1,3.5),2,0,4.5),2,1,5.5);\n\
+           tensor_get(matmul(a, b), 1, 0)\n\
+         }\n",
+        // relu zeroes a negative; transpose moves it; read the moved element.
+        "fn main() -> Float = {\n\
+           let a = tensor_set(tensor_set(tensor_zeros(2,2),0,0,-2.0),0,1,5.0);\n\
+           tensor_get(transpose(relu(a)), 1, 0)\n\
+         }\n",
+        // relu of a negative is exactly 0.0.
+        "fn main() -> Float = tensor_get(relu(tensor_set(tensor_zeros(1,1),0,0,-9.0)), 0, 0)\n",
+        // row-softmax — exercises `expf` vs `exp` parity (must be bit-identical
+        // to the interpreter's f32 exp, hence the strict equality here).
+        "fn main() -> Float = {\n\
+           let a = tensor_set(tensor_set(tensor_set(tensor_zeros(1,3),0,0,1.0),0,1,2.0),0,2,3.0);\n\
+           tensor_get(softmax(a), 0, 2)\n\
+         }\n",
+        // copy-on-write: `set` returns a NEW tensor; the original is unchanged.
+        "fn main() -> Float = {\n\
+           let a = tensor_set(tensor_zeros(2,2), 0, 0, 7.0);\n\
+           let b = tensor_set(a, 0, 0, 9.0);\n\
+           tensor_get(a, 0, 0) + tensor_get(b, 0, 0)\n\
+         }\n",
+    ];
+    // Native-only scalar cases (wasm gates these features). Checked on interp +
+    // native with strict equality + garbage-free.
+    let native_only_cases: &[&str] = &[
+        // structural `==`: a tensor equals itself, differs from a different one.
+        // (wasm gates Tensor `==`; the interpreter and native agree structurally.)
+        "fn main() -> Int = {\n\
+           let a = tensor_set(tensor_zeros(2,2), 0, 0, 1.0);\n\
+           let b = tensor_zeros(2,2);\n\
+           if a == b { 0 } else { if a == a { 1 } else { 9 } }\n\
+         }\n",
+    ];
+    // Programs whose result is a TENSOR — rendered as `Tensor(RxC)`. Checked on
+    // interp + native (wasm gates a Tensor-returning main).
+    let tensor_cases: &[&str] = &[
+        "fn main() -> Tensor = matmul(tensor_zeros(2,3), tensor_zeros(3,4))\n",
+        "fn main() -> Tensor = transpose(tensor_zeros(2,5))\n",
+    ];
+    let cc = cc_available();
+    let node = node_available();
+    let (mut nat, mut wasm_n) = (0u64, 0u64);
+
+    for src in scalar_cases {
+        let interp = ast_run(src).unwrap_or_else(|e| panic!("interp failed: {}\n{}", e, src));
+        let prog = parser::parse(lexer::lex(src).expect("lex")).expect("parse");
+        assert!(typeck::check(&prog).is_ok(), "type error\n{}", src);
+        if cc {
+            let c_src = crate::c_backend::compile(&prog)
+                .unwrap_or_else(|e| panic!("c_backend failed: {}\n{}", e, src));
+            let (n, live) = run_native_live(&c_src)
+                .unwrap_or_else(|e| panic!("native runner failed: {}\n{}", e, src));
+            assert_eq!(n, interp, "native != interp (fp parity?)\n{}", src);
+            assert_eq!(live, 0, "native leaked {} cell(s)\n{}", live, src);
+            nat += 1;
+        }
+        if node {
+            let bytes = wasm::compile(&prog)
+                .unwrap_or_else(|e| panic!("wasm compile failed: {}\n{}", e, src));
+            let (w, live) = run_wasm_live(&bytes)
+                .unwrap_or_else(|e| panic!("wasm runner failed: {}\n{}", e, src));
+            assert_eq!(w, interp, "wasm != interp\n{}", src);
+            assert_eq!(live, 0, "wasm leaked {} cell(s)\n{}", live, src);
+            wasm_n += 1;
+        }
+    }
+
+    // Native-only scalar cases + Tensor-returning cases: interp + native only.
+    for src in native_only_cases.iter().chain(tensor_cases.iter()) {
+        let interp = ast_run(src).unwrap_or_else(|e| panic!("interp failed: {}\n{}", e, src));
+        let prog = parser::parse(lexer::lex(src).expect("lex")).expect("parse");
+        assert!(typeck::check(&prog).is_ok(), "type error\n{}", src);
+        if cc {
+            let c_src = crate::c_backend::compile(&prog)
+                .unwrap_or_else(|e| panic!("c_backend failed: {}\n{}", e, src));
+            let (n, live) = run_native_live(&c_src)
+                .unwrap_or_else(|e| panic!("native runner failed: {}\n{}", e, src));
+            assert_eq!(n, interp, "native != interp\n{}", src);
+            assert_eq!(live, 0, "native leaked {} cell(s)\n{}", live, src);
+            nat += 1;
+        }
+    }
+
+    // Error cases: a clean interp Err AND a clean native TRAP (no panic). (A
+    // matmul shape mismatch is rejected statically by the shape checker — it
+    // never reaches the runtime — so the native kernel's shape trap is purely
+    // defensive and is not exercised here.)
+    let trap_cases: &[&str] = &[
+        // tensor_get out of range.
+        "fn main() -> Float = tensor_get(tensor_zeros(2,2), 5, 0)\n",
+        // tensor_set out of range.
+        "fn main() -> Float = tensor_get(tensor_set(tensor_zeros(2,2), 0, 9, 1.0), 0, 0)\n",
+        // tensor_zeros negative dimension.
+        "fn main() -> Float = tensor_get(tensor_zeros(-1, 2), 0, 0)\n",
+        // tensor_zeros oversized (exceeds the element cap).
+        "fn main() -> Int = tensor_rows(tensor_zeros(100000, 100000))\n",
+    ];
+    for src in trap_cases {
+        assert!(ast_run(src).is_err(), "interp should error (trap)\n{}", src);
+        if cc {
+            let prog = parser::parse(lexer::lex(src).expect("lex")).expect("parse");
+            assert!(typeck::check(&prog).is_ok(), "type error\n{}", src);
+            let c_src = crate::c_backend::compile(&prog)
+                .unwrap_or_else(|e| panic!("c_backend failed: {}\n{}", e, src));
+            let (n, _live) = run_native_live(&c_src)
+                .unwrap_or_else(|e| panic!("native runner failed: {}\n{}", e, src));
+            assert_eq!(n, "TRAP", "native should trap cleanly\n{}\n got={}", src, n);
+            nat += 1;
+        }
+    }
+
+    eprintln!(
+        "tensors_run_in_native_and_wasm_match_interp: {} native, {} wasm programs",
+        nat, wasm_n
+    );
 }

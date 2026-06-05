@@ -1,0 +1,32 @@
+-- Pure-tensor neural/matrix primitives, runnable on ALL backends:
+--   aria run examples/tensor.aria        (interpreter — the oracle)
+--   aria native-run examples/tensor.aria (native C backend, f32, fp-parity)
+--   aria wasm-run examples/tensor.aria   (wasm backend)
+-- The result is a scalar Float so it prints identically (bit-for-bit) on each.
+
+-- Build the 2x2 matrix [[1, 2], [3, 4]] purely through builtins.
+fn make_a() -> Tensor = {
+  let t0 = tensor_zeros(2, 2);
+  let t1 = tensor_set(t0, 0, 0, 1.0);
+  let t2 = tensor_set(t1, 0, 1, 2.0);
+  let t3 = tensor_set(t2, 1, 0, 3.0);
+  tensor_set(t3, 1, 1, 4.0)
+}
+
+-- Build [[5.5, 6.25], [7.1, 8.3]] — fractional, to exercise f32 arithmetic.
+fn make_b() -> Tensor = {
+  let t0 = tensor_zeros(2, 2);
+  let t1 = tensor_set(t0, 0, 0, 5.5);
+  let t2 = tensor_set(t1, 0, 1, 6.25);
+  let t3 = tensor_set(t2, 1, 0, 7.1);
+  tensor_set(t3, 1, 1, 8.3)
+}
+
+-- matmul, then relu, then transpose, then read one element.
+-- element (1,1) of (A*B) = 3*6.25 + 4*8.3 = 18.75 + 33.2 = 51.95 (in f32).
+-- relu leaves it unchanged (positive); transpose moves (1,1) to (1,1) again.
+fn main() -> Float = {
+  let prod = matmul(make_a(), make_b());
+  let activated = relu(prod);
+  tensor_get(transpose(activated), 1, 1)
+}

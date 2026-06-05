@@ -350,10 +350,14 @@ fn cc_build(c_src: &str, out_path: &std::path::Path) -> Result<(), String> {
     let status = std::process::Command::new("cc")
         .arg("-O2")
         .arg("-std=c11")
+        // Disable FMA contraction so f32 `a*b + c` rounds exactly like the
+        // interpreter's separate multiply/add (Tensor matmul bit-for-bit parity).
+        .arg("-ffp-contract=off")
         .arg("-o")
         .arg(out_path)
         .arg(&c_path)
-        // Link libm for the math functions used by the Vector runtime (sqrt).
+        // Link libm for the math functions used by the Vector/Tensor runtime
+        // (sqrt, expf).
         .arg("-lm")
         .output();
     let _ = std::fs::remove_file(&c_path);

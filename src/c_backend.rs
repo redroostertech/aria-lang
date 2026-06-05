@@ -141,6 +141,11 @@ impl ElemKind {
             CType::Array(_) => ElemKind::Array,
             CType::Map(..) => ElemKind::Map,
             CType::Set(_) => ElemKind::Set,
+            // A Tensor array element is outside the native subset (the monomorphizer
+            // already tags such elements `r`, so this is reached only if a future
+            // path asks; map to Ref so dup/drop dispatch is well-typed — the actual
+            // `Array[Tensor]` literal/use is rejected in `from_ty` below).
+            CType::Tensor => ElemKind::Ref,
         }
     }
 }
@@ -193,6 +198,10 @@ impl SlotKind {
             CType::Map(..) => SlotKind::Map,
             CType::Set(_) => SlotKind::Set,
             CType::Vector => SlotKind::Vector,
+            // A Tensor map/set slot is outside the native subset; never reached for
+            // a valid program (Map values restrict to flat kinds, Set elements to
+            // hashable kinds). Map to Ref to keep this match well-typed.
+            CType::Tensor => SlotKind::Ref,
         }
     }
     /// Encode an evaluated C expression of value type `t` into an int64 slot.
@@ -229,6 +238,7 @@ enum CType {
     Map(SlotKind, SlotKind), // void* — heap AriaMap (key kind, value kind)
     Set(SlotKind),       // void* — heap AriaSet (element kind)
     Vector,              // void* — heap AriaVector buffer (flat f64 vector / embedding)
+    Tensor,              // void* — heap AriaTensor (refcounted f32 [rows,cols] buffer)
 }
 
 impl CType {
@@ -243,7 +253,8 @@ impl CType {
             | CType::Array(_)
             | CType::Map(..)
             | CType::Set(_)
-            | CType::Vector => "void*",
+            | CType::Vector
+            | CType::Tensor => "void*",
         }
     }
 
@@ -257,11 +268,25 @@ impl CType {
             Ty::Str => Ok(CType::Str),
             Ty::Named(n, args) if n == "Array" && args.len() == 1 => {
                 let elem = CType::from_ty(&args[0])?;
+                // A Tensor array element has no faithful native element slot
+                // (Tensors are heap objects with their own dup/drop, and the
+                // monomorphizer collapses them to the generic `r` element kind
+                // which would mis-drop them). Reject cleanly (the interpreter
+                // supports `Array[Tensor]`; this is a native limitation).
+                if elem == CType::Tensor {
+                    return Err(
+                        "c backend: `Array[Tensor]` is not yet supported natively; \
+                         use the interpreter `aria run`"
+                            .into(),
+                    );
+                }
                 Ok(CType::Array(ElemKind::from_ctype(&elem)))
             }
             Ty::Named(n, _) if n == "Bytes" => Ok(CType::Bytes),
             // The opaque, reference-counted dense float vector / embedding.
             Ty::Named(n, _) if n == "Vector" => Ok(CType::Vector),
+            // The opaque, reference-counted dense f32 [rows,cols] tensor.
+            Ty::Named(n, _) if n == "Tensor" => Ok(CType::Tensor),
             Ty::Named(n, args) if n == "Map" && args.len() == 2 => {
                 let k = SlotKind::from_ctype(CType::from_ty(&args[0])?);
                 let v_ct = CType::from_ty(&args[1])?;
@@ -391,6 +416,18 @@ impl CtorTable {
                         .map(CType::from_ty)
                         .collect::<Result<Vec<_>, _>>()
                         .map_err(|e| format!("type `{}` ctor `{}`: {}", t.name, v.name, e))?;
+                    // A Tensor field inside an ADT cell is outside the native
+                    // subset: the generic cell drop/eq paths have no per-tag
+                    // knowledge to release/compare a Tensor child faithfully.
+                    // Reject cleanly (mirrors the wasm backend; the interpreter
+                    // supports Tensor-in-ADT).
+                    if field_types.contains(&CType::Tensor) {
+                        return Err(format!(
+                            "c backend: type `{}` ctor `{}` has a Tensor field \
+                             (outside the native subset); use the interpreter `aria run`",
+                            t.name, v.name
+                        ));
+                    }
                     by_name.insert(v.name.clone(), CtorInfo { tag, field_types });
                     tag += 1;
                 }
@@ -739,6 +776,12 @@ fn builtin_ret(name: &str) -> Option<CType> {
         "vec_to_array" => Some(CType::Array(ElemKind::Float)),
         "vec_len" => Some(CType::Int),
         "vec_get" | "vec_dot" | "vec_norm" | "vec_cosine" => Some(CType::Float),
+        // Tensor / neural primitives (non-generic; no element-kind suffix).
+        "tensor_zeros" | "tensor_set" | "matmul" | "transpose" | "relu" | "softmax" => {
+            Some(CType::Tensor)
+        }
+        "tensor_get" => Some(CType::Float),
+        "tensor_rows" | "tensor_cols" => Some(CType::Int),
         _ => None,
     }
 }
@@ -941,6 +984,9 @@ fn emit_iexpr(
                 CType::Vector => {
                     let _ = writeln!(out, "{}aria_vec_dup({});", ind, cvar(v));
                 }
+                CType::Tensor => {
+                    let _ = writeln!(out, "{}aria_tensor_dup({});", ind, cvar(v));
+                }
                 _ => {}
             }
             emit_iexpr(body, result, result_ty, env, ind, out)
@@ -967,6 +1013,9 @@ fn emit_iexpr(
                 }
                 CType::Vector => {
                     let _ = writeln!(out, "{}aria_vec_drop({});", ind, cvar(v));
+                }
+                CType::Tensor => {
+                    let _ = writeln!(out, "{}aria_tensor_drop({});", ind, cvar(v));
                 }
                 _ => {}
             }
@@ -1085,7 +1134,7 @@ fn emit_make_closure(
             CType::Float => {
                 let _ = writeln!(out, "{}aria_field({}, {}) = aria_f2i({});", ind, dst, i, ex);
             }
-            CType::Ref | CType::Str | CType::Bytes | CType::Array(_) | CType::Map(..) | CType::Set(_) | CType::Vector => {
+            CType::Ref | CType::Str | CType::Bytes | CType::Array(_) | CType::Map(..) | CType::Set(_) | CType::Vector | CType::Tensor => {
                 let _ = writeln!(out, "{}aria_field({}, {}) = (int64_t)(uintptr_t)({});", ind, dst, i, ex);
             }
         }
@@ -1242,6 +1291,11 @@ fn emit_prim(
             if lt == CType::Vector && rt == CType::Vector {
                 let cmp = if op == BinOp::Eq { "" } else { "!" };
                 let _ = writeln!(out, "{}{} = {}aria_veceq_consume({}, {});", ind, dst, cmp, lx, rx);
+                return Ok(());
+            }
+            if lt == CType::Tensor && rt == CType::Tensor {
+                let cmp = if op == BinOp::Eq { "" } else { "!" };
+                let _ = writeln!(out, "{}{} = {}aria_tensoreq_consume({}, {});", ind, dst, cmp, lx, rx);
                 return Ok(());
             }
             // Scalar ==/!= (Int/Bool/Float) — direct C comparison.
@@ -1591,6 +1645,101 @@ fn emit_builtin(
                 return Err("c backend: vec_scale factor must be Float".into());
             }
             let _ = writeln!(out, "{}{} = aria_vec_scale({}, {});", ind, dst, v, s);
+            Ok(())
+        }
+        // ---- Tensor / neural builtins (each helper consumes its Tensor args) ----
+        "tensor_zeros" => {
+            if args.len() != 2
+                || atom_type(&args[0], env)? != CType::Int
+                || atom_type(&args[1], env)? != CType::Int
+            {
+                return Err("c backend: tensor_zeros expects (Int, Int)".into());
+            }
+            let (_, r) = emit_atom(&args[0], env, out)?;
+            let (_, c) = emit_atom(&args[1], env, out)?;
+            let _ = writeln!(out, "{}{} = aria_tensor_zeros({}, {});", ind, dst, r, c);
+            Ok(())
+        }
+        "tensor_set" => {
+            if args.len() != 4
+                || atom_type(&args[0], env)? != CType::Tensor
+                || atom_type(&args[1], env)? != CType::Int
+                || atom_type(&args[2], env)? != CType::Int
+                || atom_type(&args[3], env)? != CType::Float
+            {
+                return Err("c backend: tensor_set expects (Tensor, Int, Int, Float)".into());
+            }
+            let (_, t) = emit_atom(&args[0], env, out)?;
+            let (_, r) = emit_atom(&args[1], env, out)?;
+            let (_, c) = emit_atom(&args[2], env, out)?;
+            let (_, v) = emit_atom(&args[3], env, out)?;
+            let _ = writeln!(out, "{}{} = aria_tensor_set({}, {}, {}, {});", ind, dst, t, r, c, v);
+            Ok(())
+        }
+        "tensor_get" => {
+            if args.len() != 3
+                || atom_type(&args[0], env)? != CType::Tensor
+                || atom_type(&args[1], env)? != CType::Int
+                || atom_type(&args[2], env)? != CType::Int
+            {
+                return Err("c backend: tensor_get expects (Tensor, Int, Int)".into());
+            }
+            let (_, t) = emit_atom(&args[0], env, out)?;
+            let (_, r) = emit_atom(&args[1], env, out)?;
+            let (_, c) = emit_atom(&args[2], env, out)?;
+            let _ = writeln!(out, "{}{} = aria_tensor_get({}, {}, {});", ind, dst, t, r, c);
+            Ok(())
+        }
+        "tensor_rows" => {
+            if args.len() != 1 || atom_type(&args[0], env)? != CType::Tensor {
+                return Err("c backend: tensor_rows expects one Tensor".into());
+            }
+            let (_, t) = emit_atom(&args[0], env, out)?;
+            let _ = writeln!(out, "{}{} = aria_tensor_rows({});", ind, dst, t);
+            Ok(())
+        }
+        "tensor_cols" => {
+            if args.len() != 1 || atom_type(&args[0], env)? != CType::Tensor {
+                return Err("c backend: tensor_cols expects one Tensor".into());
+            }
+            let (_, t) = emit_atom(&args[0], env, out)?;
+            let _ = writeln!(out, "{}{} = aria_tensor_cols({});", ind, dst, t);
+            Ok(())
+        }
+        "matmul" => {
+            if args.len() != 2
+                || atom_type(&args[0], env)? != CType::Tensor
+                || atom_type(&args[1], env)? != CType::Tensor
+            {
+                return Err("c backend: matmul expects (Tensor, Tensor)".into());
+            }
+            let (_, a) = emit_atom(&args[0], env, out)?;
+            let (_, b) = emit_atom(&args[1], env, out)?;
+            let _ = writeln!(out, "{}{} = aria_tensor_matmul({}, {});", ind, dst, a, b);
+            Ok(())
+        }
+        "transpose" => {
+            if args.len() != 1 || atom_type(&args[0], env)? != CType::Tensor {
+                return Err("c backend: transpose expects one Tensor".into());
+            }
+            let (_, t) = emit_atom(&args[0], env, out)?;
+            let _ = writeln!(out, "{}{} = aria_tensor_transpose({});", ind, dst, t);
+            Ok(())
+        }
+        "relu" => {
+            if args.len() != 1 || atom_type(&args[0], env)? != CType::Tensor {
+                return Err("c backend: relu expects one Tensor".into());
+            }
+            let (_, t) = emit_atom(&args[0], env, out)?;
+            let _ = writeln!(out, "{}{} = aria_tensor_relu({});", ind, dst, t);
+            Ok(())
+        }
+        "softmax" => {
+            if args.len() != 1 || atom_type(&args[0], env)? != CType::Tensor {
+                return Err("c backend: softmax expects one Tensor".into());
+            }
+            let (_, t) = emit_atom(&args[0], env, out)?;
+            let _ = writeln!(out, "{}{} = aria_tensor_softmax({});", ind, dst, t);
             Ok(())
         }
         _ => Err(format!("c backend: unsupported builtin `{}`", name)),
@@ -2047,7 +2196,7 @@ fn emit_store_fields(
             CType::Float => {
                 let _ = writeln!(out, "{}aria_field({}, {}) = aria_f2i({});", ind, cellptr, i, ex);
             }
-            CType::Ref | CType::Str | CType::Bytes | CType::Array(_) | CType::Map(..) | CType::Set(_) | CType::Vector => {
+            CType::Ref | CType::Str | CType::Bytes | CType::Array(_) | CType::Map(..) | CType::Set(_) | CType::Vector | CType::Tensor => {
                 let _ = writeln!(out, "{}aria_field({}, {}) = (int64_t)(uintptr_t)({});", ind, cellptr, i, ex);
             }
         }
@@ -2156,7 +2305,7 @@ fn emit_arm_body(
                         format!("aria_field({}, {})", sv, idx)
                     }
                     CType::Float => format!("aria_i2f(aria_field({}, {}))", sv, idx),
-                    CType::Ref | CType::Str | CType::Bytes | CType::Array(_) | CType::Map(..) | CType::Set(_) | CType::Vector => {
+                    CType::Ref | CType::Str | CType::Bytes | CType::Array(_) | CType::Map(..) | CType::Set(_) | CType::Vector | CType::Tensor => {
                         format!("(void*)(uintptr_t)aria_field({}, {})", sv, idx)
                     }
                 };
@@ -2774,6 +2923,184 @@ static void aria_print_vec_value(void* p) {
         fputs(tmp, stdout);
     }
     fputs("]\n", stdout);
+}
+
+/* ---- Tensor (dense, row-major f32, shape [rows, cols]) -------------------
+   An AriaTensor is a refcounted heap object mirroring `crate::tensor::Tensor`
+   (the interpreter oracle). Data is f32 (NOT f64), row-major; every kernel
+   computes in f32 so the result is bit-for-bit identical to the interpreter.
+   `tensor_get` reads an f32 element and WIDENS to double (Aria's Float).
+   `tensor_set` NARROWS the f64 value to f32 and returns a NEW tensor via
+   copy-on-write (FBIP when rc==1). matmul/transpose/relu/softmax produce a
+   fresh tensor and CONSUME their argument(s). The i-p-j matmul loop order and
+   separate f32 multiply-then-add (no FMA — the cc line passes
+   `-ffp-contract=off`) reproduce the interpreter's rounding exactly. softmax
+   uses `expf` (the f32 exp), matching `f32::exp`. */
+typedef struct { int64_t rc; int64_t rows; int64_t cols; float data[]; } AriaTensor;
+
+/* The interpreter caps the element count (256 MiB of f32) and rejects a
+   negative or overflowing shape with a clean Err; mirror that exactly. */
+#define ARIA_MAX_TENSOR_ELEMS ((int64_t)(64 * 1024 * 1024))
+
+static void* aria_tensor_alloc(int64_t rows, int64_t cols) {
+    /* Caller guarantees rows>=0, cols>=0 and rows*cols within the cap. */
+    int64_t n = rows * cols;
+    AriaTensor* t = (AriaTensor*)malloc(sizeof(AriaTensor) + (size_t)n * sizeof(float));
+    if (!t) aria_trap();
+    t->rc = 1; t->rows = rows; t->cols = cols;
+    aria_live++;
+    return (void*)t;
+}
+static inline void aria_tensor_dup(void* p) { ((AriaTensor*)p)->rc++; }
+static void aria_tensor_drop(void* p) {
+    AriaTensor* t = (AriaTensor*)p;
+    if (--t->rc == 0) { aria_live--; free(t); }
+}
+/* tensor_zeros(rows, cols): validate shape (clean trap on negative / overflow /
+   oversized), then return a zeroed tensor. */
+static void* aria_tensor_zeros(int64_t rows, int64_t cols) {
+    if (rows < 0 || cols < 0) aria_trap_msg("tensor_zeros expects non-negative dimensions");
+    /* Guard rows*cols against int64 overflow first, then the element cap (the
+       interpreter checks overflow, then the cap — same two clean traps). */
+    int64_t n;
+    if (__builtin_mul_overflow(rows, cols, &n))
+        aria_trap_msg("tensor_zeros dimensions overflow");
+    if (n > ARIA_MAX_TENSOR_ELEMS) aria_trap_msg("tensor_zeros exceeds the element limit");
+    AriaTensor* t = (AriaTensor*)aria_tensor_alloc(rows, cols);
+    for (int64_t i = 0; i < n; i++) t->data[i] = 0.0f;
+    return (void*)t;
+}
+static AriaTensor* aria_tensor_clone(AriaTensor* t) {
+    int64_t n = t->rows * t->cols;
+    AriaTensor* c = (AriaTensor*)aria_tensor_alloc(t->rows, t->cols);
+    memcpy(c->data, t->data, (size_t)n * sizeof(float));
+    return c;
+}
+static int64_t aria_tensor_rows(void* p) {
+    int64_t r = ((AriaTensor*)p)->rows;
+    aria_tensor_drop(p);  /* consumes its argument */
+    return r;
+}
+static int64_t aria_tensor_cols(void* p) {
+    int64_t c = ((AriaTensor*)p)->cols;
+    aria_tensor_drop(p);  /* consumes its argument */
+    return c;
+}
+/* tensor_get(t, r, c): read element, WIDEN f32 -> f64. Traps OOB. Consumes t. */
+static double aria_tensor_get(void* p, int64_t r, int64_t c) {
+    AriaTensor* t = (AriaTensor*)p;
+    if (r < 0 || c < 0 || r >= t->rows || c >= t->cols)
+        aria_trap_msg("tensor_get index out of range");
+    double x = (double)t->data[r * t->cols + c];
+    aria_tensor_drop(p);  /* consumes its argument */
+    return x;
+}
+/* tensor_set(t, r, c, v): NARROW f64 v -> f32, write into a NEW tensor (COW;
+   FBIP reuse when unique). Traps OOB. Consumes t (returns the result). */
+static void* aria_tensor_set(void* p, int64_t r, int64_t c, double v) {
+    AriaTensor* t = (AriaTensor*)p;
+    if (r < 0 || c < 0 || r >= t->rows || c >= t->cols)
+        aria_trap_msg("tensor_set index out of range");
+    if (t->rc == 1) {
+        t->data[r * t->cols + c] = (float)v;
+        aria_reuses++;
+        return p;
+    }
+    AriaTensor* n = aria_tensor_clone(t);
+    n->data[r * n->cols + c] = (float)v;
+    aria_tensor_drop(p);
+    return (void*)n;
+}
+/* matmul: (m,k) x (k,n) -> (m,n), f32 accumulation, i-p-j loop order EXACTLY
+   matching the interpreter (a different order or an f64 accumulator would
+   diverge bit-for-bit). Shape mismatch -> clean trap. Consumes both args. */
+static void* aria_tensor_matmul(void* pa, void* pb) {
+    AriaTensor* a = (AriaTensor*)pa; AriaTensor* b = (AriaTensor*)pb;
+    int64_t m = a->rows, k = a->cols, k2 = b->rows, n = b->cols;
+    if (k != k2) aria_trap_msg("matmul shape mismatch");
+    AriaTensor* out = (AriaTensor*)aria_tensor_zeros(m, n);
+    for (int64_t i = 0; i < m; i++) {
+        for (int64_t p = 0; p < k; p++) {
+            float av = a->data[i * k + p];
+            const float* row = &b->data[p * n];
+            float* dst = &out->data[i * n];
+            for (int64_t j = 0; j < n; j++) {
+                dst[j] += av * row[j];
+            }
+        }
+    }
+    aria_tensor_drop(pa); aria_tensor_drop(pb);
+    return (void*)out;
+}
+/* transpose: out[j*m+i] = in[i*n+j], shape [n,m]. Consumes its argument. */
+static void* aria_tensor_transpose(void* p) {
+    AriaTensor* t = (AriaTensor*)p;
+    int64_t m = t->rows, n = t->cols;
+    AriaTensor* out = (AriaTensor*)aria_tensor_alloc(n, m);
+    for (int64_t i = 0; i < m; i++)
+        for (int64_t j = 0; j < n; j++)
+            out->data[j * m + i] = t->data[i * n + j];
+    aria_tensor_drop(p);
+    return (void*)out;
+}
+/* relu: max(x, 0.0f) elementwise. FBIP when unique, else copy. Consumes arg. */
+static void* aria_tensor_relu(void* p) {
+    AriaTensor* t = (AriaTensor*)p;
+    int64_t nelem = t->rows * t->cols;
+    if (t->rc == 1) {
+        for (int64_t i = 0; i < nelem; i++) if (!(t->data[i] > 0.0f)) t->data[i] = 0.0f;
+        aria_reuses++;
+        return p;
+    }
+    AriaTensor* out = (AriaTensor*)aria_tensor_clone(t);
+    for (int64_t i = 0; i < nelem; i++) if (!(out->data[i] > 0.0f)) out->data[i] = 0.0f;
+    aria_tensor_drop(p);
+    return (void*)out;
+}
+/* softmax_rows: row-wise, numerically stable. For each row: subtract the row
+   max, exponentiate with `expf` (the f32 exp — matching `f32::exp`), sum, then
+   scale by 1/sum (0 if sum==0). f32 throughout. Consumes its argument. */
+static void* aria_tensor_softmax(void* p) {
+    AriaTensor* t = (AriaTensor*)p;
+    int64_t m = t->rows, n = t->cols;
+    AriaTensor* out = (AriaTensor*)aria_tensor_alloc(m, n);
+    for (int64_t i = 0; i < m; i++) {
+        const float* row = &t->data[i * n];
+        float mx = -INFINITY;
+        for (int64_t j = 0; j < n; j++) if (row[j] > mx) mx = row[j];
+        float sum = 0.0f;
+        for (int64_t j = 0; j < n; j++) {
+            float e = expf(row[j] - mx);
+            out->data[i * n + j] = e;
+            sum += e;
+        }
+        float inv = (sum > 0.0f) ? (1.0f / sum) : 0.0f;
+        for (int64_t j = 0; j < n; j++) out->data[i * n + j] *= inv;
+    }
+    aria_tensor_drop(p);
+    return (void*)out;
+}
+/* Structural equality (shape + exact f32 bits, with NaN==NaN so `t==t` holds,
+   matching the interpreter). Does NOT consume. */
+static int64_t aria_tensoreq(void* pa, void* pb) {
+    AriaTensor* a = (AriaTensor*)pa; AriaTensor* b = (AriaTensor*)pb;
+    if (a->rows != b->rows || a->cols != b->cols) return 0;
+    int64_t nelem = a->rows * a->cols;
+    for (int64_t i = 0; i < nelem; i++) {
+        float x = a->data[i], y = b->data[i];
+        if (!(x == y) && !(x != x && y != y)) return 0;  /* NaN==NaN treated equal */
+    }
+    return 1;
+}
+static int64_t aria_tensoreq_consume(void* a, void* b) {
+    int64_t r = aria_tensoreq(a, b);
+    aria_tensor_drop(a); aria_tensor_drop(b);
+    return r;
+}
+/* Print the canonical `Tensor(RxC)` rendering (does NOT consume the buffer). */
+static void aria_print_tensor_value(void* p) {
+    AriaTensor* t = (AriaTensor*)p;
+    printf("Tensor(%lldx%lld)\n", (long long)t->rows, (long long)t->cols);
 }
 
 /* ---- Ordered Map and Set -------------------------------------------------
@@ -3408,13 +3735,21 @@ pub fn compile(program: &Program) -> Result<String, String> {
         if !m.params.is_empty() {
             return Err("c backend: `main` must take no parameters".into());
         }
-        // main may return Int, Float, Bool, String, or Bytes; the runner prints it.
+        // main may return Int, Float, Bool, String, Bytes, Vector, or Tensor;
+        // the runner prints it (a Tensor renders as the canonical `Tensor(RxC)`).
         if !matches!(
             m.ret,
-            CType::Int | CType::Float | CType::Bool | CType::Str | CType::Bytes | CType::Vector
+            CType::Int
+                | CType::Float
+                | CType::Bool
+                | CType::Str
+                | CType::Bytes
+                | CType::Vector
+                | CType::Tensor
         ) {
             return Err(
-                "c backend: `main` must return Int, Bool, Float, String, Bytes, or Vector".into(),
+                "c backend: `main` must return Int, Bool, Float, String, Bytes, Vector, or Tensor"
+                    .into(),
             );
         }
     }
@@ -3626,6 +3961,13 @@ pub fn compile(program: &Program) -> Result<String, String> {
             let _ = writeln!(src, "    aria_print_set_value(r);");
             let _ = writeln!(src, "    aria_set_drop(r);");
         }
+        CType::Tensor => {
+            // Print the canonical `Tensor(RxC)` rendering (byte-for-byte identical
+            // to the interpreter), then consume the buffer.
+            let _ = writeln!(src, "    void* r = {}();", cfn("main"));
+            let _ = writeln!(src, "    aria_print_tensor_value(r);");
+            let _ = writeln!(src, "    aria_tensor_drop(r);");
+        }
         CType::Vector => {
             // Print the canonical `Vector[..]` rendering (byte-for-byte identical
             // to the interpreter), then consume the buffer.
@@ -3692,6 +4034,10 @@ fn emit_eq_helper(ctors: &CtorTable, out: &mut String) {
                     // Vector fields compare structurally (length + elements).
                     let _ = writeln!(out, "        eq = eq && aria_veceq((void*)(uintptr_t)aria_field(a, {}), (void*)(uintptr_t)aria_field(b, {}));", i, i);
                 }
+                CType::Tensor => {
+                    // Unreachable: Tensor ADT fields are rejected in CtorTable::build.
+                    let _ = writeln!(out, "        eq = eq && aria_tensoreq((void*)(uintptr_t)aria_field(a, {}), (void*)(uintptr_t)aria_field(b, {}));", i, i);
+                }
             }
         }
         out.push_str("        return eq;\n");
@@ -3743,7 +4089,7 @@ fn emit_lambda(
         let load = match ct {
             CType::Int | CType::Bool => format!("(int64_t)aria_field(__aria_clo, {})", i),
             CType::Float => format!("aria_i2f(aria_field(__aria_clo, {}))", i),
-            CType::Ref | CType::Str | CType::Bytes | CType::Array(_) | CType::Map(..) | CType::Set(_) | CType::Vector => format!("(void*)(uintptr_t)aria_field(__aria_clo, {})", i),
+            CType::Ref | CType::Str | CType::Bytes | CType::Array(_) | CType::Map(..) | CType::Set(_) | CType::Vector | CType::Tensor => format!("(void*)(uintptr_t)aria_field(__aria_clo, {})", i),
         };
         let _ = writeln!(out, "    {} {} = {};", ct.decl(), cvar(cn), load);
         match ct {
@@ -3771,6 +4117,9 @@ fn emit_lambda(
             }
             CType::Vector => {
                 let _ = writeln!(out, "    aria_vec_dup({});", cvar(cn));
+            }
+            CType::Tensor => {
+                let _ = writeln!(out, "    aria_tensor_dup({});", cvar(cn));
             }
             _ => {}
         }
@@ -3832,7 +4181,7 @@ fn emit_drop_children_helper(
         let managed: Vec<(usize, CType)> = cap_cts
             .iter()
             .enumerate()
-            .filter(|(_, t)| matches!(t, CType::Ref | CType::Str | CType::Bytes | CType::Array(_) | CType::Map(..) | CType::Set(_) | CType::Vector))
+            .filter(|(_, t)| matches!(t, CType::Ref | CType::Str | CType::Bytes | CType::Array(_) | CType::Map(..) | CType::Set(_) | CType::Vector | CType::Tensor))
             .map(|(i, t)| (i, *t))
             .collect();
         if managed.is_empty() {
@@ -3874,6 +4223,9 @@ fn emit_drop_managed_field(t: CType, i: usize, out: &mut String) {
         }
         CType::Vector => {
             let _ = writeln!(out, "        aria_vec_drop((void*)(uintptr_t)aria_field(p, {}));", i);
+        }
+        CType::Tensor => {
+            let _ = writeln!(out, "        aria_tensor_drop((void*)(uintptr_t)aria_field(p, {}));", i);
         }
         _ => {}
     }
@@ -3936,7 +4288,10 @@ mod tests {
         let exe = dir.join(format!("aria_ce_{}_{}", std::process::id(), n));
         std::fs::write(&c_path, c_src).map_err(|e| e.to_string())?;
         let cc = std::process::Command::new("cc")
-            .arg("-O2").arg("-std=c11").arg("-o").arg(&exe).arg(&c_path)
+            // `-ffp-contract=off` disables FMA contraction so f32 multiply-then-add
+            // rounds exactly like the interpreter (matmul parity). `-lm` for expf.
+            .arg("-O2").arg("-std=c11").arg("-ffp-contract=off")
+            .arg("-o").arg(&exe).arg(&c_path).arg("-lm")
             .output().map_err(|e| e.to_string())?;
         let _ = std::fs::remove_file(&c_path);
         if !cc.status.success() {
@@ -4394,13 +4749,21 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_tensor_returns_err_not_panic() {
-        // A tensor builtin is outside the IR subset; compilation must return a
-        // clean Err (never panic).
-        let src = "fn t() -> Tensor = tensor_zeros(2, 2)\n\
-                   fn main() -> Int = 0";
+    fn tensor_program_compiles_natively() {
+        // Tensor builtins are now in the native subset: a tensor program must
+        // compile cleanly (no longer an Err).
+        let src = "fn main() -> Float = tensor_get(tensor_zeros(2, 2), 0, 0)";
         let r = compile_src(src);
-        assert!(r.is_err(), "expected clean Err for a tensor program, got Ok");
+        assert!(r.is_ok(), "expected a tensor program to compile, got {:?}", r.err());
+    }
+
+    #[test]
+    fn array_of_tensor_is_gated() {
+        // Array[Tensor] has no faithful native element slot — clean Err, no panic.
+        let src = "fn main() -> Int = array_len(array_new())\n\
+                   fn mk() -> Array[Tensor] = [tensor_zeros(1, 1)]";
+        let r = compile_src(src);
+        assert!(r.is_err(), "expected Array[Tensor] to be gated, got Ok");
     }
 
     // ---- self-tail-call optimization (native) --------------------------
