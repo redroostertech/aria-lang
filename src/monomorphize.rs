@@ -1188,10 +1188,22 @@ impl<'a> Mono<'a> {
                     if let Some(r) = self.rewrite_map_set_op(name, args, env, tymap, expected)? {
                         return Ok(r);
                     }
+                    // Use the builtin's DECLARED parameter type as the expected
+                    // type when rewriting each argument, but only when that param
+                    // is concrete (a generic `Ty::Var` param conveys nothing). This
+                    // lets a bare empty array literal infer its element type from
+                    // the parameter — e.g. `vec_from_array([])` resolves `[]` to
+                    // `Array[Float]` instead of falling back to `Unit` and being
+                    // wrongly rejected by the native backend.
+                    let param_sig = crate::builtins::lookup(name);
                     let mut rargs = Vec::new();
                     let mut arg_tys = Vec::new();
-                    for a in args {
-                        let (ra, at) = self.rewrite_expr(a, env, tymap, None)?;
+                    for (i, a) in args.iter().enumerate() {
+                        let exp = param_sig
+                            .as_ref()
+                            .and_then(|(ps, _)| ps.get(i))
+                            .filter(|p| !contains_var(p));
+                        let (ra, at) = self.rewrite_expr(a, env, tymap, exp)?;
                         rargs.push(ra);
                         arg_tys.push(at);
                     }

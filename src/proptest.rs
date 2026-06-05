@@ -1463,6 +1463,13 @@ fn vector_diff_programs() -> Vec<(String, &'static str)> {
             "fn main() -> Float = vec_norm(vec_from_array([3.0, 4.0]))\n".to_string(),
             "5",
         ),
+        // A bare empty array literal must infer its element type (Array[Float])
+        // so the native backend accepts it, matching the interpreter. Regression
+        // for an interp-vs-native divergence where `[]` fell back to Unit.
+        (
+            "fn main() -> Int = vec_len(vec_from_array([]))\n".to_string(),
+            "0",
+        ),
         // cosine of identical (parallel) vectors is 1.0.
         (
             "fn main() -> Float =\n\
