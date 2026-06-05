@@ -6,10 +6,10 @@
 -- dot / norm / cosine give the core embedding-similarity primitives; cosine of a
 -- zero-norm vector is 0.0 (never NaN), and dot/cosine/add on UNEQUAL lengths is a
 -- clean runtime error.
--- Identical output via `aria run` AND `aria native-run` (the wasm / `aria mem`
--- paths cleanly report that vectors are not yet supported there).
+-- Identical output via `aria run`, `aria native-run`, AND `aria wasm-run`
+-- (the `aria mem` IR path cleanly reports that vectors are unsupported there).
 
-fn main() -> Vector = {
+fn main() -> Float = {
   let a = vec_from_array([1.0, 2.0, 3.0]);
   let b = vec_from_array([4.0, 5.0, 6.0]);
   print_int(vec_len(a));              -- 3
@@ -21,7 +21,8 @@ fn main() -> Vector = {
   print_float(vec_cosine(vec_from_array([1.0, 0.0]), vec_from_array([0.0, 1.0])));  -- 0
   -- zero-norm operand -> 0.0 (no divide-by-zero / NaN).
   print_float(vec_cosine(a, vec_from_array([0.0, 0.0, 0.0])));                      -- 0
-  print_float(vec_dot(vec_scale(a, 2.0), b));  -- 2*32 = 64
-  -- a Vector value displays as `Vector[..]` (the returned value below).
-  vec_add(a, b)                       -- Vector[5, 7, 9]
+  -- vec_add returns a new Vector (Vector[5, 7, 9]); read its first element back.
+  let sum = vec_add(a, b);
+  print_float(vec_get(sum, 0));       -- 5
+  vec_dot(vec_scale(a, 2.0), b)       -- 2 * 32 = 64
 }

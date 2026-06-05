@@ -113,7 +113,9 @@ impl ElemKind {
             WType::I64 | WType::I32 => ElemKind::Int,
             WType::F64 => ElemKind::Float,
             WType::Str => ElemKind::Str,
-            WType::Ref | WType::Array(_) | WType::Tensor | WType::Bytes => ElemKind::Ref,
+            WType::Ref | WType::Array(_) | WType::Tensor | WType::Bytes | WType::Vector => {
+                ElemKind::Ref
+            }
             WType::F32 => ElemKind::Float,
         }
     }
@@ -152,6 +154,9 @@ enum WType {
     Bytes, // pointer into linear memory (i32 address) — a Bytes buffer, stored as
            // an Array(Int) heap object (one byte per i64 slot) so it reuses the
            // Array runtime (RC/FBIP), but is a distinct Aria type for ==/display.
+    Vector, // pointer into linear memory (i32 address) — a dense f64 Vector /
+            // embedding buffer { rc, len, cap, elems[f64] }, modeled on the Tensor
+            // heap object but reusing the shared free-list allocator + __live.
     F32, // INTERNAL ONLY: a scalar f32 used for Tensor-helper locals/scratch.
          // No Aria value ever has this type (Tensor data is f32 but is read out
          // as f64); it exists purely so helper bodies can declare f32 locals.
@@ -165,7 +170,8 @@ impl WType {
             WType::I64 => 0x7E,
             WType::F64 => 0x7C,
             WType::F32 => 0x7D,
-            WType::I32 | WType::Ref | WType::Str | WType::Tensor | WType::Array(_) | WType::Bytes => 0x7F,
+            WType::I32 | WType::Ref | WType::Str | WType::Tensor | WType::Array(_) | WType::Bytes
+            | WType::Vector => 0x7F,
         }
     }
 
@@ -195,6 +201,15 @@ impl WType {
                         "wasm backend: nested Array[Array[..]] is outside the wasm subset".into(),
                     );
                 }
+                // A Vector element would be dropped via the generic ADT `__drop`
+                // (wrong heap-object kind), so `Array[Vector]` stays out of the
+                // wasm subset (matching the interpreter/native, where it is also
+                // unchanged here). Reject cleanly.
+                if matches!(elem, WType::Vector) {
+                    return Err(
+                        "wasm backend: Array[Vector] is outside the wasm subset".into(),
+                    );
+                }
                 Ok(WType::Array(ElemKind::from_wtype(elem)))
             }
             // The opaque, reference-counted Bytes buffer. Modeled on an Array(Int)
@@ -209,13 +224,10 @@ impl WType {
                  `aria native-run`): type `{}`",
                 n
             )),
-            // The Vector / embedding type is supported by the interpreter and the
-            // native (C) backend, but NOT the wasm backend — gate cleanly.
-            Ty::Named(n, _) if n == "Vector" => Err(
-                "vectors are not yet supported in the wasm backend \
-                 (use the interpreter `aria run` or the native backend \
-                 `aria native-run`): type `Vector`".to_string(),
-            ),
+            // The dense f64 Vector / embedding buffer. A distinct heap object
+            // kind (its own ==/display and the vec_* builtins), modeled on the
+            // Tensor heap object but reusing the shared free-list allocator.
+            Ty::Named(n, args) if n == "Vector" && args.is_empty() => Ok(WType::Vector),
             // A named ADT becomes a heap reference. (Generics — args present —
             // are out of the 2b subset and rejected below.)
             Ty::Named(_, args) if args.is_empty() => Ok(WType::Ref),
@@ -472,6 +484,28 @@ const TENSOR_MAX_CLASS: u64 = 256;
 // to TENSOR_MAX_CLASS — so it always fits the EXISTING free-list array (sized to
 // max(max_arity, STR_MAX_CLASS, TENSOR_MAX_CLASS) + 1) without enlarging it.
 const ARRAY_HEADER: u64 = 32; // rc(8) + len(8) + cap(8) + kind(8)
+
+// ---- Vector heap objects -------------------------------------------------
+//
+// A `Vector` is a dense, growable, reference-counted f64 buffer / embedding,
+// the byte-for-byte analogue of the native `AriaVector { rc; len; cap;
+// double elems[] }`. It is modeled on the Tensor/Array heap objects: its own
+// runtime helpers, reusing the SAME segregated free-list `__alloc`/`__free`
+// machinery and the SAME `__live` counter (no allocator constant changes).
+// Layout at `p`:
+//   [p+0]   rc    (i64)
+//   [p+8]   len   (i64)   — number of live f64 elements
+//   [p+16]  cap   (i64)   — f64 slot capacity
+//   [p+24 .. p+24+8*cap]  elements, one f64 (8 bytes) per slot
+// FBIP: push/add/scale mutate in place when rc==1, else copy-on-write.
+//
+// `24 + 8*cap` is already 8-aligned, so the size class is
+// `(24 + 8*cap - CELL_HEADER) / SLOT = cap + 1`, clamped to TENSOR_MAX_CLASS —
+// it always fits the EXISTING free-list array without enlarging it.
+const VEC_HEADER: u64 = 24; // rc(8) + len(8) + cap(8)
+/// Minimum capacity an empty Vector grows to on its first push (mirrors the
+/// native `aria_vec_grow`: cap==0 -> 4).
+const VEC_MIN_CAP: i64 = 4;
 /// Minimum capacity an empty array grows to on its first push (mirrors the native
 /// backend's `cap==0 -> 4`, avoiding the native bug of growing to cap 1).
 const ARRAY_MIN_CAP: i64 = 4;
@@ -563,10 +597,25 @@ enum HeapHelper {
     BytesFromStr, // (s:i32) -> ptr:i32   new Array(Int) of the String's UTF-8 bytes; consumes s
     BytesToStr,   // (ptr:i32) -> i32     new String of the bytes (traps on invalid UTF-8); consumes ptr
     BytesEq,      // (a:i32, b:i32) -> i32   content equality (1/0); does NOT consume operands
+    // ---- Vector runtime (dense f64 buffer / embedding) ----
+    AllocVec,   // (cap:i32) -> ptr:i32   alloc a Vector (rc=1, len=0, cap set, elems uninit)
+    DupVec,     // (ptr:i32) -> i32       rc++ on a Vector
+    DropVec,    // (ptr:i32) -> i32       rc--; free at 0 (flat f64 buffer, no children)
+    VecLen,     // (ptr:i32) -> i64       len header; CONSUMES the Vector
+    VecGet,     // (ptr:i32, i:i64) -> f64  read elem (traps OOB); CONSUMES the Vector
+    VecPush,    // (ptr:i32, x:f64) -> ptr:i32  FBIP push/grow; CONSUMES + returns Vector
+    VecFromArr, // (arr:i32) -> ptr:i32   build a Vector from an Array[Float]; CONSUMES arr
+    VecToArr,   // (ptr:i32) -> arr:i32   build an Array[Float] from a Vector; CONSUMES it
+    VecDot,     // (a:i32, b:i32) -> f64  dot product (traps on length mismatch); CONSUMES both
+    VecNorm,    // (a:i32) -> f64         L2 norm = sqrt(dot(a,a)); CONSUMES a
+    VecCosine,  // (a:i32, b:i32) -> f64  cosine (zero-norm -> 0.0, traps on mismatch); CONSUMES both
+    VecAdd,     // (a:i32, b:i32) -> ptr:i32  elementwise add (FBIP, traps on mismatch); CONSUMES both
+    VecScale,   // (a:i32, s:f64) -> ptr:i32  scale by s (FBIP); CONSUMES a
+    VecEq,      // (a:i32, b:i32) -> i32  structural equality (len+elems); does NOT consume operands
 }
 
 impl HeapHelper {
-    const ALL: [HeapHelper; 39] = [
+    const ALL: [HeapHelper; 53] = [
         HeapHelper::Alloc,
         HeapHelper::Free,
         HeapHelper::Dup,
@@ -606,6 +655,20 @@ impl HeapHelper {
         HeapHelper::BytesFromStr,
         HeapHelper::BytesToStr,
         HeapHelper::BytesEq,
+        HeapHelper::AllocVec,
+        HeapHelper::DupVec,
+        HeapHelper::DropVec,
+        HeapHelper::VecLen,
+        HeapHelper::VecGet,
+        HeapHelper::VecPush,
+        HeapHelper::VecFromArr,
+        HeapHelper::VecToArr,
+        HeapHelper::VecDot,
+        HeapHelper::VecNorm,
+        HeapHelper::VecCosine,
+        HeapHelper::VecAdd,
+        HeapHelper::VecScale,
+        HeapHelper::VecEq,
     ];
 
     fn offset(self) -> u32 {
@@ -649,6 +712,20 @@ impl HeapHelper {
             HeapHelper::BytesFromStr => 36,
             HeapHelper::BytesToStr => 37,
             HeapHelper::BytesEq => 38,
+            HeapHelper::AllocVec => 39,
+            HeapHelper::DupVec => 40,
+            HeapHelper::DropVec => 41,
+            HeapHelper::VecLen => 42,
+            HeapHelper::VecGet => 43,
+            HeapHelper::VecPush => 44,
+            HeapHelper::VecFromArr => 45,
+            HeapHelper::VecToArr => 46,
+            HeapHelper::VecDot => 47,
+            HeapHelper::VecNorm => 48,
+            HeapHelper::VecCosine => 49,
+            HeapHelper::VecAdd => 50,
+            HeapHelper::VecScale => 51,
+            HeapHelper::VecEq => 52,
         }
     }
 
@@ -698,6 +775,20 @@ impl HeapHelper {
             HeapHelper::BytesFromStr => (vec![WType::I32], WType::I32),
             HeapHelper::BytesToStr => (vec![WType::I32], WType::I32),
             HeapHelper::BytesEq => (vec![WType::I32, WType::I32], WType::I32),
+            HeapHelper::AllocVec => (vec![WType::I32], WType::I32),
+            HeapHelper::DupVec => (vec![WType::I32], WType::I32),
+            HeapHelper::DropVec => (vec![WType::I32], WType::I32),
+            HeapHelper::VecLen => (vec![WType::I32], WType::I64),
+            HeapHelper::VecGet => (vec![WType::I32, WType::I64], WType::F64),
+            HeapHelper::VecPush => (vec![WType::I32, WType::F64], WType::I32),
+            HeapHelper::VecFromArr => (vec![WType::I32], WType::I32),
+            HeapHelper::VecToArr => (vec![WType::I32], WType::I32),
+            HeapHelper::VecDot => (vec![WType::I32, WType::I32], WType::F64),
+            HeapHelper::VecNorm => (vec![WType::I32], WType::F64),
+            HeapHelper::VecCosine => (vec![WType::I32, WType::I32], WType::F64),
+            HeapHelper::VecAdd => (vec![WType::I32, WType::I32], WType::I32),
+            HeapHelper::VecScale => (vec![WType::I32, WType::F64], WType::I32),
+            HeapHelper::VecEq => (vec![WType::I32, WType::I32], WType::I32),
         }
     }
 }
@@ -1029,13 +1120,8 @@ fn bind_type(bind: &Bind, env: &LocalEnv) -> Result<WType, String> {
                     name
                 ));
             }
-            if name.starts_with("vec_") && crate::builtins::lookup(name).is_some() {
-                return Err(format!(
-                    "vectors are not yet supported in the wasm backend \
-                     (use the interpreter `aria run` or the native backend \
-                     `aria native-run`): builtin `{}`",
-                    name
-                ));
+            if let Some(ret) = vec_builtin_ret(name) {
+                return Ok(ret);
             }
             let sig = env
                 .sigs
@@ -1352,6 +1438,16 @@ fn emit_bind(bind: &Bind, env: &mut LocalEnv, code: &mut Vec<u8>) -> Result<WTyp
                 }
                 return emit_bytes_eq(*op, l, r, env, code);
             }
+            // Vector `==`/`!=`: structural (len + element bits) compare via
+            // `__veceq`, then consume both operands (`__drop_vec`). A Vector never
+            // equals an Array[Float] (they are distinct wasm types, so a mixed
+            // compare is a clean type Err here).
+            if matches!(op, BinOp::Eq | BinOp::Ne) && atom_type(l, env)? == WType::Vector {
+                if atom_type(r, env)? != WType::Vector {
+                    return Err("wasm backend: == / != on mismatched types".into());
+                }
+                return emit_vec_eq(*op, l, r, env, code);
+            }
             let lt = emit_atom(l, env, code)?;
             let rt = emit_atom(r, env, code)?;
             // Add/Sub/Mul on Int are checked: route through an emitted helper
@@ -1397,7 +1493,7 @@ fn emit_bind(bind: &Bind, env: &mut LocalEnv, code: &mut Vec<u8>) -> Result<WTyp
                         Ok(WType::F64)
                     }
                     WType::I32 | WType::Ref | WType::Str | WType::Tensor | WType::Array(_)
-                    | WType::Bytes | WType::F32 => {
+                    | WType::Bytes | WType::Vector | WType::F32 => {
                         Err("wasm backend: numeric negation requires an Int or Float".into())
                     }
                 }
@@ -1438,13 +1534,8 @@ fn emit_bind(bind: &Bind, env: &mut LocalEnv, code: &mut Vec<u8>) -> Result<WTyp
                     name
                 ));
             }
-            if name.starts_with("vec_") && crate::builtins::lookup(name).is_some() {
-                return Err(format!(
-                    "vectors are not yet supported in the wasm backend \
-                     (use the interpreter `aria run` or the native backend \
-                     `aria native-run`): builtin `{}`",
-                    name
-                ));
+            if is_vec_builtin(name) {
+                return emit_vec_builtin(name, args, env, code);
             }
             let sig_ret;
             let sig_params;
@@ -1553,7 +1644,8 @@ fn emit_store_cell_fields(
         match fty {
             WType::F64 => f64_store(off, code),
             WType::I64 => i64_store(off, code),
-            WType::I32 | WType::Ref | WType::Str | WType::Tensor | WType::Array(_) | WType::Bytes => {
+            WType::I32 | WType::Ref | WType::Str | WType::Tensor | WType::Array(_) | WType::Bytes
+            | WType::Vector => {
                 code.push(0xAD); // i64.extend_i32_u
                 i64_store(off, code);
             }
@@ -1961,6 +2053,119 @@ fn emit_tensor_builtin(
     Ok(ret)
 }
 
+/// True iff `name` is a Vector (`vec_*`) builtin handled by the wasm backend.
+fn is_vec_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        "vec_new"
+            | "vec_from_array"
+            | "vec_to_array"
+            | "vec_len"
+            | "vec_get"
+            | "vec_push"
+            | "vec_dot"
+            | "vec_norm"
+            | "vec_cosine"
+            | "vec_add"
+            | "vec_scale"
+    )
+}
+
+/// The wasm result type of a Vector builtin, or `None` if `name` is not one.
+fn vec_builtin_ret(name: &str) -> Option<WType> {
+    Some(match name {
+        "vec_new" | "vec_from_array" | "vec_push" | "vec_add" | "vec_scale" => WType::Vector,
+        "vec_to_array" => WType::Array(ElemKind::Float),
+        "vec_len" => WType::I64,
+        "vec_get" | "vec_dot" | "vec_norm" | "vec_cosine" => WType::F64,
+        _ => return None,
+    })
+}
+
+/// Emit a Vector (`vec_*`) builtin as a call into the Vector heap helpers. Each
+/// consuming helper consumes its Vector/Array argument(s) (matching the rc pass's
+/// "call arguments are consumed" rule), so no separate drop is emitted here.
+/// Mirrors `emit_tensor_builtin`.
+fn emit_vec_builtin(
+    name: &str,
+    args: &[Atom],
+    env: &mut LocalEnv,
+    code: &mut Vec<u8>,
+) -> Result<WType, String> {
+    let push_args = |env: &mut LocalEnv, code: &mut Vec<u8>, expect: &[WType]| -> Result<(), String> {
+        if args.len() != expect.len() {
+            return Err(format!(
+                "wasm backend: `{}` expects {} args, got {}",
+                name,
+                expect.len(),
+                args.len()
+            ));
+        }
+        for (a, want) in args.iter().zip(expect.iter()) {
+            let got = emit_atom(a, env, code)?;
+            if got != *want {
+                return Err(format!(
+                    "wasm backend: `{}` arg type mismatch (got {:?}, expected {:?})",
+                    name, got, want
+                ));
+            }
+        }
+        Ok(())
+    };
+    let (expect, helper, ret): (Vec<WType>, HeapHelper, WType) = match name {
+        "vec_new" => (vec![], HeapHelper::AllocVec, WType::Vector),
+        "vec_from_array" => (
+            vec![WType::Array(ElemKind::Float)],
+            HeapHelper::VecFromArr,
+            WType::Vector,
+        ),
+        "vec_to_array" => (
+            vec![WType::Vector],
+            HeapHelper::VecToArr,
+            WType::Array(ElemKind::Float),
+        ),
+        "vec_len" => (vec![WType::Vector], HeapHelper::VecLen, WType::I64),
+        "vec_get" => (vec![WType::Vector, WType::I64], HeapHelper::VecGet, WType::F64),
+        "vec_push" => (
+            vec![WType::Vector, WType::F64],
+            HeapHelper::VecPush,
+            WType::Vector,
+        ),
+        "vec_dot" => (
+            vec![WType::Vector, WType::Vector],
+            HeapHelper::VecDot,
+            WType::F64,
+        ),
+        "vec_norm" => (vec![WType::Vector], HeapHelper::VecNorm, WType::F64),
+        "vec_cosine" => (
+            vec![WType::Vector, WType::Vector],
+            HeapHelper::VecCosine,
+            WType::F64,
+        ),
+        "vec_add" => (
+            vec![WType::Vector, WType::Vector],
+            HeapHelper::VecAdd,
+            WType::Vector,
+        ),
+        "vec_scale" => (
+            vec![WType::Vector, WType::F64],
+            HeapHelper::VecScale,
+            WType::Vector,
+        ),
+        _ => return Err(format!("wasm backend: unknown vector builtin `{}`", name)),
+    };
+    // `vec_new` takes no Vector argument: AllocVec wants a cap:i32. Push cap=0.
+    if name == "vec_new" {
+        code.push(0x41); // i32.const 0  (cap)
+        leb_s(0, code);
+    } else {
+        push_args(env, code, &expect)?;
+    }
+    code.push(0x10); // call helper
+    leb_u(env.heap_index(helper) as u64, code);
+    Ok(ret)
+}
+
 /// The wasm result type of a (parsed) array builtin: `array_get$k` yields the
 /// element type, `array_len$k` an Int, every other op an `Array(kind)`.
 fn array_builtin_ret(base: &str, kind: ElemKind) -> WType {
@@ -2241,6 +2446,46 @@ fn emit_bytes_eq(
     Ok(WType::I32)
 }
 
+/// Emit a Vector `==` / `!=`. Both operands are evaluated into fresh i32 temps,
+/// compared structurally (len + exact element bits) by `__veceq` (which does NOT
+/// consume), the result negated for `!=`, then BOTH Vector pointers are dropped
+/// via `__drop_vec` (the comparison OWNS its operands, like the Bytes/ADT case).
+fn emit_vec_eq(
+    op: BinOp,
+    l: &Atom,
+    r: &Atom,
+    env: &mut LocalEnv,
+    code: &mut Vec<u8>,
+) -> Result<WType, String> {
+    let lt = env.fresh_i32();
+    let rt = env.fresh_i32();
+    let veceq = env.heap_index(HeapHelper::VecEq);
+    let drop_vec = env.heap_index(HeapHelper::DropVec);
+    emit_atom(l, env, code)?;
+    code.push(0x21);
+    leb_u(lt as u64, code);
+    emit_atom(r, env, code)?;
+    code.push(0x21);
+    leb_u(rt as u64, code);
+    code.push(0x20);
+    leb_u(lt as u64, code);
+    code.push(0x20);
+    leb_u(rt as u64, code);
+    code.push(0x10); // call __veceq
+    leb_u(veceq as u64, code);
+    if op == BinOp::Ne {
+        code.push(0x45); // i32.eqz
+    }
+    for slot in [lt, rt] {
+        code.push(0x20);
+        leb_u(slot as u64, code);
+        code.push(0x10); // call __drop_vec
+        leb_u(drop_vec as u64, code);
+        code.push(0x1A); // drop dummy result
+    }
+    Ok(WType::I32)
+}
+
 /// Emit an ADT `==` / `!=`. Both operands are evaluated into fresh i32 temps,
 /// `__eq` compares them structurally (recursively), the result is negated for
 /// `!=`, and BOTH operand pointers are then dropped via `__drop`. `__eq` only
@@ -2365,7 +2610,8 @@ fn emit_make_closure(
         match t {
             WType::F64 => f64_store(off, code),
             WType::I64 => i64_store(off, code),
-            WType::I32 | WType::Ref | WType::Str | WType::Tensor | WType::Array(_) | WType::Bytes => {
+            WType::I32 | WType::Ref | WType::Str | WType::Tensor | WType::Array(_) | WType::Bytes
+            | WType::Vector => {
                 code.push(0xAD); // i64.extend_i32_u
                 i64_store(off, code);
             }
@@ -2595,7 +2841,8 @@ fn emit_arm_body(
                 match fty {
                     WType::F64 => f64_load(off, code),
                     WType::I64 => i64_load(off, code),
-                    WType::I32 | WType::Ref | WType::Str | WType::Tensor | WType::Array(_) | WType::Bytes => {
+                    WType::I32 | WType::Ref | WType::Str | WType::Tensor | WType::Array(_) | WType::Bytes
+                    | WType::Vector => {
                         i64_load(off, code);
                         code.push(0xA7); // i32.wrap_i64
                     }
@@ -2729,6 +2976,13 @@ fn emit_prim(op: BinOp, lt: WType, rt: WType, code: &mut Vec<u8>) -> Result<WTyp
                         "wasm backend: internal — Bytes `==` should be routed earlier".into(),
                     )
                 }
+                // Vector `==` is handled in `emit_bind` (it needs `env` to call
+                // `__veceq` + drop operands), so it never reaches here.
+                WType::Vector => {
+                    return Err(
+                        "wasm backend: internal — Vector `==` should be routed earlier".into(),
+                    )
+                }
                 WType::F32 => unreachable!("F32 is not an Aria value type"),
             }
             Ok(WType::I32)
@@ -2795,6 +3049,7 @@ fn emit_iexpr(e: &IExpr, env: &mut LocalEnv, code: &mut Vec<u8>) -> Result<WType
                 // A Bytes is an Array(Int) heap object, so it dup/drops via the
                 // array helpers (kind-aware drop sees kind=Int -> no child refs).
                 WType::Bytes => Some(HeapHelper::DupArray),
+                WType::Vector => Some(HeapHelper::DupVec),
                 _ => None,
             };
             if let Some(h) = h {
@@ -2813,6 +3068,7 @@ fn emit_iexpr(e: &IExpr, env: &mut LocalEnv, code: &mut Vec<u8>) -> Result<WType
                 WType::Tensor => Some(HeapHelper::DropTensor),
                 WType::Array(_) => Some(HeapHelper::DropArray),
                 WType::Bytes => Some(HeapHelper::DropArray),
+                WType::Vector => Some(HeapHelper::DropVec),
                 _ => None,
             };
             if let Some(h) = h {
@@ -3144,6 +3400,9 @@ fn emit_heap_helper(
     let drop_array_idx = heap_base + HeapHelper::DropArray.offset();
     let dup_str_idx = heap_base + HeapHelper::DupStr.offset();
     let dup_idx = heap_base + HeapHelper::Dup.offset();
+    let alloc_vec_idx = heap_base + HeapHelper::AllocVec.offset();
+    let drop_vec_idx = heap_base + HeapHelper::DropVec.offset();
+    let array_push_idx = heap_base + HeapHelper::ArrayPush.offset();
 
     let mut body: Vec<u8> = Vec::new();
     match h {
@@ -3382,6 +3641,7 @@ fn emit_heap_helper(
                     let idx = match t {
                         WType::Str => drop_str_idx,
                         WType::Array(_) => drop_array_idx,
+                        WType::Vector => drop_vec_idx,
                         _ => drop_idx,
                     };
                     leb_u(idx as u64, &mut body);
@@ -4086,7 +4346,7 @@ fn emit_heap_helper(
                         // Array field (emit_adt_eq guards on any_array_field), so
                         // these arms are never reached at runtime; emit a
                         // constant-true to keep the match exhaustive.
-                        WType::Tensor | WType::Array(_) => {
+                        WType::Tensor | WType::Array(_) | WType::Vector => {
                             body.push(I32_CONST);
                             leb_s(1, &mut body);
                         }
@@ -6548,6 +6808,938 @@ fn emit_heap_helper(
             leb_s(1, &mut body);
             helper_entry(&[WType::I32, WType::I32, WType::I32, WType::I32, WType::I32], body)
         }
+        // ---- Vector runtime (dense f64 buffer / embedding) ----------------
+        // f64 opcodes used below: f64.const 0x44, f64.add 0xA0, f64.mul 0xA2,
+        // f64.div 0xA3, f64.sqrt 0x9F, f64.eq 0x61, f64.lt 0x63, f64.gt 0x64.
+        HeapHelper::AllocVec => {
+            // (cap:i32) -> ptr:i32. Alloc a Vector object (rc=1, len=0, cap set,
+            // elems UNINITIALIZED). cls = cap + 1 (since 24 + 8*cap is already
+            // 8-aligned), clamped to TENSOR_MAX_CLASS. Locals: cls(1,i32),
+            // ptr(2,i32).
+            // cls = cap + 1
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body); // cap
+            body.push(I32_CONST);
+            leb_s(1, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_TEE);
+            leb_u(1, &mut body); // cls
+            body.push(I32_CONST);
+            leb_s(TENSOR_MAX_CLASS as i64, &mut body);
+            body.push(0x4B); // i32.gt_u
+            body.push(IF);
+            body.push(BT_VOID);
+            body.push(I32_CONST);
+            leb_s(TENSOR_MAX_CLASS as i64, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(1, &mut body);
+            body.push(END);
+            // ptr = __alloc(cls)   (sets rc=1, live++)
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body);
+            body.push(CALL);
+            leb_u(alloc_idx as u64, &mut body);
+            body.push(LOCAL_TEE);
+            leb_u(2, &mut body); // ptr
+            // [ptr+8] = len = 0
+            body.push(I64_CONST);
+            leb_s(0, &mut body);
+            i64_store(8, &mut body);
+            // [ptr+16] = cap
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body); // cap
+            body.push(I64_EXTEND_I32_U);
+            i64_store(16, &mut body);
+            // return ptr
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body);
+            helper_entry(&[WType::I32, WType::I32], body)
+        }
+        HeapHelper::DupVec => {
+            // (ptr:i32) -> i32. rc++.
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(0, &mut body);
+            body.push(I64_CONST);
+            leb_s(1, &mut body);
+            body.push(I64_ADD);
+            i64_store(0, &mut body);
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            helper_entry(&[], body)
+        }
+        HeapHelper::DropVec => {
+            // (ptr:i32) -> i32. rc--; at 0 free with cls = cap + 1 (clamped). A
+            // Vector is a flat f64 buffer (no heap children). Locals: rc(1,i64),
+            // cls(2,i32).
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(0, &mut body);
+            body.push(I64_CONST);
+            leb_s(1, &mut body);
+            body.push(I64_SUB);
+            body.push(LOCAL_TEE);
+            leb_u(1, &mut body); // rc
+            i64_store(0, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body);
+            body.push(I64_EQZ);
+            body.push(IF);
+            body.push(BT_VOID);
+            // cls = cap + 1 (clamped); cap = [ptr+16]
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(16, &mut body);
+            body.push(I32_WRAP_I64);
+            body.push(I32_CONST);
+            leb_s(1, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_TEE);
+            leb_u(2, &mut body); // cls
+            body.push(I32_CONST);
+            leb_s(TENSOR_MAX_CLASS as i64, &mut body);
+            body.push(0x4B); // i32.gt_u
+            body.push(IF);
+            body.push(BT_VOID);
+            body.push(I32_CONST);
+            leb_s(TENSOR_MAX_CLASS as i64, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(2, &mut body);
+            body.push(END);
+            // __free(ptr, cls)   (live--)
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body);
+            body.push(CALL);
+            leb_u(free_idx as u64, &mut body);
+            body.push(DROP);
+            body.push(END); // end if rc==0
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            helper_entry(&[WType::I64, WType::I32], body)
+        }
+        HeapHelper::VecLen => {
+            // (ptr:i32) -> i64. Returns len; CONSUMES the Vector. Local: n(1,i64).
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(8, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(1, &mut body); // n
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(CALL);
+            leb_u(drop_vec_idx as u64, &mut body);
+            body.push(DROP);
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body);
+            helper_entry(&[WType::I64], body)
+        }
+        HeapHelper::VecGet => {
+            // (ptr:i32, i:i64) -> f64. Bounds-check (trap OOB), read elem, drop the
+            // (consumed) Vector, return elem. Local: x(2,f64).
+            // if i < 0 || i >= len -> trap
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body); // i
+            body.push(I64_CONST);
+            leb_s(0, &mut body);
+            body.push(0x53); // i64.lt_s
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body); // i
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body); // ptr
+            i64_load(8, &mut body); // len
+            body.push(0x59); // i64.ge_s
+            body.push(0x72); // i32.or
+            body.push(IF);
+            body.push(BT_VOID);
+            body.push(0x00); // unreachable
+            body.push(END);
+            // x = f64.load[ptr + VEC_HEADER + 8*i]
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body); // ptr
+            body.push(I32_CONST);
+            leb_s(VEC_HEADER as i64, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body); // i (i64)
+            body.push(I32_WRAP_I64);
+            body.push(I32_CONST);
+            leb_s(SLOT as i64, &mut body);
+            body.push(I32_MUL);
+            body.push(I32_ADD);
+            f64_load(0, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(2, &mut body); // x
+            // __drop_vec(ptr)
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(CALL);
+            leb_u(drop_vec_idx as u64, &mut body);
+            body.push(DROP);
+            // return x
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body);
+            helper_entry(&[WType::F64], body)
+        }
+        HeapHelper::VecPush => {
+            // (ptr:i32, x:f64) -> ptr:i32. FBIP: if rc==1 grow-if-full in place
+            // (reuses++); else copy-on-write append. Mirrors aria_vec_push (clone
+            // to cap=len>0?len:1, then grow). Locals: len(2,i32), cap(3,i32),
+            // np(4,i32), ncap(5,i32), j(6,i32).
+            // len = [ptr+8]; cap = [ptr+16]
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(8, &mut body);
+            body.push(I32_WRAP_I64);
+            body.push(LOCAL_SET);
+            leb_u(2, &mut body); // len
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(16, &mut body);
+            body.push(I32_WRAP_I64);
+            body.push(LOCAL_SET);
+            leb_u(3, &mut body); // cap
+            // if rc==1 { in place } else { COW }
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(0, &mut body);
+            body.push(I64_CONST);
+            leb_s(1, &mut body);
+            body.push(I64_EQ);
+            body.push(IF);
+            body.push(0x7F); // result i32
+            // if len < cap { write in place } else { grow }
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            body.push(0x48); // i32.lt_s
+            body.push(IF);
+            body.push(0x7F);
+            // in place: ptr.elems[len] = x; ptr.len = len+1; reuses++
+            vec_store_at(&mut body, 0, 2, 1);
+            vec_bump_len(&mut body, 0, 2);
+            vec_reuses_inc(&mut body);
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(ELSE);
+            // grow: ncap = cap>0 ? cap*2 : VEC_MIN_CAP
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            body.push(0x4A); // i32.gt_s
+            body.push(IF);
+            body.push(0x7F);
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            body.push(I32_CONST);
+            leb_s(2, &mut body);
+            body.push(I32_MUL);
+            body.push(ELSE);
+            body.push(I32_CONST);
+            leb_s(VEC_MIN_CAP, &mut body);
+            body.push(END);
+            body.push(LOCAL_SET);
+            leb_u(5, &mut body); // ncap
+            // np = __alloc_vec(ncap); np.len = len
+            body.push(LOCAL_GET);
+            leb_u(5, &mut body);
+            body.push(CALL);
+            leb_u(alloc_vec_idx as u64, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(4, &mut body); // np
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body);
+            body.push(I64_EXTEND_I32_U);
+            i64_store(8, &mut body);
+            // copy elements raw (ownership transfers), j=0..len
+            vec_copy_loop(&mut body, 0, 4, 2, 6);
+            // np.elems[len] = x; np.len = len+1
+            vec_store_at(&mut body, 4, 2, 1);
+            vec_bump_len(&mut body, 4, 2);
+            // free old object only. cls=cap+1.
+            vec_free_shallow(&mut body, 0, 3, free_idx);
+            vec_reuses_inc(&mut body);
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body);
+            body.push(END); // end if len<cap
+            body.push(ELSE);
+            // ---- copy-on-write append ----
+            // ncap = len>0 ? len : 1, then since we append one more we still need
+            // room: clone to cap=max(len,1), grow if full. To mirror native
+            // exactly (clone cap=len>0?len:1 then grow when len==cap), allocate
+            // ncap = (len>0?len:1); if len==ncap grow to ncap*2 (or 4 if 0).
+            // Simpler & equivalent capacity-wise for garbage-freeness: ncap=len+1.
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body);
+            body.push(I32_CONST);
+            leb_s(1, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_SET);
+            leb_u(5, &mut body); // ncap
+            // np = __alloc_vec(ncap); np.len = len
+            body.push(LOCAL_GET);
+            leb_u(5, &mut body);
+            body.push(CALL);
+            leb_u(alloc_vec_idx as u64, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(4, &mut body); // np
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body);
+            body.push(I64_EXTEND_I32_U);
+            i64_store(8, &mut body);
+            // copy elements (raw f64 copy; no per-elem rc), j=0..len
+            vec_copy_loop(&mut body, 0, 4, 2, 6);
+            // np.elems[len] = x; np.len = len+1
+            vec_store_at(&mut body, 4, 2, 1);
+            vec_bump_len(&mut body, 4, 2);
+            // drop original
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(CALL);
+            leb_u(drop_vec_idx as u64, &mut body);
+            body.push(DROP);
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body);
+            body.push(END); // end if rc==1
+            helper_entry(
+                &[WType::I32, WType::I32, WType::I32, WType::I32, WType::I32],
+                body,
+            )
+        }
+        HeapHelper::VecFromArr => {
+            // (arr:i32) -> ptr:i32. Build a Vector from an Array[Float]. The array
+            // stores each Float as f64 BITS in an i64 slot, so we copy each slot
+            // raw (i64.load -> i64.store) into the Vector's f64 buffer. Then drop
+            // the (consumed) array. Locals: len(1,i32), ptr(2,i32), i(3,i32),
+            // bits(4,i64).
+            // len = [arr+8]
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(8, &mut body);
+            body.push(I32_WRAP_I64);
+            body.push(LOCAL_SET);
+            leb_u(1, &mut body); // len
+            // ptr = __alloc_vec(len); ptr.len = len
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body);
+            body.push(CALL);
+            leb_u(alloc_vec_idx as u64, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(2, &mut body); // ptr
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body);
+            body.push(I64_EXTEND_I32_U);
+            i64_store(8, &mut body);
+            // i = 0; while i < len { copy slot i (i64 bits) }
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(3, &mut body); // i
+            body.push(0x03); // loop
+            body.push(BT_VOID);
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body);
+            body.push(0x48); // i32.lt_s
+            body.push(IF);
+            body.push(BT_VOID);
+            // bits = i64.load[arr + ARRAY_HEADER + 8*i]
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(I32_CONST);
+            leb_s(ARRAY_HEADER as i64, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            body.push(I32_CONST);
+            leb_s(SLOT as i64, &mut body);
+            body.push(I32_MUL);
+            body.push(I32_ADD);
+            i64_load(0, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(4, &mut body); // bits
+            // store bits at [ptr + VEC_HEADER + 8*i]
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body);
+            body.push(I32_CONST);
+            leb_s(VEC_HEADER as i64, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            body.push(I32_CONST);
+            leb_s(SLOT as i64, &mut body);
+            body.push(I32_MUL);
+            body.push(I32_ADD);
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body);
+            i64_store(0, &mut body);
+            // i++
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            body.push(I32_CONST);
+            leb_s(1, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_SET);
+            leb_u(3, &mut body);
+            body.push(0x0C);
+            leb_u(1, &mut body);
+            body.push(END); // end if
+            body.push(END); // end loop
+            // drop the (consumed) Array[Float] (kind Float has no heap children)
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(CALL);
+            leb_u(drop_array_idx as u64, &mut body);
+            body.push(DROP);
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body);
+            helper_entry(&[WType::I32, WType::I32, WType::I32, WType::I64], body)
+        }
+        HeapHelper::VecToArr => {
+            // (ptr:i32) -> arr:i32. Build an Array[Float] (kind 1) from a Vector by
+            // pushing each element (as f64 bits) through __array_push. Mirrors
+            // aria_vec_to_array. Then drop the (consumed) Vector. Locals:
+            // len(1,i32), arr(2,i32), i(3,i32), bits(4,i64).
+            // len = [ptr+8]
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(8, &mut body);
+            body.push(I32_WRAP_I64);
+            body.push(LOCAL_SET);
+            leb_u(1, &mut body); // len
+            // arr = __array_new(kind=1, cap=0)  (start empty, push grows it like
+            // aria_array_new + aria_array_push)
+            body.push(I32_CONST);
+            leb_s(1, &mut body); // kind Float
+            body.push(I32_CONST);
+            leb_s(0, &mut body); // cap 0
+            body.push(CALL);
+            leb_u(alloc_array_idx as u64, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(2, &mut body); // arr
+            // i = 0; while i < len { arr = __array_push(arr, bits_i, 1) }
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(3, &mut body); // i
+            body.push(0x03); // loop
+            body.push(BT_VOID);
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body);
+            body.push(0x48); // i32.lt_s
+            body.push(IF);
+            body.push(BT_VOID);
+            // bits = i64.load[ptr + VEC_HEADER + 8*i]
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(I32_CONST);
+            leb_s(VEC_HEADER as i64, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            body.push(I32_CONST);
+            leb_s(SLOT as i64, &mut body);
+            body.push(I32_MUL);
+            body.push(I32_ADD);
+            i64_load(0, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(4, &mut body); // bits
+            // arr = __array_push(arr, bits, 1)
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body);
+            body.push(I32_CONST);
+            leb_s(1, &mut body); // kind Float
+            body.push(CALL);
+            leb_u(array_push_idx as u64, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(2, &mut body); // arr
+            // i++
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            body.push(I32_CONST);
+            leb_s(1, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_SET);
+            leb_u(3, &mut body);
+            body.push(0x0C);
+            leb_u(1, &mut body);
+            body.push(END); // end if
+            body.push(END); // end loop
+            // drop the (consumed) Vector
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(CALL);
+            leb_u(drop_vec_idx as u64, &mut body);
+            body.push(DROP);
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body);
+            helper_entry(&[WType::I32, WType::I32, WType::I32, WType::I64], body)
+        }
+        HeapHelper::VecDot => {
+            // (a:i32, b:i32) -> f64. Trap on length mismatch; else acc =
+            // sum_i a[i]*b[i] (left-to-right). CONSUMES both. Locals: n(2,i32),
+            // i(3,i32), acc(4,f64).
+            // if a.len != b.len -> trap
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(8, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body);
+            i64_load(8, &mut body);
+            body.push(0x52); // i64.ne
+            body.push(IF);
+            body.push(BT_VOID);
+            body.push(0x00); // unreachable
+            body.push(END);
+            // n = a.len
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(8, &mut body);
+            body.push(I32_WRAP_I64);
+            body.push(LOCAL_SET);
+            leb_u(2, &mut body); // n
+            // acc = 0.0 ; i = 0
+            body.push(0x44); // f64.const 0
+            body.extend_from_slice(&0.0f64.to_le_bytes());
+            body.push(LOCAL_SET);
+            leb_u(4, &mut body); // acc
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(3, &mut body); // i
+            vec_dot_loop(&mut body, 0, 1, 2, 3, 4);
+            // drop both
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(CALL);
+            leb_u(drop_vec_idx as u64, &mut body);
+            body.push(DROP);
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body);
+            body.push(CALL);
+            leb_u(drop_vec_idx as u64, &mut body);
+            body.push(DROP);
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body); // acc
+            helper_entry(&[WType::I32, WType::I32, WType::F64], body)
+        }
+        HeapHelper::VecNorm => {
+            // (a:i32) -> f64. sqrt(dot(a,a)). CONSUMES a. Locals: n(1,i32),
+            // i(2,i32), acc(3,f64).
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(8, &mut body);
+            body.push(I32_WRAP_I64);
+            body.push(LOCAL_SET);
+            leb_u(1, &mut body); // n
+            body.push(0x44);
+            body.extend_from_slice(&0.0f64.to_le_bytes());
+            body.push(LOCAL_SET);
+            leb_u(3, &mut body); // acc
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(2, &mut body); // i
+            vec_dot_loop(&mut body, 0, 0, 1, 2, 3);
+            // sqrt(acc)
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            body.push(0x9F); // f64.sqrt
+            // drop a (after computing; acc already on stack — but drop_vec returns
+            // i32 we DROP; the f64 stays). Reorder: stash sqrt result first.
+            body.push(LOCAL_SET);
+            leb_u(3, &mut body); // reuse acc local to hold the norm
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(CALL);
+            leb_u(drop_vec_idx as u64, &mut body);
+            body.push(DROP);
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            helper_entry(&[WType::I32, WType::I32, WType::F64], body)
+        }
+        HeapHelper::VecCosine => {
+            // (a:i32, b:i32) -> f64. Trap on length mismatch. nx = ||a||, ny =
+            // ||b||; if nx==0 || ny==0 -> 0.0 else dot(a,b)/(nx*ny). CONSUMES both.
+            // Locals: n(2,i32), i(3,i32), nx(4,f64), ny(5,f64), d(6,f64), r(7,f64).
+            // if a.len != b.len -> trap
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(8, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body);
+            i64_load(8, &mut body);
+            body.push(0x52); // i64.ne
+            body.push(IF);
+            body.push(BT_VOID);
+            body.push(0x00); // unreachable
+            body.push(END);
+            // n = a.len
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(8, &mut body);
+            body.push(I32_WRAP_I64);
+            body.push(LOCAL_SET);
+            leb_u(2, &mut body); // n
+            // nx = sqrt(dot(a,a))
+            body.push(0x44);
+            body.extend_from_slice(&0.0f64.to_le_bytes());
+            body.push(LOCAL_SET);
+            leb_u(4, &mut body);
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(3, &mut body);
+            vec_dot_loop(&mut body, 0, 0, 2, 3, 4);
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body);
+            body.push(0x9F); // f64.sqrt
+            body.push(LOCAL_SET);
+            leb_u(4, &mut body); // nx
+            // ny = sqrt(dot(b,b))
+            body.push(0x44);
+            body.extend_from_slice(&0.0f64.to_le_bytes());
+            body.push(LOCAL_SET);
+            leb_u(5, &mut body);
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(3, &mut body);
+            vec_dot_loop(&mut body, 1, 1, 2, 3, 5);
+            body.push(LOCAL_GET);
+            leb_u(5, &mut body);
+            body.push(0x9F); // f64.sqrt
+            body.push(LOCAL_SET);
+            leb_u(5, &mut body); // ny
+            // if nx==0 || ny==0 { r = 0 } else { r = dot(a,b)/(nx*ny) }
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body);
+            body.push(0x44);
+            body.extend_from_slice(&0.0f64.to_le_bytes());
+            body.push(0x61); // f64.eq
+            body.push(LOCAL_GET);
+            leb_u(5, &mut body);
+            body.push(0x44);
+            body.extend_from_slice(&0.0f64.to_le_bytes());
+            body.push(0x61); // f64.eq
+            body.push(0x72); // i32.or
+            body.push(IF);
+            body.push(BT_VOID);
+            body.push(0x44);
+            body.extend_from_slice(&0.0f64.to_le_bytes());
+            body.push(LOCAL_SET);
+            leb_u(7, &mut body); // r = 0
+            body.push(ELSE);
+            // d = dot(a,b)
+            body.push(0x44);
+            body.extend_from_slice(&0.0f64.to_le_bytes());
+            body.push(LOCAL_SET);
+            leb_u(6, &mut body);
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(3, &mut body);
+            vec_dot_loop(&mut body, 0, 1, 2, 3, 6);
+            // r = d / (nx*ny)
+            body.push(LOCAL_GET);
+            leb_u(6, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(5, &mut body);
+            body.push(0xA2); // f64.mul
+            body.push(0xA3); // f64.div
+            body.push(LOCAL_SET);
+            leb_u(7, &mut body); // r
+            body.push(END);
+            // drop both
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(CALL);
+            leb_u(drop_vec_idx as u64, &mut body);
+            body.push(DROP);
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body);
+            body.push(CALL);
+            leb_u(drop_vec_idx as u64, &mut body);
+            body.push(DROP);
+            body.push(LOCAL_GET);
+            leb_u(7, &mut body);
+            helper_entry(
+                &[WType::I32, WType::I32, WType::F64, WType::F64, WType::F64, WType::F64],
+                body,
+            )
+        }
+        HeapHelper::VecAdd => {
+            // (a:i32, b:i32) -> ptr:i32. Trap on length mismatch. FBIP: if a.rc==1
+            // add b into a in place (reuses++, drop b, return a); else clone a,
+            // add b, drop both, return clone. Locals: n(2,i32), i(3,i32),
+            // out(4,i32), x(5,f64).
+            // if a.len != b.len -> trap
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(8, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body);
+            i64_load(8, &mut body);
+            body.push(0x52); // i64.ne
+            body.push(IF);
+            body.push(BT_VOID);
+            body.push(0x00); // unreachable
+            body.push(END);
+            // n = a.len
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(8, &mut body);
+            body.push(I32_WRAP_I64);
+            body.push(LOCAL_SET);
+            leb_u(2, &mut body); // n
+            // if a.rc==1 { out=a; reuses++ } else { out = clone(a) }
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(0, &mut body);
+            body.push(I64_CONST);
+            leb_s(1, &mut body);
+            body.push(I64_EQ);
+            body.push(IF);
+            body.push(0x7F); // result i32 -> out
+            vec_reuses_inc(&mut body);
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(ELSE);
+            vec_clone(&mut body, 0, 2, 6, 3, alloc_vec_idx);
+            body.push(END);
+            body.push(LOCAL_SET);
+            leb_u(4, &mut body); // out
+            // for i in 0..n: out[i] = out[i] + b[i]
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(3, &mut body);
+            body.push(0x03); // loop
+            body.push(BT_VOID);
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body);
+            body.push(0x48); // i32.lt_s
+            body.push(IF);
+            body.push(BT_VOID);
+            // addr_out = out + VEC_HEADER + 8*i  (kept for store)
+            vec_elem_addr(&mut body, 4, 3);
+            // value = out[i] + b[i]
+            vec_elem_addr(&mut body, 4, 3);
+            f64_load(0, &mut body);
+            vec_elem_addr(&mut body, 1, 3);
+            f64_load(0, &mut body);
+            body.push(0xA0); // f64.add
+            f64_store(0, &mut body);
+            // i++
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            body.push(I32_CONST);
+            leb_s(1, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_SET);
+            leb_u(3, &mut body);
+            body.push(0x0C);
+            leb_u(1, &mut body);
+            body.push(END);
+            body.push(END); // loop
+            // if a.rc!=1 we cloned, so drop a; always drop b. To match native
+            // (in-place path drops only b; COW path drops a and b), drop a only
+            // when out != a. Equivalent: drop b always; drop a if out!=a.
+            // drop b
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body);
+            body.push(CALL);
+            leb_u(drop_vec_idx as u64, &mut body);
+            body.push(DROP);
+            // if out != a -> drop a
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(I32_NE);
+            body.push(IF);
+            body.push(BT_VOID);
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(CALL);
+            leb_u(drop_vec_idx as u64, &mut body);
+            body.push(DROP);
+            body.push(END);
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body); // out
+            helper_entry(
+                &[WType::I32, WType::I32, WType::I32, WType::F64, WType::I32],
+                body,
+            )
+        }
+        HeapHelper::VecScale => {
+            // (a:i32, s:f64) -> ptr:i32. FBIP: if a.rc==1 scale in place
+            // (reuses++); else clone, scale, drop a. Locals: n(2,i32), out(3,i32),
+            // i(4,i32).
+            // n = a.len
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(8, &mut body);
+            body.push(I32_WRAP_I64);
+            body.push(LOCAL_SET);
+            leb_u(2, &mut body); // n
+            // if a.rc==1 { out=a; reuses++ } else { out=clone(a) }
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(0, &mut body);
+            body.push(I64_CONST);
+            leb_s(1, &mut body);
+            body.push(I64_EQ);
+            body.push(IF);
+            body.push(0x7F);
+            vec_reuses_inc(&mut body);
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(ELSE);
+            vec_clone(&mut body, 0, 2, 5, 4, alloc_vec_idx);
+            body.push(END);
+            body.push(LOCAL_SET);
+            leb_u(3, &mut body); // out
+            // for i in 0..n: out[i] = out[i] * s
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(4, &mut body);
+            body.push(0x03); // loop
+            body.push(BT_VOID);
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body);
+            body.push(0x48); // i32.lt_s
+            body.push(IF);
+            body.push(BT_VOID);
+            vec_elem_addr(&mut body, 3, 4); // addr for store
+            vec_elem_addr(&mut body, 3, 4);
+            f64_load(0, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body); // s
+            body.push(0xA2); // f64.mul
+            f64_store(0, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(4, &mut body);
+            body.push(I32_CONST);
+            leb_s(1, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_SET);
+            leb_u(4, &mut body);
+            body.push(0x0C);
+            leb_u(1, &mut body);
+            body.push(END);
+            body.push(END); // loop
+            // if out != a -> drop a
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(I32_NE);
+            body.push(IF);
+            body.push(BT_VOID);
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            body.push(CALL);
+            leb_u(drop_vec_idx as u64, &mut body);
+            body.push(DROP);
+            body.push(END);
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body); // out
+            // extra locals (after params a:i32, s:f64): n(2), out(3), i(4), tmp(5)
+            helper_entry(&[WType::I32, WType::I32, WType::I32, WType::I32], body)
+        }
+        HeapHelper::VecEq => {
+            // (a:i32, b:i32) -> i32. Structural equality (len + exact element bits,
+            // f64.eq so -0.0==0.0 and NaN!=NaN, matching native `!=` on doubles).
+            // Does NOT consume operands. Locals: n(2,i32), i(3,i32).
+            // if a.len != b.len return 0
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(8, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(1, &mut body);
+            i64_load(8, &mut body);
+            body.push(0x52); // i64.ne
+            body.push(IF);
+            body.push(BT_VOID);
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            body.push(0x0F); // return
+            body.push(END);
+            // n = a.len
+            body.push(LOCAL_GET);
+            leb_u(0, &mut body);
+            i64_load(8, &mut body);
+            body.push(I32_WRAP_I64);
+            body.push(LOCAL_SET);
+            leb_u(2, &mut body); // n
+            // i = 0; while i < n { if a[i] != b[i] return 0 }
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            body.push(LOCAL_SET);
+            leb_u(3, &mut body);
+            body.push(0x03); // loop
+            body.push(BT_VOID);
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            body.push(LOCAL_GET);
+            leb_u(2, &mut body);
+            body.push(0x48); // i32.lt_s
+            body.push(IF);
+            body.push(BT_VOID);
+            vec_elem_addr(&mut body, 0, 3);
+            f64_load(0, &mut body);
+            vec_elem_addr(&mut body, 1, 3);
+            f64_load(0, &mut body);
+            body.push(0x62); // f64.ne
+            body.push(IF);
+            body.push(BT_VOID);
+            body.push(I32_CONST);
+            leb_s(0, &mut body);
+            body.push(0x0F); // return 0
+            body.push(END);
+            body.push(LOCAL_GET);
+            leb_u(3, &mut body);
+            body.push(I32_CONST);
+            leb_s(1, &mut body);
+            body.push(I32_ADD);
+            body.push(LOCAL_SET);
+            leb_u(3, &mut body);
+            body.push(0x0C);
+            leb_u(1, &mut body);
+            body.push(END); // end if i<n
+            body.push(END); // end loop
+            body.push(I32_CONST);
+            leb_s(1, &mut body);
+            helper_entry(&[WType::I32, WType::I32, WType::I32], body)
+        }
     }
 }
 
@@ -7011,6 +8203,209 @@ fn array_free_shallow(body: &mut Vec<u8>, arr_local: u32, cap_local: u32, free_i
     body.push(0x10);
     leb_u(free_idx as u64, body);
     body.push(0x1A); // drop dummy
+}
+
+// ---- Vector (dense f64 buffer) codegen helpers --------------------------
+
+/// Push the byte address of element `idx_local` of the Vector in `ptr_local`:
+/// `ptr + VEC_HEADER + 8*idx`.
+fn vec_elem_addr(body: &mut Vec<u8>, ptr_local: u32, idx_local: u32) {
+    body.push(0x20); // local.get ptr
+    leb_u(ptr_local as u64, body);
+    body.push(0x41); // i32.const VEC_HEADER
+    leb_s(VEC_HEADER as i64, body);
+    body.push(0x6A); // i32.add
+    body.push(0x20); // local.get idx
+    leb_u(idx_local as u64, body);
+    body.push(0x41); // i32.const SLOT
+    leb_s(SLOT as i64, body);
+    body.push(0x6C); // i32.mul
+    body.push(0x6A); // i32.add
+}
+
+/// `vec.elems[idx_local] = <f64 in x_local>` where `vec_local` holds the ptr.
+fn vec_store_at(body: &mut Vec<u8>, vec_local: u32, idx_local: u32, x_local: u32) {
+    vec_elem_addr(body, vec_local, idx_local);
+    body.push(0x20); // local.get x (f64)
+    leb_u(x_local as u64, body);
+    body.push(0x39); // f64.store
+    leb_u(3, body);
+    leb_u(0, body);
+}
+
+/// `vec.len = len_local + 1` (vec_local holds the ptr; len_local the OLD length).
+fn vec_bump_len(body: &mut Vec<u8>, vec_local: u32, len_local: u32) {
+    body.push(0x20);
+    leb_u(vec_local as u64, body);
+    body.push(0x20);
+    leb_u(len_local as u64, body);
+    body.push(0x41);
+    leb_s(1, body);
+    body.push(0x6A); // i32.add
+    body.push(0xAD); // i64.extend_i32_u
+    body.push(0x37); // i64.store [vec+8]
+    leb_u(3, body);
+    leb_u(8, body);
+}
+
+/// `__reuses++` (shared FBIP reuse counter).
+fn vec_reuses_inc(body: &mut Vec<u8>) {
+    array_reuses_inc(body);
+}
+
+/// Copy `len_local` raw f64 element slots from `src_local` to `dst_local` (no
+/// per-element rc — Vector elements are plain f64). `j_local` is a scratch i32.
+fn vec_copy_loop(body: &mut Vec<u8>, src_local: u32, dst_local: u32, len_local: u32, j_local: u32) {
+    body.push(0x41);
+    leb_s(0, body);
+    body.push(0x21);
+    leb_u(j_local as u64, body);
+    body.push(0x03);
+    body.push(0x40); // loop
+    body.push(0x20);
+    leb_u(j_local as u64, body);
+    body.push(0x20);
+    leb_u(len_local as u64, body);
+    body.push(0x48); // i32.lt_s
+    body.push(0x04);
+    body.push(0x40);
+    // dst.elems[j] = src.elems[j]  (raw i64 bit copy is fine, but use f64)
+    vec_elem_addr(body, dst_local, j_local);
+    vec_elem_addr(body, src_local, j_local);
+    body.push(0x2B); // f64.load
+    leb_u(3, body);
+    leb_u(0, body);
+    body.push(0x39); // f64.store
+    leb_u(3, body);
+    leb_u(0, body);
+    // j++
+    body.push(0x20);
+    leb_u(j_local as u64, body);
+    body.push(0x41);
+    leb_s(1, body);
+    body.push(0x6A);
+    body.push(0x21);
+    leb_u(j_local as u64, body);
+    body.push(0x0C);
+    leb_u(1, body);
+    body.push(0x0B); // end if
+    body.push(0x0B); // end loop
+}
+
+/// Free the Vector object at `vec_local` WITHOUT regard to children (a Vector is
+/// a flat f64 buffer). cls = clamp(cap + 1, MAX). `cap_local` holds cap; also
+/// decrements `__live` via `__free`.
+fn vec_free_shallow(body: &mut Vec<u8>, vec_local: u32, cap_local: u32, free_idx: u32) {
+    let push_cls = |b: &mut Vec<u8>| {
+        b.push(0x20);
+        leb_u(cap_local as u64, b);
+        b.push(0x41);
+        leb_s(1, b);
+        b.push(0x6A); // cap + 1
+    };
+    body.push(0x20);
+    leb_u(vec_local as u64, body); // ptr
+    push_cls(body);
+    push_cls(body);
+    body.push(0x41);
+    leb_s(TENSOR_MAX_CLASS as i64, body);
+    body.push(0x4B); // (cls > MAX) as i32
+    push_cls(body);
+    body.push(0x41);
+    leb_s(TENSOR_MAX_CLASS as i64, body);
+    body.push(0x6B); // cls - MAX
+    body.push(0x6C); // (cls>MAX)*(cls-MAX)
+    body.push(0x6B); // cls - that
+    body.push(0x10);
+    leb_u(free_idx as u64, body);
+    body.push(0x1A); // drop dummy
+}
+
+/// Emit a clone of the Vector `src_local` (len = `n_local`): allocate a new
+/// buffer with cap = len, set its len, raw-copy all f64 elements, and leave the
+/// new pointer (rc=1) on the operand stack. `tmp_local` holds the new ptr;
+/// `j_local` is a scratch i32 counter. (cap = len mirrors `aria_vec_clone`,
+/// which allocates cap = len>0?len:1; for FBIP add/scale we never push after a
+/// clone, so cap = len is sufficient and garbage-free.)
+fn vec_clone(
+    body: &mut Vec<u8>,
+    src_local: u32,
+    n_local: u32,
+    tmp_local: u32,
+    j_local: u32,
+    alloc_vec_idx: u32,
+) {
+    // tmp = __alloc_vec(n)
+    body.push(0x20);
+    leb_u(n_local as u64, body);
+    body.push(0x10);
+    leb_u(alloc_vec_idx as u64, body);
+    body.push(0x21); // local.set tmp
+    leb_u(tmp_local as u64, body);
+    // tmp.len = n
+    body.push(0x20);
+    leb_u(tmp_local as u64, body);
+    body.push(0x20);
+    leb_u(n_local as u64, body);
+    body.push(0xAD); // i64.extend_i32_u
+    body.push(0x37); // i64.store [tmp+8]
+    leb_u(3, body);
+    leb_u(8, body);
+    // copy elems src -> tmp
+    vec_copy_loop(body, src_local, tmp_local, n_local, j_local);
+    // leave tmp on the stack
+    body.push(0x20);
+    leb_u(tmp_local as u64, body);
+}
+
+/// Emit a dot-product accumulation loop over `n_local` elements:
+/// `while i < n { acc += a[i] * b[i]; i++ }`. `a_local`/`b_local` hold Vector
+/// ptrs (may be the same for norm), `i_local` a scratch i32, `acc_local` the f64
+/// accumulator (must be pre-initialized by the caller).
+fn vec_dot_loop(
+    body: &mut Vec<u8>,
+    a_local: u32,
+    b_local: u32,
+    n_local: u32,
+    i_local: u32,
+    acc_local: u32,
+) {
+    body.push(0x03); // loop
+    body.push(0x40);
+    body.push(0x20);
+    leb_u(i_local as u64, body);
+    body.push(0x20);
+    leb_u(n_local as u64, body);
+    body.push(0x48); // i32.lt_s
+    body.push(0x04);
+    body.push(0x40);
+    // acc = acc + a[i]*b[i]
+    body.push(0x20);
+    leb_u(acc_local as u64, body);
+    vec_elem_addr(body, a_local, i_local);
+    body.push(0x2B); // f64.load
+    leb_u(3, body);
+    leb_u(0, body);
+    vec_elem_addr(body, b_local, i_local);
+    body.push(0x2B); // f64.load
+    leb_u(3, body);
+    leb_u(0, body);
+    body.push(0xA2); // f64.mul
+    body.push(0xA0); // f64.add
+    body.push(0x21); // local.set acc
+    leb_u(acc_local as u64, body);
+    // i++
+    body.push(0x20);
+    leb_u(i_local as u64, body);
+    body.push(0x41);
+    leb_s(1, body);
+    body.push(0x6A);
+    body.push(0x21);
+    leb_u(i_local as u64, body);
+    body.push(0x0C);
+    leb_u(1, body);
+    body.push(0x0B); // end if
+    body.push(0x0B); // end loop
 }
 
 /// Emit a byte-copy loop: `while i < <len_local> { dst[16 + i] = src[16 + i]; i++ }`,
@@ -7626,17 +9021,20 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
         // `main` takes no params and returns Int (existing), Float (an f64
         // export decodes to a JS number), or a heap String (Phase 2d); the Node
         // runner decodes the result accordingly.
-        // (A Bytes *return* from `main` is gated cleanly: the Node runner only
-        // decodes an Int/Float/String result, and a Bytes is a heap object the
-        // shared harness cannot render as `Bytes[..]`. Bytes are fully supported
-        // INSIDE a wasm program — built, mutated, compared, round-tripped to a
-        // String — only the top-level main-return rendering is deferred here.)
+        // (A Bytes *or* Vector *return* from `main` is gated cleanly: the Node
+        // runner only decodes an Int/Float/String result, and both are heap
+        // objects the shared harness cannot render as `Bytes[..]` / `Vector[..]`
+        // — that needs an in-wasm shortest-round-trip float formatter, which is
+        // out of scope. Bytes and Vectors are FULLY supported INSIDE a wasm
+        // program — built, mutated, dot/cosine/norm/add/scale, compared, printed
+        // element-by-element via print_float/print_int, round-tripped through an
+        // Array — only the top-level main-return rendering is deferred here.)
         if !m.params.is_empty()
             || (m.ret != WType::I64 && m.ret != WType::F64 && m.ret != WType::Str)
         {
             return Err(
                 "wasm backend: `main` must take no params and return Int, Float, or String \
-                 (a Bytes return is gated; use bytes_to_str or print inside main)"
+                 (a Bytes or Vector return is gated; print inside main or return a scalar)"
                     .into(),
             );
         }
@@ -7919,6 +9317,7 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
         let dup_idx = env.heap_index(HeapHelper::Dup);
         let dup_str_idx = env.heap_index(HeapHelper::DupStr);
         let dup_array_idx = env.heap_index(HeapHelper::DupArray);
+        let dup_vec_idx = env.heap_index(HeapHelper::DupVec);
         for (i, (cn, ct)) in ifn.captures.iter().zip(layout.cap_wtys.iter()).enumerate() {
             env.add_local(cn, *ct);
             let slot = env.var_index(cn)?;
@@ -7928,7 +9327,8 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
             match ct {
                 WType::F64 => f64_load(off, &mut body_code),
                 WType::I64 => i64_load(off, &mut body_code),
-                WType::I32 | WType::Ref | WType::Str | WType::Tensor | WType::Array(_) | WType::Bytes => {
+                WType::I32 | WType::Ref | WType::Str | WType::Tensor | WType::Array(_) | WType::Bytes
+                | WType::Vector => {
                     i64_load(off, &mut body_code);
                     body_code.push(0xA7); // i32.wrap_i64
                 }
@@ -7956,6 +9356,13 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
                     leb_u(slot as u64, &mut body_code);
                     body_code.push(0x10);
                     leb_u(dup_array_idx as u64, &mut body_code);
+                    body_code.push(0x1A); // drop dummy
+                }
+                WType::Vector => {
+                    body_code.push(0x20);
+                    leb_u(slot as u64, &mut body_code);
+                    body_code.push(0x10);
+                    leb_u(dup_vec_idx as u64, &mut body_code);
                     body_code.push(0x1A); // drop dummy
                 }
                 _ => {}
@@ -8006,7 +9413,9 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
                 .cap_wtys
                 .iter()
                 .enumerate()
-                .filter(|(_, t)| matches!(t, WType::Ref | WType::Str | WType::Array(_)))
+                .filter(|(_, t)| {
+                    matches!(t, WType::Ref | WType::Str | WType::Array(_) | WType::Vector)
+                })
                 .map(|(i, t)| (i, *t))
                 .collect(),
         })

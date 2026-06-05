@@ -796,6 +796,7 @@ fn run_wasm_live(bytes: &[u8]) -> Result<(String, i64), String> {
          const ex=r.instance.exports;memref=ex.memory;\
          const v=ex.main();\
          let m;if(typeof v==='bigint'){{m=String(v);}}\
+         else if(typeof v==='number'){{m=String(v);}}\
          else{{const dv=new DataView(ex.memory.buffer);\
          const len=Number(dv.getBigInt64(v+8,true));\
          m=dec.decode(new Uint8Array(ex.memory.buffer).subarray(v+16,v+16+len));}}\
@@ -1706,7 +1707,10 @@ fn vector_diff_programs() -> Vec<(String, &'static str)> {
 fn vectors_interp_matches_compiled() {
     let progs = vector_diff_programs();
     let cc = cc_available();
+    let node = node_available();
     let mut native_checked = 0u64;
+    let mut wasm_ran = 0u64;
+    let mut wasm_gated = 0u64;
 
     for (src, expected) in &progs {
         // Oracle: tree-walking interpreter.
@@ -1731,24 +1735,193 @@ fn vectors_interp_matches_compiled() {
             native_checked += 1;
         }
 
-        // The wasm backend must cleanly REJECT vectors (never compile/panic).
+        // The wasm backend now RUNS vectors fully INSIDE a program: every vec_*
+        // op is real wasm. A program whose `main` RETURNS a Vector is the one
+        // gated case (the shared Node harness only renders Int/Float/String — a
+        // `Vector[..]` rendering needs an in-wasm float formatter, out of scope);
+        // such programs are rejected cleanly (never a panic / wrong number).
+        // Detect the gated case by the expected output being a `Vector[..]`
+        // rendering, and assert the gate; otherwise compile, run (node-gated),
+        // and require an identical result with a garbage-free heap (live == 0).
+        let main_returns_vector = expected.starts_with("Vector[");
         let bytes = wasm::compile(&prog);
-        assert!(
-            bytes.is_err(),
-            "wasm backend unexpectedly accepted a vector program\n{}",
-            src
-        );
-        assert!(
-            bytes.unwrap_err().contains("vectors are not yet supported"),
-            "wasm rejection message should mention vectors\n{}",
-            src
-        );
+        if main_returns_vector {
+            assert!(
+                bytes.is_err(),
+                "wasm should gate a Vector-returning main\n{}",
+                src
+            );
+            let msg = bytes.unwrap_err();
+            assert!(
+                msg.contains("Vector return is gated") || msg.contains("Bytes or Vector return"),
+                "wasm gate message should mention the gated Vector return\n{}\n got: {}",
+                src,
+                msg
+            );
+            wasm_gated += 1;
+        } else {
+            let bytes =
+                bytes.unwrap_or_else(|e| panic!("wasm compile failed (should run): {}\n{}", e, src));
+            if node {
+                let (w, live) = run_wasm_live(&bytes)
+                    .unwrap_or_else(|e| panic!("wasm runner failed: {}\n{}", e, src));
+                assert_eq!(w, *expected, "wasm != expected\n{}\n wasm={}", src, w);
+                assert_eq!(live, 0, "wasm leaked {} cell(s)\n{}", live, src);
+                wasm_ran += 1;
+            }
+        }
     }
 
     eprintln!(
-        "vectors_interp_matches_compiled: {} programs ({} native)",
+        "vectors_interp_matches_compiled: {} programs ({} native, {} wasm ran, {} wasm gated)",
         progs.len(),
-        native_checked
+        native_checked,
+        wasm_ran,
+        wasm_gated
+    );
+}
+
+/// Vectors USED inside a wasm program (built, mutated FBIP, dot/cosine/norm/add/
+/// scale, compared, printed element-by-element, round-tripped through an Array)
+/// run fully under wasm and match the interpreter oracle byte-for-byte, with a
+/// garbage-free heap (`__live == 0`). These each return a SCALAR so the shared
+/// Node harness renders them — exercising the full vec_* surface that the gated
+/// Vector-return cases in `vectors_interp_matches_compiled` can't show end-to-end.
+/// Also covers the clean TRAP on a length mismatch / out-of-range index.
+#[test]
+fn vectors_run_in_wasm_matches_interp() {
+    if !node_available() {
+        return;
+    }
+    // (source, expected). Each `main` returns a SCALAR (so the Node harness
+    // renders it cleanly — no intermediate prints to pollute stdout). Trap cases
+    // use "TRAP".
+    let cases: &[(&str, &str)] = &[
+        // zero-norm cosine policy (all-zero operand) -> 0.0, never NaN.
+        (
+            "fn main() -> Float = vec_cosine(vec_from_array([1.0,2.0]), vec_from_array([0.0,0.0]))\n",
+            "0",
+        ),
+        // cosine of parallel vectors = 1.
+        (
+            "fn main() -> Float = vec_cosine(vec_from_array([1.0,0.0]), vec_from_array([1.0,0.0]))\n",
+            "1",
+        ),
+        // cosine of orthogonal vectors = 0.
+        (
+            "fn main() -> Float = vec_cosine(vec_from_array([1.0,0.0]), vec_from_array([0.0,1.0]))\n",
+            "0",
+        ),
+        // norm: sqrt(9+16) = 5.
+        (
+            "fn main() -> Float = vec_norm(vec_from_array([3.0, 4.0]))\n",
+            "5",
+        ),
+        // dot product = 32.
+        (
+            "fn main() -> Float = vec_dot(vec_from_array([1.0,2.0,3.0]), vec_from_array([4.0,5.0,6.0]))\n",
+            "32",
+        ),
+        // vec_add (FBIP in-place, a unique) then read the last element back = 9.
+        (
+            "fn main() -> Float = {\n\
+               let c = vec_add(vec_from_array([1.0,2.0,3.0]), vec_from_array([4.0,5.0,6.0]));\n\
+               vec_get(c, 0) + vec_get(c, 1) + vec_get(c, 2)\n\
+             }\n",
+            "21",
+        ),
+        // scale (FBIP) then dot; 2*[1,2,3]·[4,5,6] = 64.
+        (
+            "fn main() -> Float =\n\
+               vec_dot(vec_scale(vec_from_array([1.0,2.0,3.0]), 2.0), vec_from_array([4.0,5.0,6.0]))\n",
+            "64",
+        ),
+        // copy-on-write: a shared vector scaled, original unchanged. 30 + 3 = 33.
+        (
+            "fn use2(v: Vector) -> Float = vec_get(vec_scale(v, 10.0), 0) + vec_get(v, 0)\n\
+             fn main() -> Float = use2(vec_from_array([3.0, 0.0]))\n",
+            "33",
+        ),
+        // copy-on-write on vec_add: original first element survives. a0=1, b0=11.
+        (
+            "fn main() -> Float = {\n\
+               let a = vec_from_array([1.0, 2.0, 3.0]);\n\
+               let a2 = a;\n\
+               let b = vec_add(a, vec_from_array([10.0, 10.0, 10.0]));\n\
+               vec_get(a2, 0) + vec_get(b, 0)\n\
+             }\n",
+            "12",
+        ),
+        // from_array/to_array round-trip + index.
+        (
+            "fn main() -> Float = {\n\
+               let xs = vec_to_array(vec_from_array([7.0, 8.0, 9.0]));\n\
+               xs[1]\n\
+             }\n",
+            "8",
+        ),
+        // FBIP push loop builds 100 ones; sum = 100.
+        (
+            "fn build(n: Int, acc: Vector) -> Vector =\n\
+               if n == 0 { acc } else { build(n - 1, vec_push(acc, 1.0)) }\n\
+             fn sumv(v: Vector, i: Int, n: Int, acc: Float) -> Float =\n\
+               if i == n { acc } else { sumv(v, i + 1, n, acc + vec_get(v, i)) }\n\
+             fn main() -> Float = sumv(build(100, vec_new()), 0, 100, 0.0)\n",
+            "100",
+        ),
+        // equality holds (-> 1); a Vector never equals one of a different length.
+        (
+            "fn main() -> Int =\n\
+               if vec_from_array([1.0,2.0]) == vec_from_array([1.0,2.0]) { 1 } else { 0 }\n",
+            "1",
+        ),
+        // inequality (different element) -> 0.
+        (
+            "fn main() -> Int =\n\
+               if vec_from_array([1.0,2.0]) == vec_from_array([1.0,3.0]) { 1 } else { 0 }\n",
+            "0",
+        ),
+        // length mismatch in `==` -> not equal -> 0.
+        (
+            "fn main() -> Int =\n\
+               if vec_from_array([1.0]) == vec_from_array([1.0,2.0]) { 1 } else { 0 }\n",
+            "0",
+        ),
+        // length-mismatch dot -> clean TRAP.
+        (
+            "fn main() -> Float = vec_dot(vec_from_array([1.0,2.0]), vec_from_array([1.0,2.0,3.0]))\n",
+            "TRAP",
+        ),
+        // out-of-range index -> clean TRAP.
+        (
+            "fn main() -> Float = vec_get(vec_from_array([1.0,2.0]), 5)\n",
+            "TRAP",
+        ),
+    ];
+    for (src, expected) in cases {
+        // Interp oracle (skip for the trap cases, which are runtime errors).
+        if *expected != "TRAP" {
+            let interp = ast_run(src).unwrap_or_else(|e| panic!("interp failed: {}\n{}", e, src));
+            assert_eq!(&interp, expected, "interp mismatch\n{}", src);
+        } else {
+            assert!(ast_run(src).is_err(), "interp should error (trap)\n{}", src);
+        }
+        let prog = parser::parse(lexer::lex(src).expect("lex")).expect("parse");
+        assert!(typeck::check(&prog).is_ok(), "type error\n{}", src);
+        let bytes = wasm::compile(&prog)
+            .unwrap_or_else(|e| panic!("wasm compile failed: {}\n{}", e, src));
+        let (w, live) =
+            run_wasm_live(&bytes).unwrap_or_else(|e| panic!("wasm runner failed: {}\n{}", e, src));
+        if *expected == "TRAP" {
+            assert_eq!(w, "TRAP", "wasm should trap cleanly\n{}\n got={}", src, w);
+        } else {
+            assert_eq!(w, *expected, "wasm != expected\n{}\n wasm={}", src, w);
+            assert_eq!(live, 0, "wasm leaked {} cell(s)\n{}", live, src);
+        }
+    }
+    eprintln!(
+        "vectors_run_in_wasm_matches_interp: {} programs ran under wasm",
+        cases.len()
     );
 }
 
