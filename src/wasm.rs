@@ -861,6 +861,7 @@ enum HeapHelper {
     VecNorm,    // (a:i32) -> f64         L2 norm = sqrt(dot(a,a)); CONSUMES a
     VecCosine,  // (a:i32, b:i32) -> f64  cosine (zero-norm -> 0.0, traps on mismatch); CONSUMES both
     VecAdd,     // (a:i32, b:i32) -> ptr:i32  elementwise add (FBIP, traps on mismatch); CONSUMES both
+    VecSub,     // (a:i32, b:i32) -> ptr:i32  elementwise sub (FBIP, traps on mismatch); CONSUMES both
     VecScale,   // (a:i32, s:f64) -> ptr:i32  scale by s (FBIP); CONSUMES a
     VecEq,      // (a:i32, b:i32) -> i32  structural equality (len+elems); does NOT consume operands
     // ---- ordered Map / Set runtime (sorted association / element buffer) ----
@@ -896,7 +897,7 @@ enum HeapHelper {
 }
 
 impl HeapHelper {
-    const ALL: [HeapHelper; 81] = [
+    const ALL: [HeapHelper; 82] = [
         HeapHelper::Alloc,
         HeapHelper::Free,
         HeapHelper::Dup,
@@ -978,6 +979,7 @@ impl HeapHelper {
         HeapHelper::SetShow,
         HeapHelper::TensorRow,
         HeapHelper::TensorFromRows,
+        HeapHelper::VecSub,
     ];
 
     fn offset(self) -> u32 {
@@ -1063,6 +1065,7 @@ impl HeapHelper {
             HeapHelper::SetShow => 78,
             HeapHelper::TensorRow => 79,
             HeapHelper::TensorFromRows => 80,
+            HeapHelper::VecSub => 81,
         }
     }
 
@@ -1124,6 +1127,7 @@ impl HeapHelper {
             HeapHelper::VecNorm => (vec![WType::I32], WType::F64),
             HeapHelper::VecCosine => (vec![WType::I32, WType::I32], WType::F64),
             HeapHelper::VecAdd => (vec![WType::I32, WType::I32], WType::I32),
+            HeapHelper::VecSub => (vec![WType::I32, WType::I32], WType::I32),
             HeapHelper::VecScale => (vec![WType::I32, WType::F64], WType::I32),
             HeapHelper::VecEq => (vec![WType::I32, WType::I32], WType::I32),
             HeapHelper::KeyCmp => (vec![WType::I64, WType::I64, WType::I64], WType::I32),
@@ -2850,6 +2854,7 @@ fn is_vec_builtin(name: &str) -> bool {
             | "vec_norm"
             | "vec_cosine"
             | "vec_add"
+            | "vec_sub"
             | "vec_scale"
     )
 }
@@ -2857,7 +2862,9 @@ fn is_vec_builtin(name: &str) -> bool {
 /// The wasm result type of a Vector builtin, or `None` if `name` is not one.
 fn vec_builtin_ret(name: &str) -> Option<WType> {
     Some(match name {
-        "vec_new" | "vec_from_array" | "vec_push" | "vec_add" | "vec_scale" => WType::Vector,
+        "vec_new" | "vec_from_array" | "vec_push" | "vec_add" | "vec_sub" | "vec_scale" => {
+            WType::Vector
+        }
         "vec_to_array" => WType::Array(ElemKind::Float),
         "vec_len" => WType::I64,
         "vec_get" | "vec_dot" | "vec_norm" | "vec_cosine" => WType::F64,
@@ -2928,6 +2935,11 @@ fn emit_vec_builtin(
         "vec_add" => (
             vec![WType::Vector, WType::Vector],
             HeapHelper::VecAdd,
+            WType::Vector,
+        ),
+        "vec_sub" => (
+            vec![WType::Vector, WType::Vector],
+            HeapHelper::VecSub,
             WType::Vector,
         ),
         "vec_scale" => (
@@ -8739,11 +8751,13 @@ fn emit_heap_helper(
                 body,
             )
         }
-        HeapHelper::VecAdd => {
+        HeapHelper::VecAdd | HeapHelper::VecSub => {
             // (a:i32, b:i32) -> ptr:i32. Trap on length mismatch. FBIP: if a.rc==1
-            // add b into a in place (reuses++, drop b, return a); else clone a,
-            // add b, drop both, return clone. Locals: n(2,i32), i(3,i32),
+            // combine b into a in place (reuses++, drop b, return a); else clone a,
+            // combine b, drop both, return clone. `VecAdd` uses f64.add, `VecSub`
+            // uses f64.sub (the ONLY difference). Locals: n(2,i32), i(3,i32),
             // out(4,i32), x(5,f64).
+            let f64_op: u8 = if matches!(h, HeapHelper::VecSub) { 0xA1 } else { 0xA0 };
             // if a.len != b.len -> trap
             body.push(LOCAL_GET);
             leb_u(0, &mut body);
@@ -8796,12 +8810,12 @@ fn emit_heap_helper(
             body.push(BT_VOID);
             // addr_out = out + VEC_HEADER + 8*i  (kept for store)
             vec_elem_addr(&mut body, 4, 3);
-            // value = out[i] + b[i]
+            // value = out[i] (+/-) b[i]
             vec_elem_addr(&mut body, 4, 3);
             f64_load(0, &mut body);
             vec_elem_addr(&mut body, 1, 3);
             f64_load(0, &mut body);
-            body.push(0xA0); // f64.add
+            body.push(f64_op); // f64.add (VecAdd) or f64.sub (VecSub)
             f64_store(0, &mut body);
             // i++
             body.push(LOCAL_GET);
@@ -13853,7 +13867,7 @@ mod tests {
     fn heap_helper_offsets_match_all_order() {
         assert_eq!(
             HeapHelper::ALL.len(),
-            81,
+            82,
             "HeapHelper::ALL length changed — update offset()/sig() and this count together"
         );
         for (i, h) in HeapHelper::ALL.iter().enumerate() {

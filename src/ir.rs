@@ -177,6 +177,7 @@ const IR_BUILTINS: &[&str] = &[
     "vec_norm",
     "vec_cosine",
     "vec_add",
+    "vec_sub",
     "vec_scale",
 ];
 
@@ -510,6 +511,18 @@ impl Lowerer {
                          native backend `aria native-run`: builtin `{}`",
                         name
                     )));
+                }
+                // `grad` (reverse-mode autodiff) runs the differentiated function
+                // over a tape that lives in the tree-walking interpreter only.
+                // Reject it on every compiled/IR path with a specific message.
+                if name == "grad" {
+                    return Err(LowerError(
+                        "grad (reverse-mode autodiff) is only supported in the \
+                         interpreter (`aria run`); the compiled backends \
+                         (native/wasm) and the IR memory path (`aria mem`) cannot \
+                         run it"
+                            .to_string(),
+                    ));
                 }
                 // Builtins the IR doesn't implement (tensors/RAG/compression) are
                 // outside the IR subset — reject at lowering with a clear message

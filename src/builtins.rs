@@ -156,7 +156,24 @@ fn build_signatures() -> Vec<(&'static str, Vec<Ty>, Ty)> {
         ("vec_norm", vec![vector()], Float),
         ("vec_cosine", vec![vector(), vector()], Float),
         ("vec_add", vec![vector(), vector()], vector()),
+        ("vec_sub", vec![vector(), vector()], vector()),
         ("vec_scale", vec![vector(), Float], vector()),
+        // ---- Reverse-mode automatic differentiation -------------------------
+        // `grad(f, x)` returns the gradient `∂f/∂x` of a scalar function of a
+        // Vector, at the point `x`, by ONE reverse-mode (tape) backward pass —
+        // O(1) in the number of inputs, the correct asymptotics for training.
+        //
+        // INTERPRETER-ONLY. `f` is function-typed (`Ty::Fn`), which the compiled
+        // backends already reject (only the interpreter executes function
+        // values). The interpreter evaluates `f` over a tracing Vector, records a
+        // Wengert tape of every differentiable scalar/vector op, seeds the scalar
+        // output's adjoint to 1.0, and sweeps the tape backward to read the input
+        // adjoints. Supported differentiable op set (anything else inside `f`
+        // raises a clean "grad: unsupported operation" error, never a panic):
+        // Float `+ - * /` and unary negate; `vec_get`, `vec_dot`, `vec_add`,
+        // `vec_sub`, `vec_scale`, `vec_norm`, and `vec_from_array`/`vec_push`
+        // built from tracing elements.
+        ("grad", vec![Fn(vec![vector()], Box::new(Float)), vector()], vector()),
     ]
 }
 

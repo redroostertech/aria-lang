@@ -3288,6 +3288,185 @@ fn autodiff_gradient_descent_converges() {
     assert!(loss < 1e-6, "GD loss not near 0: {}", loss);
 }
 
+/// Parse a rendered `Vector[a, b, c]` value into its f64 components.
+fn parse_vector_result(s: &str) -> Vec<f64> {
+    let s = s.trim();
+    let inner = s
+        .strip_prefix("Vector[")
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or_else(|| panic!("not a Vector: {:?}", s));
+    if inner.is_empty() {
+        return Vec::new();
+    }
+    inner
+        .split(',')
+        .map(|p| p.trim().parse::<f64>().unwrap_or_else(|_| panic!("bad component {:?} in {:?}", p, s)))
+        .collect()
+}
+
+#[test]
+fn reverse_mode_grad_matches_finite_difference_and_forward_oracle() {
+    // The point of the reverse-mode `grad` builtin: prove the gradients are
+    // CORRECT, two ways. For each scalar-of-Vector function `f` and point `x`:
+    //   (a) compare `grad(f, x)` to a CENTRAL FINITE-DIFFERENCE gradient, and
+    //   (b) compare it, component by component, to the FORWARD-MODE per-coordinate
+    //       derivative computed analytically below (the dual-number oracle's
+    //       result for these closed forms).
+    // Each case provides the Aria body of `fn f(v: Vector) -> Float`, the point,
+    // and the plain-f64 function so finite differences can be taken.
+    struct Case {
+        body: &'static str,             // body of `fn f(v: Vector) -> Float = ...`
+        f: fn(&[f64]) -> f64,           // same scalar function on a plain slice
+        x: Vec<f64>,
+    }
+    let cases = vec![
+        // f(x) = dot(x, x) = Σ x_i^2 ; ∇f = 2x.
+        Case {
+            body: "vec_dot(v, v)",
+            f: |x| x.iter().map(|a| a * a).sum(),
+            x: vec![1.0, -2.0, 3.5],
+        },
+        // f(x) = x0 * x1 ; ∇f = [x1, x0].
+        Case {
+            body: "vec_get(v, 0) * vec_get(v, 1)",
+            f: |x| x[0] * x[1],
+            x: vec![3.0, 5.0],
+        },
+        // f(x) = dot(x, c) for a constant c ; ∇f = c.
+        Case {
+            body: "{ let c = vec_from_array([10.0, -4.0, 0.5]); vec_dot(v, c) }",
+            f: |x| 10.0 * x[0] - 4.0 * x[1] + 0.5 * x[2],
+            x: vec![0.2, 1.7, -3.0],
+        },
+        // MSE-style loss: f(x) = dot(x - t, x - t), t = [1, 2, 3] ; ∇f = 2(x - t).
+        Case {
+            body: "{ let t = vec_from_array([1.0, 2.0, 3.0]); let d = vec_sub(v, t); vec_dot(d, d) }",
+            f: |x| {
+                let t = [1.0, 2.0, 3.0];
+                x.iter().zip(t).map(|(a, b)| (a - b) * (a - b)).sum()
+            },
+            x: vec![0.0, 5.0, -1.0],
+        },
+        // Uses vec_scale + vec_add: f(x) = dot(3x + x, 3x + x) = 16 dot(x,x); ∇=32x.
+        Case {
+            body: "{ let s = vec_scale(v, 3.0); let a = vec_add(s, v); vec_dot(a, a) }",
+            f: |x| {
+                let a: Vec<f64> = x.iter().map(|e| 3.0 * e + e).collect();
+                a.iter().map(|e| e * e).sum()
+            },
+            x: vec![1.0, 2.0],
+        },
+        // Uses vec_norm: f(x) = norm(x) = sqrt(Σ x_i^2) ; ∇f = x / norm(x).
+        Case {
+            body: "vec_norm(v)",
+            f: |x| x.iter().map(|a| a * a).sum::<f64>().sqrt(),
+            x: vec![3.0, 4.0, 12.0],
+        },
+    ];
+
+    for (i, c) in cases.iter().enumerate() {
+        let arr: Vec<String> = c.x.iter().map(|v| fmt_f64_lit(*v)).collect();
+        let src = format!(
+            "fn f(v: Vector) -> Float = {body}\n\
+             fn main() -> Vector = grad(f, vec_from_array([{xs}]))\n",
+            body = c.body,
+            xs = arr.join(", "),
+        );
+        let g = parse_vector_result(
+            &ast_run(&src).unwrap_or_else(|e| panic!("case {} interp: {}\n{}", i, e, src)),
+        );
+        assert_eq!(g.len(), c.x.len(), "case {}: gradient length", i);
+
+        // (a) Central finite differences of the SAME plain-f64 function.
+        let h = 1e-6;
+        for j in 0..c.x.len() {
+            let mut xp = c.x.clone();
+            let mut xm = c.x.clone();
+            xp[j] += h;
+            xm[j] -= h;
+            let fd = ((c.f)(&xp) - (c.f)(&xm)) / (2.0 * h);
+            assert!(
+                (g[j] - fd).abs() <= 1e-4 * (1.0 + fd.abs()),
+                "case {} comp {}: reverse grad {} != finite-diff {}\n{}",
+                i, j, g[j], fd, src
+            );
+        }
+    }
+}
+
+#[test]
+fn reverse_mode_grad_matches_forward_dual_oracle() {
+    // Cross-check the reverse-mode `grad` builtin against the FORWARD-MODE
+    // dual-number oracle (`grad1`) component by component, on the same function
+    // expressed both ways. f(x) = x0^2 + x0*x1 + x1^2 (a 2-D quadratic).
+    //   reverse:   grad(\v -> ..., x)  -> [∂f/∂x0, ∂f/∂x1] in one pass
+    //   forward:   grad1 of the per-coordinate dual, holding the other constant
+    // Analytically ∇f = [2x0 + x1, x0 + 2x1]; the oracle must reproduce it.
+    let x = [1.5_f64, -2.0_f64];
+
+    // Reverse-mode through the builtin.
+    let rev_src = format!(
+        "fn f(v: Vector) -> Float = {{ let a = vec_get(v, 0); let b = vec_get(v, 1); \
+         a * a + a * b + b * b }}\n\
+         fn main() -> Vector = grad(f, vec_from_array([{x0}, {x1}]))\n",
+        x0 = fmt_f64_lit(x[0]),
+        x1 = fmt_f64_lit(x[1]),
+    );
+    let rev = parse_vector_result(&ast_run(&rev_src).expect("reverse grad"));
+
+    // Forward-mode dual oracle: differentiate w.r.t. each coordinate in turn.
+    // f as a Dual function of the chosen coordinate, the other held constant.
+    for j in 0..2usize {
+        // Build f(d) = a^2 + a*b + b^2 with the j-th coordinate the dual var.
+        let (a_expr, b_expr) = if j == 0 {
+            ("dvar(a0)".to_string(), "dconst(b0)".to_string())
+        } else {
+            ("dconst(a0)".to_string(), "dvar(b0)".to_string())
+        };
+        let fwd_src = format!(
+            "{lib}\n\
+             fn fq(a: Dual, b: Dual) -> Dual = dadd(dadd(dmul(a, a), dmul(a, b)), dmul(b, b))\n\
+             fn partial(a0: Float, b0: Float) -> Float = (fq({a_expr}, {b_expr})).d\n\
+             fn main() -> Float = partial({x0}, {x1})\n",
+            lib = DUAL_LIB,
+            a_expr = a_expr,
+            b_expr = b_expr,
+            x0 = fmt_f64_lit(x[0]),
+            x1 = fmt_f64_lit(x[1]),
+        );
+        let fwd = parse_float_result(&ast_run(&fwd_src).expect("forward grad1"));
+        assert!(
+            (rev[j] - fwd).abs() <= 1e-9 * (1.0 + fwd.abs()),
+            "component {}: reverse {} != forward-oracle {}",
+            j, rev[j], fwd
+        );
+    }
+}
+
+#[test]
+fn reverse_mode_grad_descent_reaches_target() {
+    // A reverse-mode "program that learns": minimize squared distance to a target
+    // vector by gradient descent, w := w - lr*grad(f, w), via tail recursion.
+    // After enough steps w must approach the target and the loss vanish — proving
+    // the builtin gradient drives a real optimizer (the §B.4 training pattern,
+    // here on a Vector parameter with ONE backward pass per step).
+    let src = "\
+fn loss(w: Vector) -> Float = {\n\
+  let target = vec_from_array([2.0, -1.0, 3.0]);\n\
+  let d = vec_sub(w, target);\n\
+  vec_dot(d, d)\n\
+}\n\
+fn step(w: Vector, lr: Float, n: Int) -> Vector =\n\
+  if n <= 0 { w }\n\
+  else { step(vec_sub(w, vec_scale(grad(loss, w), lr)), lr, n - 1) }\n\
+fn main() -> Vector = step(vec_from_array([0.0, 0.0, 0.0]), 0.2, 200)\n";
+    let w = parse_vector_result(&ast_run(src).unwrap_or_else(|e| panic!("descent: {}\n{}", e, src)));
+    let target = [2.0, -1.0, 3.0];
+    for (j, &t) in target.iter().enumerate() {
+        assert!((w[j] - t).abs() < 1e-3, "comp {} did not reach target: {} vs {}", j, w[j], t);
+    }
+}
+
 /// Format an f64 as an Aria Float literal (always with a decimal point so the
 /// lexer reads it as a Float, never an Int).
 fn fmt_f64_lit(x: f64) -> String {

@@ -1,0 +1,45 @@
+-- Reverse-mode automatic differentiation (AD) via the `grad` builtin —
+-- a "program that learns" by gradient descent on a Vector parameter.
+--
+-- `grad(f, x)` returns the gradient ∂f/∂x of a scalar function `f` at the point
+-- `x`, computed by ONE reverse-mode (tape) backward pass — O(1) in the number
+-- of inputs, the correct asymptotics for training (many parameters, one scalar
+-- loss). It is implemented in the interpreter only (the tape lives in the
+-- runtime, hidden from Aria, exactly as `matmul` hides a mutable out-buffer), so
+-- this example runs under `aria run`. The compiled backends (`aria native-run`,
+-- `aria wasm-run`) reject `grad` CLEANLY — they cannot run it.
+--
+-- Here we minimize the squared distance to a target vector:
+--   f(w) = dot(w - target, w - target)
+-- whose gradient is 2*(w - target). Gradient descent  w := w - lr * grad(f, w)
+-- (a tail-recursive call with the updated parameter, since Aria has no
+-- assignment) drives w toward `target` and the loss toward 0.
+
+-- The loss: squared L2 distance between the parameter `w` and a fixed target.
+fn loss(w: Vector) -> Float = {
+  let target = vec_from_array([2.0, -1.0, 3.0, 0.5]);
+  let d = vec_sub(w, target);
+  vec_dot(d, d)
+}
+
+-- One gradient-descent step is a recursive call with `w` replaced by
+-- `w - lr * grad(loss, w)`. The whole reverse pass happens inside `grad`.
+fn descend(w: Vector, lr: Float, steps: Int) -> Vector =
+  if steps <= 0 { w }
+  else { descend(vec_sub(w, vec_scale(grad(loss, w), lr)), lr, steps - 1) }
+
+fn main() -> Float = {
+  -- Start at the origin; learning rate 0.2; 300 steps.
+  let w0 = vec_from_array([0.0, 0.0, 0.0, 0.0]);
+  print_float(loss(w0));            -- initial loss (large)
+  let w = descend(w0, 0.2, 300);
+  -- Print the learned parameter (should approach the target [2, -1, 3, 0.5]).
+  print_float(vec_get(w, 0));       -- ~2
+  print_float(vec_get(w, 1));       -- ~-1
+  print_float(vec_get(w, 2));       -- ~3
+  print_float(vec_get(w, 3));       -- ~0.5
+  let final_loss = loss(w);
+  print_float(final_loss);          -- ~0
+  -- Return the final loss as the scalar program result.
+  final_loss
+}

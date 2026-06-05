@@ -770,7 +770,7 @@ fn builtin_ret(name: &str) -> Option<CType> {
         "bytes_new" | "bytes_set" | "bytes_push" | "bytes_from_str" => Some(CType::Bytes),
         "bytes_len" | "bytes_get" => Some(CType::Int),
         // Vector / embedding builtins (non-generic; no element-kind suffix).
-        "vec_new" | "vec_from_array" | "vec_push" | "vec_add" | "vec_scale" => {
+        "vec_new" | "vec_from_array" | "vec_push" | "vec_add" | "vec_sub" | "vec_scale" => {
             Some(CType::Vector)
         }
         "vec_to_array" => Some(CType::Array(ElemKind::Float)),
@@ -1633,6 +1633,18 @@ fn emit_builtin(
             let (_, a) = emit_atom(&args[0], env, out)?;
             let (_, b) = emit_atom(&args[1], env, out)?;
             let _ = writeln!(out, "{}{} = aria_vec_add({}, {});", ind, dst, a, b);
+            Ok(())
+        }
+        "vec_sub" => {
+            if args.len() != 2
+                || atom_type(&args[0], env)? != CType::Vector
+                || atom_type(&args[1], env)? != CType::Vector
+            {
+                return Err("c backend: vec_sub expects (Vector, Vector)".into());
+            }
+            let (_, a) = emit_atom(&args[0], env, out)?;
+            let (_, b) = emit_atom(&args[1], env, out)?;
+            let _ = writeln!(out, "{}{} = aria_vec_sub({}, {});", ind, dst, a, b);
             Ok(())
         }
         "vec_scale" => {
@@ -2942,6 +2954,21 @@ static void* aria_vec_add(void* a, void* b) {
     }
     AriaVector* n = aria_vec_clone(x);
     for (int64_t i = 0; i < n->len; i++) n->elems[i] += y->elems[i];
+    aria_vec_drop(a); aria_vec_drop(b);
+    return (void*)n;
+}
+/* Elementwise difference x - y. FBIP when the left operand is unique. */
+static void* aria_vec_sub(void* a, void* b) {
+    AriaVector* x = (AriaVector*)a; AriaVector* y = (AriaVector*)b;
+    if (x->len != y->len) aria_trap_msg("vector length mismatch");  /* clean trap */
+    if (x->rc == 1) {
+        for (int64_t i = 0; i < x->len; i++) x->elems[i] -= y->elems[i];
+        aria_reuses++;
+        aria_vec_drop(b);
+        return a;
+    }
+    AriaVector* n = aria_vec_clone(x);
+    for (int64_t i = 0; i < n->len; i++) n->elems[i] -= y->elems[i];
     aria_vec_drop(a); aria_vec_drop(b);
     return (void*)n;
 }

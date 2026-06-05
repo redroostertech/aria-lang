@@ -68,8 +68,13 @@ ground truth from the current source is:
 
 ### What is conspicuously absent for "learning / adapting"
 
-- **No automatic differentiation. No gradients. No `backward`/`grad`.** Nothing in
-  the tree computes a derivative. This is *the* gap for Capability 1.
+- ~~**No automatic differentiation. No gradients. No `backward`/`grad`.**~~
+  *(Updated 2026-06 — see §G.4.)* Aria now has **both** forward-mode AD (dual
+  numbers in pure Aria, `examples/autodiff.aria`) **and** a reverse-mode `grad`
+  builtin (tape-based, one backward pass, **interpreter-only**) validated against
+  finite differences and the forward oracle. The remaining gap for Capability 1 is
+  bringing `grad` to the **compiled** backends (a native tape runtime or the
+  source-to-source adjoint of §B.1 Option 3) and the speed/persistence work below.
 - **Scalar f32 kernels only.** `src/tensor.rs` and the C runtime are triple-nested
   scalar loops — **no BLAS, no SIMD, no Accelerate/Metal/CUDA.** Fine for tiny
   demos, orders of magnitude off real training.
@@ -686,11 +691,86 @@ needs the gradient on the native backend — a later step that either (i)
 monomorphizes a source-to-source adjoint, §B.1 Option 3 / Phase 3a, or (ii) adds a
 native tape runtime mirroring the interpreter one).
 
-### G.4 Summary
+### G.4 Reverse-mode `grad` — IMPLEMENTED (interpreter, 2026-06)
+
+The 5-step plan above is now **built and validated** as an **interpreter-only**
+builtin:
+
+```aria
+grad(f: (Vector) -> Float, x: Vector) -> Vector   -- ∂f/∂x, one backward pass
+```
+
+**Design as shipped.** A `Tape` (Wengert list) of `TapeNode { value, parents:
+Vec<(parent_id, local_partial)> }` lives in a thread-local `RefCell<Option<Tape>>`
+(`src/interp.rs`) that is set **only** for the duration of `f`'s evaluation inside a
+`grad` call — the mutation is scoped entirely to the builtin and never observable
+from Aria, mirroring how `matmul` hides its mutable out-buffer. Two new `Value`
+variants flow where a `Float`/`Vector` would *inside the trace only*:
+`Value::Tracing(node_id)` (a tracing scalar) and `Value::TracingVec(Vec<node_id>)`
+(the differentiated Vector argument). `grad(f, x)` builds one leaf node per input
+coordinate, feeds `f` a `TracingVec` of them, runs `f` via the normal
+`apply_value` closure call, seeds the scalar output's adjoint to 1.0, sweeps the
+tape backward (`parent.adj += node.adj * local_partial`), and returns the input
+leaves' adjoints as a `Vector`.
+
+**Zero overhead / no behavior change for non-grad code.** `eval_binary`, unary
+negate, and the vector builtins branch into the tape path **only when an operand
+is already tracing** — impossible outside a `grad` call. Normal programs never
+construct or observe a tracing value, so the hot path is unchanged (the 4-backend
+differential fuzzer stays bit-for-bit green).
+
+**Supported differentiable op set.** Float `+ - * /` and unary negate (recorded in
+`eval_binary`/`Unary`), plus the vector ops `vec_get`, `vec_dot`, `vec_add`,
+`vec_sub` (newly added — elementwise difference, FBIP, on all 3 backends),
+`vec_scale` (scalar factor may itself be tracing), `vec_norm` (∂‖x‖/∂xᵢ = xᵢ/‖x‖,
+with the 0-norm gradient defined as 0 to avoid NaN), and constructing a tracing
+Vector via `vec_from_array`/`vec_push` of tracing elements. **Any other operation
+on a differentiated value raises a CLEAN error** — `grad: unsupported operation
+\`X\` on a differentiated value` — never a panic and never a silently-wrong
+gradient. Control flow (`if`/`match`, recursion) inside `f` is traced *by value*
+automatically, since the interpreter takes the actual branch during the forward
+trace (the checkpoint/trace problem does not arise for a tape-based interpreter
+reverse mode).
+
+**Interpreter-only, gated cleanly elsewhere.** `f` is function-typed (`Ty::Fn`),
+which the compiled backends already reject. The IR lowering (`src/ir.rs`) adds an
+explicit, specific gate so `aria native-run` / `aria wasm-run` / `aria mem` all
+fail with `grad (reverse-mode autodiff) is only supported in the interpreter
+(\`aria run\`); the compiled backends (native/wasm) and the IR memory path (\`aria
+mem\`) cannot run it` — a clean error, no panic. **Path to compiled-backend
+support:** the tape would need to be emitted/threaded into the native runtime —
+either a native tape runtime mirroring the interpreter one, or the source-to-source
+adjoint of §B.1 Option 3 / Phase 3a (where Aria's immutability is a decisive
+advantage). The type checker required **no changes**: the existing builtin-call
+path already checks a lambda argument bidirectionally against `(Vector)->Float`.
+
+**Validation (the gradients are CORRECT, not merely produced).** New tests in
+`src/proptest.rs`:
+- `reverse_mode_grad_matches_finite_difference_and_forward_oracle` — for
+  `dot(x,x)` (∇=2x), `x0*x1` (∇=[x1,x0]), `dot(x,c)` (∇=c), an MSE-style
+  `dot(x−t,x−t)` (∇=2(x−t)), a `vec_scale`+`vec_add` case (∇=32x), and `vec_norm`
+  (∇=x/‖x‖), asserts each reverse-mode component matches a **central
+  finite-difference** gradient within tolerance.
+- `reverse_mode_grad_matches_forward_dual_oracle` — cross-checks `grad` against the
+  **forward-mode dual `grad1` oracle** (G.1) component-by-component on a 2-D
+  quadratic, to ~1e-9.
+- `reverse_mode_grad_descent_reaches_target` — a reverse-mode "program that
+  learns": `w := w − lr·grad(loss, w)` (tail recursion) on squared distance to a
+  target reaches the target within 1e-3.
+
+**Demo.** `examples/grad.aria` minimizes `f(w)=dot(w−target, w−target)` by
+reverse-mode gradient descent on a 4-element Vector parameter: from the origin,
+`aria run examples/grad.aria` drives `w` to the target `[2,−1,3,0.5]` with the
+loss falling from 14.25 to ~2.6e-31. `aria native-run`/`aria wasm-run` reject it
+cleanly (it is interp-only). Test count: **339 → 342**, all green
+(`RUST_MIN_STACK=536870912 cargo test`); `"grad"` added to the GBNF acceptor
+corpus.
+
+### G.5 Summary
 
 | Capability | Status after spike |
 |---|---|
 | Forward-mode AD (dual numbers), pure Aria | **DONE** — `examples/autodiff.aria`, all 3 backends identical, garbage-free |
 | A program that *learns* (GD on a loss) | **DONE** — `(x-3)^2`→3 and a line-fit recovering `y=2x+1` |
-| Correctness proof (AD vs finite-diff) | **DONE** — 2 new tests, 330 green |
-| Reverse-mode `grad` builtin | **DESIGNED** (typeck is ready; runtime tape deferred as not-low-risk) — precise 5-step plan above |
+| Correctness proof (AD vs finite-diff) | **DONE** — `examples/autodiff.aria` + `examples/grad.aria`, 342 green |
+| Reverse-mode `grad` builtin | **DONE (interpreter)** — tape-based, one backward pass, op set above; validated vs finite-diff AND the forward dual oracle; gated cleanly off the compiled backends |

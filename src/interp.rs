@@ -41,6 +41,18 @@ pub enum Value {
     /// empty captured environment. Boxed (via `Arc`) so adding closures does not
     /// enlarge `Value` and blow the recursive-interpreter stack.
     Closure(std::sync::Arc<ClosureData>),
+    /// A REVERSE-MODE AUTODIFF tracing scalar. Holds an index into the active
+    /// `grad` tape (a Wengert list); flows everywhere a `Float` would *inside* a
+    /// `grad(f, x)` evaluation of `f`. It NEVER exists outside a `grad` call —
+    /// normal programs never construct or observe one, so non-grad evaluation is
+    /// completely unaffected (the scalar/vector ops only branch into the tracing
+    /// path when an operand is already `Tracing`/`TracingVec`).
+    Tracing(usize),
+    /// A reverse-mode tracing Vector: a dense vector of tape-node ids (one per
+    /// coordinate). The `Vector` argument that `grad` feeds to `f` is one of
+    /// these, so `vec_get`/`vec_dot`/… on it produce `Tracing` scalars. Like
+    /// `Tracing`, it only ever exists inside a `grad` call.
+    TracingVec(Vec<usize>),
     Unit,
 }
 
@@ -87,6 +99,11 @@ impl Value {
             Value::Closure(c) => {
                 format!("<closure/{}>", c.params.len())
             }
+            // Tracing values only ever exist transiently inside a `grad` call
+            // and never reach user-visible display; render them descriptively
+            // for diagnostics if one ever surfaces in an error message.
+            Value::Tracing(_) => "<grad scalar>".to_string(),
+            Value::TracingVec(ids) => format!("<grad vector/{}>", ids.len()),
             Value::Data { ctor, fields } => {
                 if fields.is_empty() {
                     ctor.clone()
@@ -116,6 +133,189 @@ pub fn render_bytes(bs: &[u8]) -> String {
 pub fn render_vector(xs: &[f64]) -> String {
     let inner: Vec<String> = xs.iter().map(|f| format!("{}", f)).collect();
     format!("Vector[{}]", inner.join(", "))
+}
+
+// ===========================================================================
+// Reverse-mode automatic differentiation — the `grad` builtin's tape.
+//
+// A `Tape` is a Wengert list: an append-only `Vec<Node>` where each node holds
+// its computed forward `value` and, for each parent it depends on, the *local
+// partial derivative* of this node w.r.t. that parent. `grad(f, x)` evaluates
+// `f` over a tracing Vector (one leaf node per input coordinate); every
+// differentiable scalar/vector op that sees a tracing operand pushes a node
+// recording its inputs and local partials. After the forward trace yields a
+// single scalar output node, we seed its adjoint to 1.0 and sweep the tape in
+// reverse, accumulating `parent.adj += node.adj * local_partial` (the standard
+// vector-Jacobian product). The gradient is the vector of leaf adjoints.
+//
+// The tape is owned by the `grad` call (a thread-local set only for the
+// duration of `f`'s evaluation) — the mutation is scoped entirely to the
+// builtin and never observable from Aria, mirroring how `matmul` hides its
+// mutable out-buffer. Outside a `grad` call the thread-local is `None` and the
+// tracing path is never entered.
+// ===========================================================================
+
+/// One node of the reverse-mode tape. `value` is the forward result; `parents`
+/// pairs each input node id with the local partial ∂(this)/∂(that input).
+struct TapeNode {
+    value: f64,
+    parents: Vec<(usize, f64)>,
+}
+
+/// The append-only Wengert list for one `grad` call.
+struct Tape {
+    nodes: Vec<TapeNode>,
+}
+
+impl Tape {
+    fn new() -> Self {
+        Tape { nodes: Vec::new() }
+    }
+    /// Push a leaf (input) node holding a concrete value, with no parents.
+    fn leaf(&mut self, value: f64) -> usize {
+        let id = self.nodes.len();
+        self.nodes.push(TapeNode { value, parents: Vec::new() });
+        id
+    }
+    /// Push an interior node: its forward value and its (parent, local-partial)
+    /// list. Returns the new node id.
+    fn op(&mut self, value: f64, parents: Vec<(usize, f64)>) -> usize {
+        let id = self.nodes.len();
+        self.nodes.push(TapeNode { value, parents });
+        id
+    }
+    fn value(&self, id: usize) -> f64 {
+        self.nodes[id].value
+    }
+    /// Reverse sweep from `output` (seeded adjoint 1.0). Returns the adjoint of
+    /// every node, indexed by node id.
+    fn backward(&self, output: usize) -> Vec<f64> {
+        let mut adj = vec![0.0_f64; self.nodes.len()];
+        adj[output] = 1.0;
+        // Nodes are in topological order (a node only references earlier ids),
+        // so a single reverse pass over the ids suffices.
+        for id in (0..self.nodes.len()).rev() {
+            let a = adj[id];
+            if a == 0.0 {
+                continue;
+            }
+            for &(p, partial) in &self.nodes[id].parents {
+                adj[p] += a * partial;
+            }
+        }
+        adj
+    }
+}
+
+thread_local! {
+    /// The active `grad` tape, present only while evaluating the function `f`
+    /// passed to `grad`. `None` everywhere else, so the tracing branches in
+    /// `eval_binary`/the vector builtins are inert for normal programs.
+    static GRAD_TAPE: std::cell::RefCell<Option<Tape>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Read the forward value of a tracing scalar from the active tape. Errors
+/// cleanly if there is no active tape (should never happen for a well-formed
+/// `Tracing` value, which only exists inside a `grad` call).
+fn tracing_value(id: usize) -> Result<f64, String> {
+    GRAD_TAPE.with(|t| {
+        t.borrow()
+            .as_ref()
+            .map(|tape| tape.value(id))
+            .ok_or_else(|| "grad: tracing value used outside a `grad` call".to_string())
+    })
+}
+
+/// Coerce a value to a tape node id, materializing a `Float`/`Int` as a fresh
+/// constant leaf so a mixed op (`tracing * constant`) records correctly. Any
+/// other value type inside a differentiated computation is a clean error.
+fn as_node(v: &Value) -> Result<usize, String> {
+    match v {
+        Value::Tracing(id) => Ok(*id),
+        Value::Float(f) => GRAD_TAPE.with(|t| {
+            let mut b = t.borrow_mut();
+            let tape = b
+                .as_mut()
+                .ok_or_else(|| "grad: internal tape missing".to_string())?;
+            Ok(tape.leaf(*f))
+        }),
+        Value::Int(n) => GRAD_TAPE.with(|t| {
+            let mut b = t.borrow_mut();
+            let tape = b
+                .as_mut()
+                .ok_or_else(|| "grad: internal tape missing".to_string())?;
+            Ok(tape.leaf(*n as f64))
+        }),
+        other => Err(format!(
+            "grad: unsupported operation on a differentiated value of type {}",
+            other.display()
+        )),
+    }
+}
+
+/// Record a unary differentiable op: result value `v`, with local partial
+/// `d_dx` of the result w.r.t. the single input `x`. Returns a `Tracing` value.
+fn record_unary(x: usize, v: f64, d_dx: f64) -> Value {
+    GRAD_TAPE.with(|t| {
+        let mut b = t.borrow_mut();
+        let tape = b.as_mut().expect("tape present in tracing op");
+        Value::Tracing(tape.op(v, vec![(x, d_dx)]))
+    })
+}
+
+/// Record a binary differentiable op: result value `v`, with local partials
+/// `da`/`db` of the result w.r.t. inputs `a`/`b`. Returns a `Tracing` value.
+fn record_binary(a: usize, b: usize, v: f64, da: f64, db: f64) -> Value {
+    GRAD_TAPE.with(|t| {
+        let mut bt = t.borrow_mut();
+        let tape = bt.as_mut().expect("tape present in tracing op");
+        Value::Tracing(tape.op(v, vec![(a, da), (b, db)]))
+    })
+}
+
+/// Record an op with an arbitrary parent/partial list (used by `vec_dot`).
+fn record_many(parents: Vec<(usize, f64)>, v: f64) -> Value {
+    GRAD_TAPE.with(|t| {
+        let mut b = t.borrow_mut();
+        let tape = b.as_mut().expect("tape present in tracing op");
+        Value::Tracing(tape.op(v, parents))
+    })
+}
+
+/// True iff the binary float op `op` on `(l, r)` involves a tracing operand and
+/// so must be recorded on the tape. Only the four arithmetic ops are
+/// differentiable; comparisons/logic on tracing scalars are unsupported.
+fn is_tracing(v: &Value) -> bool {
+    matches!(v, Value::Tracing(_))
+}
+
+/// Record one of the four differentiable Float arithmetic ops on tracing
+/// operands. Returns the resulting `Tracing` value, or a clean error for a
+/// non-differentiable operator. The caller guarantees at least one operand is
+/// `Tracing`.
+fn tracing_float_op(op: BinOp, l: &Value, r: &Value) -> Result<Value, String> {
+    let a = as_node(l)?;
+    let b = as_node(r)?;
+    let (av, bv) = (tracing_value(a)?, tracing_value(b)?);
+    match op {
+        // (a+b)' : da=1, db=1
+        BinOp::Add => Ok(record_binary(a, b, av + bv, 1.0, 1.0)),
+        // (a-b)' : da=1, db=-1
+        BinOp::Sub => Ok(record_binary(a, b, av - bv, 1.0, -1.0)),
+        // (a*b)' : da=b, db=a
+        BinOp::Mul => Ok(record_binary(a, b, av * bv, bv, av)),
+        // (a/b)' : da=1/b, db=-a/b^2
+        BinOp::Div => {
+            if bv == 0.0 {
+                return Err("grad: division by zero in a differentiated value".into());
+            }
+            Ok(record_binary(a, b, av / bv, 1.0 / bv, -av / (bv * bv)))
+        }
+        other => Err(format!(
+            "grad: unsupported operation `{:?}` on a differentiated value",
+            other
+        )),
+    }
 }
 
 /// Sum of elementwise products of two equal-length float slices (the caller
@@ -346,6 +546,12 @@ impl Interp {
                     let callee = v.clone();
                     return self.apply_value(callee, vals, name);
                 }
+                // `grad` is the reverse-mode autodiff builtin. It must invoke the
+                // closure argument (`apply_value`), so it lives on `Interp`
+                // rather than in the free `builtin` helper.
+                if name == "grad" {
+                    return self.grad_builtin(vals);
+                }
                 if let Some(v) = builtin(name, &vals)? {
                     return Ok(v);
                 }
@@ -390,6 +596,11 @@ impl Interp {
                         n.checked_neg().ok_or("integer overflow in unary `-`")?,
                     )),
                     (UnOp::Neg, Value::Float(f)) => Ok(Value::Float(-f)),
+                    // Reverse-mode AD: negate a tracing scalar. (-x)' : dx = -1.
+                    (UnOp::Neg, Value::Tracing(id)) => {
+                        let v = tracing_value(id)?;
+                        Ok(record_unary(id, -v, -1.0))
+                    }
                     (UnOp::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
                     (op, v) => Err(format!("cannot apply {:?} to {}", op, v.display())),
                 }
@@ -627,6 +838,68 @@ impl Interp {
         result
     }
 
+    /// The reverse-mode autodiff builtin `grad(f, x) -> Vector`. Evaluates the
+    /// scalar function `f` over a tracing Vector built from `x`'s coordinates,
+    /// recording a tape; seeds the scalar output's adjoint to 1.0 and sweeps the
+    /// tape backward; returns the vector of input-leaf adjoints (∂f/∂x).
+    fn grad_builtin(&self, args: Vec<Value>) -> Result<Value, String> {
+        let (callee, x) = match args.as_slice() {
+            [c, Value::Vector(x)] => (c.clone(), x.clone()),
+            [_, other] => {
+                return Err(format!(
+                    "grad: second argument must be a Vector, got {}",
+                    other.display()
+                ))
+            }
+            _ => return Err("grad expects (f: (Vector) -> Float, x: Vector)".into()),
+        };
+
+        // Install a fresh tape for the duration of this `grad` call. A nested
+        // `grad` (f calls grad) would clobber the outer tape; reject that
+        // cleanly rather than mis-differentiate.
+        let already = GRAD_TAPE.with(|t| t.borrow().is_some());
+        if already {
+            return Err("grad: nested `grad` calls are not supported".into());
+        }
+
+        // Build one leaf node per input coordinate, then a tracing Vector of
+        // those node ids to feed to `f`.
+        let leaves: Vec<usize> = GRAD_TAPE.with(|t| {
+            *t.borrow_mut() = Some(Tape::new());
+            let mut b = t.borrow_mut();
+            let tape = b.as_mut().unwrap();
+            x.iter().map(|&v| tape.leaf(v)).collect()
+        });
+        let tracing_x = Value::TracingVec(leaves.clone());
+
+        // Evaluate f(tracing_x). On ANY error, tear down the tape before
+        // propagating so a later normal evaluation never sees a stale tape.
+        let result = self.apply_value(callee, vec![tracing_x], "grad function `f`");
+
+        let grad_or_err = result.and_then(|out| match out {
+            // The scalar output must be a single tracing node. A bare constant
+            // output (f ignores x) yields a zero gradient.
+            Value::Tracing(out_id) => GRAD_TAPE.with(|t| {
+                let b = t.borrow();
+                let tape = b.as_ref().unwrap();
+                let adj = tape.backward(out_id);
+                Ok(Value::Vector(leaves.iter().map(|&l| adj[l]).collect()))
+            }),
+            Value::Float(_) | Value::Int(_) => {
+                // f returned a constant independent of x: gradient is all zeros.
+                Ok(Value::Vector(vec![0.0; leaves.len()]))
+            }
+            other => Err(format!(
+                "grad: function `f` must return a Float, got {}",
+                other.display()
+            )),
+        });
+
+        // Always clear the tape, success or failure.
+        GRAD_TAPE.with(|t| *t.borrow_mut() = None);
+        grad_or_err
+    }
+
     fn eval_binary(
         &self,
         op: BinOp,
@@ -666,6 +939,13 @@ impl Interp {
             BinOp::Eq => return Ok(Value::Bool(values_equal(&l, &r))),
             BinOp::Ne => return Ok(Value::Bool(!values_equal(&l, &r))),
             _ => {}
+        }
+
+        // Reverse-mode autodiff: if either operand is a tracing scalar (only
+        // possible inside a `grad` call), record the arithmetic op on the tape
+        // instead of computing a plain float. Zero overhead otherwise.
+        if is_tracing(&l) || is_tracing(&r) {
+            return tracing_float_op(op, &l, &r);
         }
 
         match (&l, &r) {
@@ -817,7 +1097,205 @@ fn match_pattern(
 }
 
 /// Returns Ok(Some(value)) if `name` is a builtin, Ok(None) otherwise.
+/// Differentiable Vector builtins for reverse-mode AD: invoked only when a
+/// `grad` trace passes a `TracingVec` (or, for `vec_scale`, a `Tracing` scalar
+/// factor) to a vector builtin. Each op records the appropriate tape nodes and
+/// returns a `Tracing`/`TracingVec` result. Returns `Ok(None)` for a builtin
+/// that is not part of the differentiable vector op set, so the caller can
+/// surface a clean "unsupported operation" error rather than silently mis-
+/// differentiating. Length-mismatch policy matches the concrete builtins.
+fn tracing_vec_builtin(name: &str, args: &[Value]) -> Result<Option<Value>, String> {
+    // Convert a value expected to be a tracing Vector into its node-id slice.
+    // A *concrete* `Vector` operand (e.g. a constant `c` in `vec_dot(x, c)`) is
+    // lifted to fresh constant leaf nodes so the mixed op differentiates
+    // correctly (its partials w.r.t. those leaves are simply discarded — they
+    // are not input leaves).
+    let as_vec_nodes = |v: &Value| -> Result<Vec<usize>, String> {
+        match v {
+            Value::TracingVec(ids) => Ok(ids.clone()),
+            Value::Vector(xs) => GRAD_TAPE.with(|t| {
+                let mut b = t.borrow_mut();
+                let tape = b
+                    .as_mut()
+                    .ok_or_else(|| "grad: internal tape missing".to_string())?;
+                Ok(xs.iter().map(|f| tape.leaf(*f)).collect())
+            }),
+            other => Err(format!(
+                "grad: `{}` expected a Vector, got {}",
+                name,
+                other.display()
+            )),
+        }
+    };
+    match name {
+        "vec_get" => match args {
+            [vv, Value::Int(i)] => {
+                let ids = as_vec_nodes(vv)?;
+                if *i < 0 || *i as usize >= ids.len() {
+                    return Err(format!(
+                        "vec_get index {} out of range for vector of length {}",
+                        i,
+                        ids.len()
+                    ));
+                }
+                // Identity: result = x[i]; partial w.r.t. x[i] is 1.
+                let node = ids[*i as usize];
+                let v = tracing_value(node)?;
+                Ok(Some(record_unary(node, v, 1.0)))
+            }
+            _ => Err("vec_get expects (Vector, Int)".into()),
+        },
+        "vec_len" => match args {
+            [Value::TracingVec(ids)] => Ok(Some(Value::Int(ids.len() as i64))),
+            _ => Err("vec_len expects (Vector)".into()),
+        },
+        "vec_dot" => match args {
+            [a, b] => {
+                let xa = as_vec_nodes(a)?;
+                let xb = as_vec_nodes(b)?;
+                if xa.len() != xb.len() {
+                    return Err(format!(
+                        "vec_dot length mismatch: {} vs {}",
+                        xa.len(),
+                        xb.len()
+                    ));
+                }
+                // dot = Σ a_i*b_i ; ∂dot/∂a_i = b_i, ∂dot/∂b_i = a_i.
+                let mut acc = 0.0;
+                let mut parents = Vec::with_capacity(xa.len() * 2);
+                for (&ai, &bi) in xa.iter().zip(xb.iter()) {
+                    let av = tracing_value(ai)?;
+                    let bv = tracing_value(bi)?;
+                    acc += av * bv; // same left-to-right order as `dot`
+                    parents.push((ai, bv));
+                    parents.push((bi, av));
+                }
+                Ok(Some(record_many(parents, acc)))
+            }
+            _ => Err("vec_dot expects (Vector, Vector)".into()),
+        },
+        "vec_norm" => match args {
+            [a] => {
+                let xa = as_vec_nodes(a)?;
+                // norm = sqrt(Σ x_i^2); ∂norm/∂x_i = x_i / norm. At norm==0 the
+                // gradient is undefined — keep it 0 (a clean, non-NaN choice).
+                let mut sumsq = 0.0;
+                let mut vals = Vec::with_capacity(xa.len());
+                for &xi in &xa {
+                    let v = tracing_value(xi)?;
+                    vals.push(v);
+                    sumsq += v * v;
+                }
+                let norm = sumsq.sqrt();
+                let parents: Vec<(usize, f64)> = xa
+                    .iter()
+                    .zip(vals.iter())
+                    .map(|(&xi, &v)| (xi, if norm == 0.0 { 0.0 } else { v / norm }))
+                    .collect();
+                Ok(Some(record_many(parents, norm)))
+            }
+            _ => Err("vec_norm expects (Vector)".into()),
+        },
+        "vec_add" | "vec_sub" => match args {
+            [a, b] => {
+                let xa = as_vec_nodes(a)?;
+                let xb = as_vec_nodes(b)?;
+                if xa.len() != xb.len() {
+                    return Err(format!(
+                        "{} length mismatch: {} vs {}",
+                        name,
+                        xa.len(),
+                        xb.len()
+                    ));
+                }
+                let sub = name == "vec_sub";
+                let mut out = Vec::with_capacity(xa.len());
+                for (&ai, &bi) in xa.iter().zip(xb.iter()) {
+                    let av = tracing_value(ai)?;
+                    let bv = tracing_value(bi)?;
+                    // add: r=a+b, da=1, db=1 ; sub: r=a-b, da=1, db=-1.
+                    let (rv, db) = if sub { (av - bv, -1.0) } else { (av + bv, 1.0) };
+                    let node = match record_binary(ai, bi, rv, 1.0, db) {
+                        Value::Tracing(id) => id,
+                        _ => unreachable!(),
+                    };
+                    out.push(node);
+                }
+                Ok(Some(Value::TracingVec(out)))
+            }
+            _ => Err(format!("{} expects (Vector, Vector)", name).into()),
+        },
+        "vec_scale" => match args {
+            [a, s] => {
+                let xa = as_vec_nodes(a)?;
+                // The scalar factor may itself be tracing (e.g. `vec_scale(v, t)`
+                // with `t` a differentiated scalar) or a plain Float.
+                let snode = as_node(s)?;
+                let sv = tracing_value(snode)?;
+                let mut out = Vec::with_capacity(xa.len());
+                for &ai in &xa {
+                    let av = tracing_value(ai)?;
+                    // r = s*a ; ∂r/∂a = s, ∂r/∂s = a.
+                    let node = match record_binary(ai, snode, sv * av, sv, av) {
+                        Value::Tracing(id) => id,
+                        _ => unreachable!(),
+                    };
+                    out.push(node);
+                }
+                Ok(Some(Value::TracingVec(out)))
+            }
+            _ => Err("vec_scale expects (Vector, Float)".into()),
+        },
+        "vec_push" => match args {
+            [vv, x] => {
+                let mut ids = as_vec_nodes(vv)?;
+                ids.push(as_node(x)?);
+                Ok(Some(Value::TracingVec(ids)))
+            }
+            _ => Err("vec_push expects (Vector, Float)".into()),
+        },
+        "vec_from_array" => match args {
+            [Value::Array(xs)] => {
+                // Build a tracing Vector from an array that contains tracing
+                // scalars (and/or plain floats lifted to constant leaves).
+                let mut ids = Vec::with_capacity(xs.len());
+                for v in xs {
+                    ids.push(as_node(v)?);
+                }
+                Ok(Some(Value::TracingVec(ids)))
+            }
+            _ => Err("vec_from_array expects (Array[Float])".into()),
+        },
+        // Any other builtin applied to a tracing value is outside the supported
+        // differentiable op set: signal `None` so the caller raises a clean,
+        // specific error (never a panic, never a silently-wrong gradient).
+        _ => Ok(None),
+    }
+}
+
 fn builtin(name: &str, args: &[Value]) -> Result<Option<Value>, String> {
+    // Reverse-mode AD: a Vector builtin applied to a tracing Vector (only
+    // possible inside a `grad` call) is handled by the tape recorder, which
+    // produces `Tracing`/`TracingVec` results. We branch here, before the normal
+    // (concrete) builtin dispatch, only when a tracing operand is present — so
+    // ordinary programs pay nothing and behave identically.
+    if args
+        .iter()
+        .any(|a| matches!(a, Value::TracingVec(_) | Value::Tracing(_)))
+    {
+        match tracing_vec_builtin(name, args)? {
+            Some(v) => return Ok(Some(v)),
+            // A tracing operand reached a builtin outside the differentiable op
+            // set — fail cleanly rather than fall through to the concrete
+            // dispatch (which would mis-type the tracing value).
+            None => {
+                return Err(format!(
+                    "grad: unsupported operation `{}` on a differentiated value",
+                    name
+                ))
+            }
+        }
+    }
     let one = |args: &[Value]| -> Result<Value, String> {
         if args.len() != 1 {
             return Err(format!("`{}` expects 1 argument", name));
@@ -1257,6 +1735,21 @@ fn builtin(name: &str, args: &[Value]) -> Result<Option<Value>, String> {
             }
             _ => Err("vec_add expects (Vector, Vector)".into()),
         },
+        "vec_sub" => match args {
+            [Value::Vector(x), Value::Vector(y)] => {
+                if x.len() != y.len() {
+                    return Err(format!(
+                        "vec_sub length mismatch: {} vs {}",
+                        x.len(),
+                        y.len()
+                    ));
+                }
+                Ok(Some(Value::Vector(
+                    x.iter().zip(y).map(|(a, b)| a - b).collect(),
+                )))
+            }
+            _ => Err("vec_sub expects (Vector, Vector)".into()),
+        },
         "vec_scale" => match args {
             [Value::Vector(x), Value::Float(s)] => {
                 Ok(Some(Value::Vector(x.iter().map(|a| a * s).collect())))
@@ -1540,6 +2033,11 @@ mod tests {
             Value::Closure(c) => {
                 Fn(c.params.iter().map(|_| Unit).collect(), Box::new(Unit))
             }
+            // Reverse-mode AD tracing values only exist transiently inside a
+            // `grad` call and never reach this test helper; map them to the
+            // scalar/Vector type they stand in for.
+            Value::Tracing(_) => Float,
+            Value::TracingVec(_) => Named("Vector".into(), vec![]),
         }
     }
 
@@ -1628,6 +2126,14 @@ mod tests {
         // returns the wrong concrete type, while still letting a genuinely
         // unconstrained return var (e.g. `array_new` -> `Array[T]`) pass.
         for (name, params, ret) in crate::builtins::signatures() {
+            // `grad` is the one builtin whose implementation lives on the
+            // evaluator (`Interp::grad_builtin`), not the free `builtin` helper,
+            // because it must APPLY its closure argument. It is exercised
+            // directly by the autodiff tests instead; the free `builtin` table
+            // legitimately does not contain it.
+            if name == "grad" {
+                continue;
+            }
             let args: Vec<Value> = params.iter().map(dummy).collect();
             match builtin(name, &args) {
                 Ok(Some(v)) => {
