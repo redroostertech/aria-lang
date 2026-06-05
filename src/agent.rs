@@ -479,6 +479,22 @@ pub fn build_feedback(program: &str, diags: &[Diagnostic]) -> String {
     )
 }
 
+/// Build the RUNTIME-error feedback appended to the transcript when a candidate
+/// TYPE-CHECKS CLEAN but FAILS AT RUNTIME. It carries the runtime error message,
+/// the most-recent-first STACK TRACE (the exact call chain the model needs to
+/// localize the fix), and the program, with an instruction to return a corrected
+/// program. This closes the loop over runtime failures (write -> check -> RUN ->
+/// fix), not just type errors. The literal phrase "failed at runtime" lets a
+/// mock/test key its corrected response on having received runtime feedback.
+pub fn build_runtime_feedback(program: &str, err: &interp::RuntimeError) -> String {
+    // `err.render()` is `runtime error: <msg>` + the indented frames.
+    format!(
+        "Your program type-checks but failed at runtime:\n{}\nHere is the program you wrote:\n{}\nReturn the corrected full Aria program (only the program).",
+        err.render(),
+        program
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Program extraction
 // ---------------------------------------------------------------------------
@@ -585,6 +601,7 @@ pub fn run_loop(
     let mut transcript: Vec<String> = Vec::new();
     let mut last_program = String::new();
     let mut last_diags: Vec<Diagnostic> = Vec::new();
+    let mut last_runtime_error: Option<String> = None;
     let iters = max_iters.max(1);
 
     for iter in 1..=iters {
@@ -625,17 +642,49 @@ pub fn run_loop(
             // Clean: RUN it CAPTURING its printed output (safe by construction —
             // no I/O/FFI/etc.). We grade what the program PRINTS, so the loop
             // carries the captured stdout alongside `main`'s return value.
-            let (result, output, runtime_error) = run_program(&program);
-            return AgentOutcome {
-                success: runtime_error.is_none(),
-                program,
-                diagnostics: Vec::new(),
-                result,
-                output,
-                runtime_error,
-                iterations: iter,
-                transcript,
-            };
+            let (result, output, runtime_error) = run_program_traced(&program);
+            match runtime_error {
+                None => {
+                    // Clean check AND clean run: converged.
+                    return AgentOutcome {
+                        success: true,
+                        program,
+                        diagnostics: Vec::new(),
+                        result,
+                        output,
+                        runtime_error: None,
+                        iterations: iter,
+                        transcript,
+                    };
+                }
+                Some(err) => {
+                    // CHECKS CLEAN but FAILS AT RUNTIME: not yet converged. Feed
+                    // the runtime error + STACK TRACE back and retry within budget
+                    // (write -> check -> RUN -> fix). If this was the last
+                    // iteration, fall through to the budget-exhausted outcome
+                    // below, surfacing the runtime error.
+                    if verbose {
+                        eprintln!("[runtime error] {}", err.render());
+                    }
+                    last_runtime_error = Some(err.render());
+                    if iter < iters {
+                        let feedback = build_runtime_feedback(&program, &err);
+                        transcript.push(feedback);
+                        continue;
+                    }
+                    // Last iteration: report the runtime failure.
+                    return AgentOutcome {
+                        success: false,
+                        program,
+                        diagnostics: Vec::new(),
+                        result: None,
+                        output: None,
+                        runtime_error: Some(err.render()),
+                        iterations: iter,
+                        transcript,
+                    };
+                }
+            }
         }
 
         // Not clean: record feedback and loop (unless this was the last iter).
@@ -649,14 +698,16 @@ pub fn run_loop(
         transcript.push(feedback);
     }
 
-    // Budget exhausted without a clean check.
+    // Budget exhausted without a converging run. `last_runtime_error` carries the
+    // most recent clean-check-but-runtime-failure (if any), so the report can
+    // distinguish "never type-checked" from "checked but kept trapping".
     AgentOutcome {
         success: false,
         program: last_program,
         diagnostics: last_diags,
         result: None,
         output: None,
-        runtime_error: None,
+        runtime_error: last_runtime_error,
         iterations: iters,
         transcript,
     }
@@ -682,15 +733,29 @@ pub fn check_program(program: &str) -> Vec<Diagnostic> {
 /// `aria run`, the `print_*` output is BUFFERED (not sent to stdout) so the loop
 /// can report — and the benchmark grade — what the program PRINTED.
 pub fn run_program(program: &str) -> (Option<String>, Option<String>, Option<String>) {
+    let (res, out, err) = run_program_traced(program);
+    // Flatten the structured runtime error back to a plain string (the rendered
+    // trace) for callers that only want the legacy 3-tuple shape.
+    (res, out, err.map(|e| e.render()))
+}
+
+/// Like [`run_program`] but returns a STRUCTURED [`interp::RuntimeError`] (message
+/// + stack frames) on a runtime failure, so the loop can both render the trace as
+/// feedback for the model AND inspect the frames. Construction / lex-parse
+/// failures (which carry no Aria call stack) become a frame-less `RuntimeError`.
+pub fn run_program_traced(
+    program: &str,
+) -> (Option<String>, Option<String>, Option<interp::RuntimeError>) {
+    let no_frames = |message: String| interp::RuntimeError { message, frames: Vec::new() };
     let prog = match lexer::lex(&prelude::wrap(program)).and_then(parser::parse) {
         Ok(p) => p,
-        Err(e) => return (None, None, Some(e)),
+        Err(e) => return (None, None, Some(no_frames(e))),
     };
     let interp = match interp::Interp::new(&prog) {
         Ok(i) => i,
-        Err(e) => return (None, None, Some(e)),
+        Err(e) => return (None, None, Some(no_frames(e))),
     };
-    match interp.run_main_capturing() {
+    match interp.run_main_capturing_traced() {
         Ok((v, out)) => (Some(v.display()), Some(out), None),
         Err(e) => (None, None, Some(e)),
     }
@@ -949,5 +1014,87 @@ mod tests {
         let outcome = run_loop(&Failing, "task", 5, false);
         assert!(!outcome.success);
         assert!(outcome.runtime_error.as_deref().unwrap().contains("boom"));
+    }
+
+    // ---- runtime-error feedback path (Feature 1b) ---------------------
+
+    #[test]
+    fn run_program_traced_surfaces_stack_trace() {
+        // A clean-checking program that divides by zero three calls deep yields a
+        // structured runtime error whose frames are the call chain.
+        let src = "\
+fn inner(x: Int) -> Int = 1 / 0
+fn outer(x: Int) -> Int = inner(x)
+fn main() -> Int = outer(5)
+";
+        let (res, _out, err) = run_program_traced(src);
+        assert!(res.is_none());
+        let err = err.expect("runtime error");
+        assert!(err.message.contains("division by zero"), "msg: {}", err.message);
+        let names: Vec<&str> = err.frames.iter().map(|f| f.function.as_str()).collect();
+        assert_eq!(names, vec!["inner", "outer", "main"], "most-recent first");
+        // The rendered form embeds the trace the model will see.
+        let rendered = err.render();
+        assert!(rendered.contains("at `inner` (line 1)"));
+        assert!(rendered.contains("at `main` (line 3)"));
+    }
+
+    #[test]
+    fn loop_feeds_back_runtime_error_and_reconverges() {
+        // A provider whose FIRST program type-checks but TRAPS at runtime, and
+        // whose corrected program (returned once it has SEEN runtime feedback) is
+        // clean. Proves the loop treats a runtime failure as non-converged and
+        // closes the write -> check -> RUN -> fix loop.
+        struct RuntimeThenFixed;
+        impl Provider for RuntimeThenFixed {
+            fn complete(&self, prompt: &str) -> Result<String, String> {
+                if prompt.contains("failed at runtime") {
+                    // Corrected program: no division by zero, returns 7.
+                    Ok("```aria\nfn main() -> Int = 7\n```".to_string())
+                } else {
+                    // Clean-checking but traps: 1/0 is well-typed Int division.
+                    Ok("```aria\nfn main() -> Int = 1 / 0\n```".to_string())
+                }
+            }
+            fn label(&self) -> String {
+                "rt".to_string()
+            }
+        }
+        let outcome = run_loop(&RuntimeThenFixed, "task", 5, false);
+        assert!(outcome.success, "should reconverge after runtime feedback");
+        assert_eq!(outcome.iterations, 2, "trap -> feedback -> fix");
+        assert_eq!(outcome.result.as_deref(), Some("7"));
+        // The transcript's feedback carried the runtime error + stack trace.
+        assert_eq!(outcome.transcript.len(), 1);
+        assert!(outcome.transcript[0].contains("failed at runtime"));
+        assert!(outcome.transcript[0].contains("division by zero"));
+        assert!(
+            outcome.transcript[0].contains("at `main`"),
+            "feedback must carry the stack trace: {}",
+            outcome.transcript[0]
+        );
+    }
+
+    #[test]
+    fn loop_reports_runtime_failure_when_budget_exhausted() {
+        // A provider that ALWAYS returns a clean-checking program that traps never
+        // converges; the budget-exhausted outcome surfaces the runtime error.
+        struct AlwaysTraps;
+        impl Provider for AlwaysTraps {
+            fn complete(&self, _p: &str) -> Result<String, String> {
+                Ok("fn main() -> Int = 1 / 0".to_string())
+            }
+            fn label(&self) -> String {
+                "traps".to_string()
+            }
+        }
+        let outcome = run_loop(&AlwaysTraps, "task", 3, false);
+        assert!(!outcome.success);
+        assert_eq!(outcome.iterations, 3);
+        assert!(outcome.diagnostics.is_empty(), "it type-checks, so no diagnostics");
+        let rt = outcome.runtime_error.expect("runtime error surfaced");
+        assert!(rt.contains("division by zero"));
+        // Two runtime-feedback messages precede the final (3rd) attempt.
+        assert_eq!(outcome.transcript.len(), 2);
     }
 }

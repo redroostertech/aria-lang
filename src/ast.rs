@@ -131,6 +131,12 @@ pub struct Param {
 #[derive(Debug, Clone)]
 pub struct FnDecl {
     pub name: String,
+    /// 1-based source line of the `fn` keyword that introduced this function.
+    /// Used by runtime stack traces and the static call-graph analyzer to report
+    /// the definition site of a function. `0` for compiler-generated functions
+    /// (trait dispatchers / lowered impl methods / monomorphized clones) that
+    /// have no single source line.
+    pub line: usize,
     /// `true` if the function carries a `pure` annotation. The effect checker
     /// (`typeck`) verifies such a function performs no IO. Erased afterwards.
     pub pure: bool,

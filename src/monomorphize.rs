@@ -188,6 +188,7 @@ impl<'a> Mono<'a> {
                             self.rewrite_expr(&f.body, &mut env, &empty, Some(&f.ret))?;
                         items.push(Item::Fn(FnDecl {
                             name: f.name.clone(),
+                            line: f.line,
                             pure: f.pure,
                             type_params: Vec::new(),
                             bounds: Vec::new(),
@@ -473,6 +474,7 @@ impl<'a> Mono<'a> {
 
         let decl = FnDecl {
             name: mangled.clone(),
+            line: info.decl.line,
             pure: info.decl.pure,
             type_params: Vec::new(),
             bounds: Vec::new(),

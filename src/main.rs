@@ -4,6 +4,8 @@
 //!   aria run   <file.aria>          parse and execute `main`
 //!   aria check <file.aria>          type-check only (human-readable report)
 //!   aria check --json <file.aria>   type-check, emit structured JSON diagnostics
+//!   aria analyze <file.aria>        static call-graph analysis (human report)
+//!   aria analyze --json <file.aria> static call-graph as stable JSON (AI tools)
 //!   aria ast   <file.aria>          print the parsed AST (debugging)
 //!   aria pack  <in> <out>           compress any file (rANS entropy coder)
 //!   aria unpack <in> <out>          decompress an Aria-packed file
@@ -25,6 +27,7 @@
 mod agent;
 mod agent_bench;
 mod agent_tasks;
+mod analyze;
 mod arith;
 mod ast;
 mod builtins;
@@ -79,12 +82,13 @@ fn main() -> ExitCode {
 fn real_main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: aria <run|check|ast|pack|unpack|npack|nunpack|bench|demo|mem|wasm|wasm-run|native|native-run|gbnf|lsp|agent|agent-bench> [args...]");
+        eprintln!("usage: aria <run|check|analyze|ast|pack|unpack|npack|nunpack|bench|demo|mem|wasm|wasm-run|native|native-run|gbnf|lsp|agent|agent-bench> [args...]");
         return ExitCode::from(2);
     }
 
     match args[1].as_str() {
         "run" | "ast" | "check" => run_source(&args),
+        "analyze" => run_analyze(&args),
         "pack" => pack_file(&args, Codec::Rans, true),
         "unpack" => pack_file(&args, Codec::Rans, false),
         "npack" => pack_file(&args, Codec::Neural, true),
@@ -822,6 +826,63 @@ fn run_check_json(path: &str) -> ExitCode {
     }
 }
 
+/// `aria analyze [--json] <file.aria>`: a STATIC CALL-GRAPH analysis pass. Runs
+/// lex/parse/typeck first (so only well-formed programs are analyzed), then builds
+/// the call graph (callers/callees per function) and derived facts (entry, dead
+/// code, unreachable functions, recursive cycles). With `--json` it prints a
+/// stable JSON object for AI tools / static analyzers; without it, a readable
+/// human summary. See docs/ANALYSIS.md for the schema.
+fn run_analyze(args: &[String]) -> ExitCode {
+    let json = args.iter().skip(2).any(|a| a == "--json");
+    let path = args.iter().skip(2).find(|a| a.as_str() != "--json");
+    let path = match path {
+        Some(p) => p,
+        None => {
+            eprintln!("usage: aria analyze [--json] <file.aria>");
+            return ExitCode::from(2);
+        }
+    };
+
+    let src = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: cannot read {}: {}", path, e);
+            return ExitCode::from(2);
+        }
+    };
+    let toks = match lexer::lex(&prelude::wrap(&src)) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("lex error: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+    let program = match parser::parse(toks) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("parse error: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+    // Analyze a TYPE-CHECKED program: surface check errors first so analysis only
+    // ever runs on well-formed code.
+    if let Err(errors) = typeck::check(&program) {
+        eprintln!("type error{} in {}:", if errors.len() == 1 { "" } else { "s" }, path);
+        for e in &errors {
+            eprintln!("  - {}", e);
+        }
+        return ExitCode::FAILURE;
+    }
+
+    let graph = analyze::analyze(&program, &analyze::prelude_fn_names());
+    if json {
+        println!("{}", graph.to_json());
+    } else {
+        print!("{}", graph.to_human());
+    }
+    ExitCode::SUCCESS
+}
+
 fn run_source(args: &[String]) -> ExitCode {
     // Accept `--json` in any position (only meaningful for `aria check`); strip
     // it out so the remaining positional args are the command + file path.
@@ -908,12 +969,17 @@ fn run_source(args: &[String]) -> ExitCode {
     // Run on a large-stack thread: the tree-walking interpreter uses native
     // stack per Aria call, so deep (but finite) recursion won't overflow; the
     // interpreter's own depth guard catches genuinely infinite recursion.
+    // Run with RUNTIME STACK TRACKING: on success this is identical to the plain
+    // run (frames are recorded but never alter values/output); on an error it
+    // returns the call chain so we can print a stack trace after the message.
     let result = std::thread::Builder::new()
         .stack_size(1 << 30) // 1 GiB
-        .spawn(move || interp.run_main())
+        .spawn(move || interp.run_main_traced())
         .expect("spawn interpreter thread")
         .join()
-        .unwrap_or_else(|_| Err("interpreter thread panicked".into()));
+        .unwrap_or_else(|_| {
+            Err(interp::RuntimeError { message: "interpreter thread panicked".into(), frames: Vec::new() })
+        });
     match result {
         Ok(v) => {
             // Print `main`'s result value, matching the native backend
@@ -927,7 +993,10 @@ fn run_source(args: &[String]) -> ExitCode {
             }
         }
         Err(e) => {
-            eprintln!("runtime error: {}", e);
+            // The rendered form is `runtime error: <msg>` followed by an
+            // indented, most-recent-first stack trace (interpreter-side only;
+            // the native/wasm backends keep their bare trap messages in v1).
+            eprintln!("{}", e.render());
             ExitCode::FAILURE
         }
     }

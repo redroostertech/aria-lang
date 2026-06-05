@@ -294,6 +294,9 @@ impl Parser {
     }
 
     fn parse_fn(&mut self) -> Result<FnDecl, String> {
+        // 1-based source line of the function (the `pure`/`fn` keyword). Captured
+        // before consuming any tokens so it points at the function's start.
+        let line = self.line();
         // Optional `pure` annotation before `fn`. Canonical form: `pure` may
         // only appear immediately before `fn` and nowhere else.
         let pure = if *self.peek() == Tok::Pure {
@@ -330,6 +333,7 @@ impl Parser {
         self.type_params = Vec::new();
         Ok(FnDecl {
             name,
+            line,
             pure,
             type_params,
             bounds,
@@ -1060,6 +1064,34 @@ mod tests {
     fn parse_src(src: &str) -> Result<Program, String> {
         let toks = crate::lexer::lex(src)?;
         parse(toks)
+    }
+
+    #[test]
+    fn fn_decl_line_is_the_fn_keyword_line() {
+        // Each function's `line` is the 1-based source line of its `fn`/`pure`
+        // keyword. Blank lines and comments are counted, and a `pure` prefix does
+        // not shift the line off the keyword.
+        let src = "\
+fn a() -> Int = 1
+
+-- a comment on line 3
+fn b() -> Int = a()
+
+pure fn c() -> Int = 9
+";
+        let prog = parse_src(src).expect("parse");
+        let line_of = |name: &str| -> usize {
+            prog.items
+                .iter()
+                .find_map(|it| match it {
+                    Item::Fn(f) if f.name == name => Some(f.line),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no fn {}", name))
+        };
+        assert_eq!(line_of("a"), 1);
+        assert_eq!(line_of("b"), 4);
+        assert_eq!(line_of("c"), 6);
     }
 
     #[test]

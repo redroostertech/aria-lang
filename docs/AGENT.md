@@ -21,10 +21,18 @@
    `aria check --json`. If there are diagnostics, build a feedback message
    embedding the **JSON diagnostics** + the program, append it to the transcript,
    and loop back to step 2.
-5. **Run it** in-process via the interpreter when the check is clean; report the
-   program, `main`'s result, and the iteration count.
-6. **Give up gracefully** after `--max-iters` (default 5) without a clean check:
-   report the best attempt, its remaining diagnostics, and the transcript.
+5. **Run it** in-process via the interpreter when the check is clean. If the
+   program **type-checks but fails at runtime** (e.g. division by zero), the loop
+   treats it as *not yet converged*: it builds a runtime-error feedback message
+   carrying the error **and the stack trace** (the exact call chain — see
+   [ANALYSIS.md](ANALYSIS.md)), appends it to the transcript, and loops back to
+   step 2. This closes the loop over runtime failures too —
+   **write → check → RUN → fix** — and the trace is exactly the signal the model
+   needs to localize the bug. On a clean check *and* a clean run, report the
+   program, `main`'s result, the captured output, and the iteration count.
+6. **Give up gracefully** after `--max-iters` (default 5) without a converging
+   run: report the best attempt, its remaining diagnostics *or* the last runtime
+   error, and the transcript.
 
 ```text
    PRIMER + TASK ──▶ PROVIDER ──▶ EXTRACT ──▶ check_structured ──┐ diagnostics

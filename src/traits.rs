@@ -198,6 +198,8 @@ pub fn lower(
             let mangled = impl_method_name(&m.name, &imp.trait_name, &imp.head_type);
             items.push(Item::Fn(FnDecl {
                 name: mangled,
+                // Preserve the source line of the impl method as written.
+                line: m.line,
                 pure: m.pure,
                 type_params: Vec::new(),
                 bounds: Vec::new(),
@@ -265,6 +267,8 @@ pub fn lower(
             let body = Expr::Match(Box::new(Expr::Var(receiver)), arms);
             items.push(Item::Fn(FnDecl {
                 name: tm.name.clone(),
+                // Compiler-generated trait dispatcher: no single source line.
+                line: 0,
                 pure: false,
                 type_params: vec![itf.self_param.clone()],
                 bounds: vec![(itf.self_param.clone(), itf.name.clone())],

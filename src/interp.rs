@@ -223,6 +223,114 @@ thread_local! {
     /// large-stack worker thread the interpreter runs on, and so capture is
     /// strictly scoped to the capturing run.
     static OUTPUT_CAPTURE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+
+    /// The active RUNTIME CALL STACK, present only while a `run_main`-family call
+    /// is in flight. `None` (the default) means stack tracking is OFF, so normal
+    /// `aria run` SUCCESS paths and non-interpreter code pay ZERO overhead and see
+    /// no behavior change. `Some(stack)` (installed for the duration of a run)
+    /// makes every user-function entry PUSH a `{function, line}` frame and every
+    /// SUCCESSFUL return POP it. On an ERROR the frames are deliberately LEFT on
+    /// the stack as they unwind, so when the run returns `Err` the stack holds the
+    /// exact call chain from `main` down to the function that trapped — that is the
+    /// stack trace. Consecutive identical frames (a non-tail self-recursive call)
+    /// are collapsed at render time so runaway/deep recursion does not produce a
+    /// million-line trace. Thread-local so it never crosses the large-stack worker
+    /// thread the interpreter runs on and stays strictly scoped to one run.
+    static CALL_STACK: std::cell::RefCell<Option<Vec<Frame>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// One entry in a runtime stack trace: the called function's name and the
+/// 1-based source line of its DEFINITION (the `fn` keyword). In v1 frame lines
+/// are FUNCTION-DEFINITION lines, not exact call-SITE lines; precise call-site
+/// spans are the planned next step (see docs/ANALYSIS.md).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Frame {
+    pub function: String,
+    pub line: usize,
+}
+
+/// A structured runtime error: the trap message plus the call stack at the point
+/// of failure (most-recent call first). Produced by `run_main_traced` /
+/// `run_main_capturing_traced` so the agent loop and diagnostics can consume the
+/// frames, and rendered to a human string by `RuntimeError::render` for
+/// `aria run` / `aria agent` output.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RuntimeError {
+    pub message: String,
+    /// Frames, MOST-RECENT call first (the function that trapped is `frames[0]`,
+    /// `main` is last). Empty if the error occurred before any user frame was
+    /// entered (e.g. "no `main` function found").
+    pub frames: Vec<Frame>,
+}
+
+impl RuntimeError {
+    /// Render the error followed by an indented, most-recent-first stack trace,
+    /// e.g.
+    ///   runtime error: division by zero
+    ///     at `inner` (line 12)
+    ///     at `middle` (line 8)
+    ///     at `main` (line 3)
+    /// Frames with line 0 (compiler-generated functions: trait dispatchers,
+    /// lowered impl methods) print `(generated)` instead of a line number.
+    pub fn render(&self) -> String {
+        let mut s = format!("runtime error: {}", self.message);
+        for f in &self.frames {
+            if f.line == 0 {
+                s.push_str(&format!("\n  at `{}` (generated)", f.function));
+            } else {
+                s.push_str(&format!("\n  at `{}` (line {})", f.function, f.line));
+            }
+        }
+        s
+    }
+}
+
+/// Install a fresh (empty) call stack for the duration of `f`, capturing the
+/// frames left behind on the error path into a `RuntimeError`. Restores the
+/// previous stack state (`None` normally) on the way out, success OR error, so a
+/// subsequent run is unaffected. Consecutive identical frames are collapsed.
+fn with_call_stack<T>(f: impl FnOnce() -> Result<T, String>) -> Result<T, RuntimeError> {
+    let prev = CALL_STACK.with(|c| c.borrow_mut().replace(Vec::new()));
+    let result = f();
+    let stack = CALL_STACK.with(|c| std::mem::replace(&mut *c.borrow_mut(), prev));
+    match result {
+        Ok(v) => Ok(v),
+        Err(message) => {
+            let raw = stack.unwrap_or_default();
+            // Most-recent call first: the deepest (last-pushed) frame is the one
+            // that trapped. Collapse runs of identical consecutive frames so a
+            // non-tail self-recursion does not explode the trace.
+            let mut frames: Vec<Frame> = Vec::new();
+            for fr in raw.into_iter().rev() {
+                if frames.last().map(|p| p == &fr).unwrap_or(false) {
+                    continue;
+                }
+                frames.push(fr);
+            }
+            Err(RuntimeError { message, frames })
+        }
+    }
+}
+
+/// Push a user-function frame onto the active call stack (no-op when tracking is
+/// off). Called on entry to a user function in the interpreter.
+fn push_frame(function: &str, line: usize) {
+    CALL_STACK.with(|c| {
+        if let Some(stack) = c.borrow_mut().as_mut() {
+            stack.push(Frame { function: function.to_string(), line });
+        }
+    });
+}
+
+/// Pop the top frame on a SUCCESSFUL return (no-op when tracking is off). The
+/// error path intentionally does NOT pop, leaving the chain in place for the
+/// trace.
+fn pop_frame() {
+    CALL_STACK.with(|c| {
+        if let Some(stack) = c.borrow_mut().as_mut() {
+            stack.pop();
+        }
+    });
 }
 
 /// Emit one already-formatted output LINE from a `print_*` builtin: append it to
@@ -437,8 +545,34 @@ impl Interp {
         if !main.params.is_empty() {
             return Err("`main` must take no parameters".to_string());
         }
+        // Push the `main` frame so a trace bottoms out at `main` (run_main is the
+        // entry point and does not go through the `Expr::Call` push path). No-op
+        // when stack tracking is off.
+        push_frame("main", main.line);
         let mut scope: Scope = vec![HashMap::new()];
-        self.eval_fn_body("main", &main.body, &mut scope)
+        let result = self.eval_fn_body("main", &main.body, &mut scope);
+        if result.is_ok() {
+            pop_frame();
+        }
+        result
+    }
+
+    /// Run `main` with RUNTIME STACK TRACKING on, returning a structured
+    /// `RuntimeError` (message + call frames, most-recent first) on failure. The
+    /// SUCCESS path is byte-for-byte identical to `run_main` (stack tracking only
+    /// records frames; it never alters values or output), so `aria run` success
+    /// output is unchanged. Used by `aria run` and the agent loop's error path.
+    pub fn run_main_traced(&self) -> Result<Value, RuntimeError> {
+        with_call_stack(|| self.run_main())
+    }
+
+    /// `run_main_capturing` with stack tracking on. Returns `(value, captured
+    /// stdout)` on success, or a structured `RuntimeError` (with the captured
+    /// stdout discarded — the partial output before the trap is not the signal we
+    /// surface) on failure. Used by the agent loop to RUN a clean-checking program
+    /// and feed back the runtime error + trace if it traps.
+    pub fn run_main_capturing_traced(&self) -> Result<(Value, String), RuntimeError> {
+        with_call_stack(|| self.run_main_capturing())
     }
 
     /// Run `main` with OUTPUT CAPTURE on: every `print_*` builtin appends its
@@ -618,13 +752,18 @@ impl Interp {
                         vals.len()
                     ));
                 }
+                let fn_line = f.line;
                 let mut frame = HashMap::new();
                 for (p, v) in f.params.iter().zip(vals.into_iter()) {
                     frame.insert(p.name.clone(), v);
                 }
                 let mut call_scope: Scope = vec![frame];
+                // Push this function's frame BEFORE the depth check so a
+                // recursion-limit error's trace includes the function that hit it.
+                push_frame(name, fn_line);
                 let d = self.depth.get() + 1;
                 if d > MAX_CALL_DEPTH {
+                    // Leave the frame on the stack (error path) for the trace.
                     return Err(format!(
                         "maximum recursion depth ({}) exceeded calling `{}`",
                         MAX_CALL_DEPTH, name
@@ -637,6 +776,10 @@ impl Interp {
                 // guard. Only this single nested call frame is on the stack.
                 let result = self.eval_fn_body(name, &f.body, &mut call_scope);
                 self.depth.set(d - 1);
+                // On success, pop our frame; on error, leave it for the trace.
+                if result.is_ok() {
+                    pop_frame();
+                }
                 result
             }
 
@@ -876,6 +1019,10 @@ impl Interp {
             frame.insert(p.clone(), v);
         }
         let mut call_scope: Scope = vec![frame];
+        // A closure has no single source definition line (it may be an anonymous
+        // lambda or a top-level function used as a value), so its trace frame
+        // carries line 0 and prints as `(generated)`.
+        push_frame(what, 0);
         let d = self.depth.get() + 1;
         if d > MAX_CALL_DEPTH {
             return Err(format!(
@@ -886,6 +1033,9 @@ impl Interp {
         self.depth.set(d);
         let result = self.eval(&data.body, &mut call_scope);
         self.depth.set(d - 1);
+        if result.is_ok() {
+            pop_frame();
+        }
         result
     }
 
@@ -1947,6 +2097,95 @@ mod tests {
         typeck::check(&prog).expect("typeck");
         let interp = Interp::new(&prog).expect("interp::new");
         interp.run_main_capturing().expect("run")
+    }
+
+    // Lex -> parse -> typeck -> interp with STACK TRACKING, expecting a runtime
+    // error and returning the structured `RuntimeError`.
+    fn run_traced_err(src: &str) -> RuntimeError {
+        let toks = lexer::lex(src).expect("lex");
+        let prog = parser::parse(toks).expect("parse");
+        typeck::check(&prog).expect("typeck");
+        let interp = Interp::new(&prog).expect("interp::new");
+        interp.run_main_traced().expect_err("expected a runtime error")
+    }
+
+    // ---- runtime stack traces (Feature 1) -----------------------------
+
+    #[test]
+    fn stack_trace_three_frames_div_by_zero() {
+        // main -> outer -> inner, where inner divides by zero. The trace is
+        // most-recent first with each function's DEFINITION line.
+        let src = "\
+fn inner(x: Int) -> Int = 1 / 0
+fn outer(x: Int) -> Int = inner(x)
+fn main() -> Int = outer(5)
+";
+        let err = run_traced_err(src);
+        assert_eq!(err.message, "division by zero");
+        assert_eq!(
+            err.frames,
+            vec![
+                Frame { function: "inner".into(), line: 1 },
+                Frame { function: "outer".into(), line: 2 },
+                Frame { function: "main".into(), line: 3 },
+            ]
+        );
+        // Rendered form.
+        let r = err.render();
+        assert!(r.starts_with("runtime error: division by zero"));
+        assert!(r.contains("\n  at `inner` (line 1)"));
+        assert!(r.contains("\n  at `outer` (line 2)"));
+        assert!(r.contains("\n  at `main` (line 3)"));
+    }
+
+    #[test]
+    fn stack_trace_index_out_of_bounds_carries_chain() {
+        // An out-of-bounds `array_get` is a RUNTIME trap (it type-checks), so its
+        // call chain is traced. (A non-exhaustive `match` is a COMPILE error in
+        // Aria and never reaches the interpreter, so it is not a runtime trace.)
+        let src = "\
+fn get_it(i: Int) -> Int = array_get(array_push(array_new(), 10), i)
+fn main() -> Int = get_it(5)
+";
+        let err = run_traced_err(src);
+        // Index-out-of-bounds message from the array builtin.
+        assert!(
+            err.message.contains("out of") || err.message.contains("index"),
+            "msg: {}",
+            err.message
+        );
+        let names: Vec<&str> = err.frames.iter().map(|f| f.function.as_str()).collect();
+        assert_eq!(names, vec!["get_it", "main"]);
+    }
+
+    #[test]
+    fn stack_trace_collapses_nontail_self_recursion() {
+        // A non-tail self-recursive function that traps must NOT produce one frame
+        // per recursive call: consecutive identical frames collapse to one.
+        // `boom` recurses in a non-tail position (the `+ 1` makes it non-tail),
+        // bottoming out by dividing by zero at n == 0.
+        let src = "\
+fn boom(n: Int) -> Int = if n == 0 { 1 / 0 } else { boom(n - 1) + 1 }
+fn main() -> Int = boom(20)
+";
+        let err = run_traced_err(src);
+        assert_eq!(err.message, "division by zero");
+        let names: Vec<&str> = err.frames.iter().map(|f| f.function.as_str()).collect();
+        // Collapsed: a single `boom` frame, then `main` — not 21 `boom` frames.
+        assert_eq!(names, vec!["boom", "main"]);
+    }
+
+    #[test]
+    fn successful_run_leaves_no_trace_and_is_unchanged() {
+        // The SUCCESS path through the traced runner returns the same value as the
+        // plain runner — stack tracking adds no behavior change.
+        let src = "fn main() -> Int = { print_int(3); 42 }";
+        let toks = lexer::lex(src).expect("lex");
+        let prog = parser::parse(toks).expect("parse");
+        typeck::check(&prog).expect("typeck");
+        let interp = Interp::new(&prog).expect("interp::new");
+        let v = interp.run_main_traced().expect("clean run");
+        assert_eq!(v.display(), "42");
     }
 
     // ---- output capture (Part 1) --------------------------------------
