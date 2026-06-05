@@ -14298,6 +14298,68 @@ mod tests {
     }
 
     #[test]
+    fn wasm_run_cli_prints_returned_float_identically_to_run_and_native() {
+        // FIX 2 regression guard: a `main -> Float` returning a SPECIAL value
+        // (±inf, -0) must be PRINTED identically by `aria run`, `aria native-run`,
+        // and `aria wasm-run`. The bit-comparison tests above never exercised the
+        // wasm-run print path, which used bare JS `String(v)` (=> "Infinity") and
+        // diverged from interp/native ("inf"). This drives the real `aria` binary.
+        if !node_available() {
+            return;
+        }
+        // Locate the freshly built `aria` binary next to the test runner exe
+        // (target/<profile>/aria). Unit tests inside the bin don't get
+        // CARGO_BIN_EXE_aria, so derive it from the current exe's directory.
+        let aria = {
+            let mut p = std::env::current_exe().expect("current exe");
+            p.pop(); // .../deps
+            if p.file_name().and_then(|s| s.to_str()) == Some("deps") {
+                p.pop();
+            }
+            p.push(if cfg!(windows) { "aria.exe" } else { "aria" });
+            p
+        };
+        if !aria.exists() {
+            // The binary may not be built in this layout (e.g. some CI runners);
+            // skip rather than fail spuriously.
+            return;
+        }
+        let cc_ok = Command::new("cc").arg("--version").output().map(|o| o.status.success()).unwrap_or(false);
+        let cases = [
+            ("fn main() -> Float = 1.0 / 0.0", "inf"),
+            ("fn main() -> Float = -1.0 / 0.0", "-inf"),
+            ("fn main() -> Float = 0.0 * -1.0", "-0"),
+        ];
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        for (src, expect) in cases {
+            let path = std::env::temp_dir().join(format!(
+                "aria_cli_float_{}_{}.aria",
+                std::process::id(),
+                SEQ.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::write(&path, src).expect("write temp source");
+            let run_for = |sub: &str| -> String {
+                let o = Command::new(&aria)
+                    .arg(sub)
+                    .arg(&path)
+                    .output()
+                    .expect("spawn aria");
+                String::from_utf8_lossy(&o.stdout).trim_end().to_string()
+            };
+            let interp = run_for("run");
+            let wasm = run_for("wasm-run");
+            assert_eq!(interp, expect, "interp printed `{}` for `{}`", interp, src);
+            assert_eq!(wasm, expect, "wasm-run printed `{}` (expected `{}`) for `{}`", wasm, expect, src);
+            if cc_ok {
+                let native = run_for("native-run");
+                assert_eq!(native, expect, "native-run printed `{}` for `{}`", native, src);
+            }
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    #[test]
     fn float_field_in_adt_is_garbage_free() {
         // An ADT carrying Float fields: sum/compare them, discard the cell. The
         // Float field is NOT reference-managed, so __drop just frees the cell;

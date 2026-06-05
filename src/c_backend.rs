@@ -2414,19 +2414,48 @@ const RUNTIME: &str = r#"#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <signal.h>
+#include <unistd.h>
 
 /* ---- live-cell accounting (the native analogue of wasm __live) ---- */
 static int64_t aria_live = 0;
 static int64_t aria_reuses = 0;
 
-/* ---- recursion-depth guard (the native analogue of the interpreter's
-   MAX_CALL_DEPTH). Incremented at the start of every emitted Aria function /
-   lambda body and decremented immediately before its single return. Genuine
-   non-tail recursion grows this with the C stack; a self-tail-recursive
-   function is TCO'd into a `goto` loop (the increment sits ABOVE the loop
-   label) so it never trips the limit. ---- */
-static int64_t aria_depth = 0;
-#define ARIA_MAX_CALL_DEPTH 100000
+/* ---- recursion / stack-overflow guard ----
+   Rather than counting frames (which a function with many live locals can blow
+   past silently, and which costs a per-call inc/dec/compare), we install a
+   SIGSEGV/SIGBUS handler on an alternate signal stack. Any stack overflow from
+   deep recursion -- of ANY frame size -- delivers SIGSEGV, which the handler
+   turns into a clean diagnostic and a non-zero exit. Self-tail-recursive
+   functions are TCO'd into a `goto` loop and never grow the stack at all.
+   The handler is async-signal-safe: it only write(2)s a fixed message and
+   _exit(70)s -- no printf/exit/malloc. */
+static char aria_sigstack[65536]; /* 64 KB alternate stack for the handler */
+
+static void aria_stack_overflow_handler(int sig) {
+    (void)sig;
+    static const char msg[] = "runtime error: stack overflow (recursion too deep)\n";
+    /* write(2) is async-signal-safe; ignore the (unrecoverable) return value. */
+    ssize_t n = write(2, msg, sizeof(msg) - 1);
+    (void)n;
+    _exit(70);
+}
+
+static void aria_install_stack_guard(void) {
+    stack_t ss;
+    ss.ss_sp = aria_sigstack;
+    ss.ss_size = sizeof(aria_sigstack);
+    ss.ss_flags = 0;
+    if (sigaltstack(&ss, NULL) != 0) return; /* best-effort; proceed without */
+
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = aria_stack_overflow_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_ONSTACK;
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
+}
 
 /* ---- ADT cell: { int64_t rc; int64_t tag; int64_t fields[]; } ---- */
 typedef struct { int64_t rc; int64_t tag; int64_t fields[]; } AriaCell;
@@ -3970,15 +3999,13 @@ pub fn compile(program: &Program) -> Result<String, String> {
             closures: &closures,
         };
         let _ = writeln!(src, "    {} aria_ret;", sig.ret.decl());
-        // Recursion-depth guard: increment ONCE on entry (above the tail-loop
-        // label so a TCO'd back-edge never re-counts), trap if too deep, and
-        // decrement at the single return below.
-        let _ = writeln!(src, "    if (++aria_depth > ARIA_MAX_CALL_DEPTH) aria_trap_msg(\"maximum recursion depth (100000) exceeded\");");
+        // Deep non-tail recursion is caught by the SIGSEGV/SIGBUS stack-overflow
+        // handler (installed in main), not a per-call counter, so there is no
+        // per-call overhead here.
         if ifn.tail_recursive {
             let _ = writeln!(src, "    aria_loop_top:;");
         }
         emit_iexpr(&ifn.body, "aria_ret", sig.ret, &mut env, "    ", &mut src)?;
-        let _ = writeln!(src, "    aria_depth--;");
         let _ = writeln!(src, "    return aria_ret;");
         let _ = writeln!(src, "}}");
         src.push('\n');
@@ -3994,6 +4021,9 @@ pub fn compile(program: &Program) -> Result<String, String> {
     //    count on stderr (garbage-free <=> aria_live == 0 for value results).
     let ret = sigs["main"].ret;
     let _ = writeln!(src, "int main(void) {{");
+    // Install the stack-overflow guard before running any Aria code so deep
+    // recursion of any frame size traps cleanly instead of SIGSEGV'ing silently.
+    let _ = writeln!(src, "    aria_install_stack_guard();");
     match ret {
         CType::Int => {
             let _ = writeln!(src, "    int64_t r = {}();", cfn("main"));
@@ -4211,11 +4241,9 @@ fn emit_lambda(
         closures,
     };
     let _ = writeln!(out, "    {} aria_ret;", ret_ct.decl());
-    // Recursion-depth guard (lambdas are not TCO'd, so they recurse on the C
-    // stack and must be counted too). Single inc on entry, dec before return.
-    let _ = writeln!(out, "    if (++aria_depth > ARIA_MAX_CALL_DEPTH) aria_trap_msg(\"maximum recursion depth (100000) exceeded\");");
+    // Deep recursion (lambdas are not TCO'd) is caught by the stack-overflow
+    // signal handler installed in main -- no per-call counter overhead.
     emit_iexpr(&ifn.body, "aria_ret", ret_ct, &mut env, "    ", out)?;
-    let _ = writeln!(out, "    aria_depth--;");
     let _ = writeln!(out, "    return aria_ret;");
     let _ = writeln!(out, "}}");
     out.push('\n');
@@ -4954,11 +4982,11 @@ mod tests {
 
     #[test]
     fn deep_non_tail_recursion_traps_cleanly_native() {
-        // Genuine (non-tail) recursion 500_000 deep would overflow the C stack
-        // and SIGSEGV (exit 139) without the guard. With the depth guard it must
-        // instead print the interpreter-style `maximum recursion depth (100000)
-        // exceeded` and exit cleanly with a defined non-zero status (70), never a
-        // signal (139/134).
+        // Genuine (non-tail) recursion 500_000 deep overflows the C stack. The
+        // SIGSEGV/SIGBUS stack-overflow handler (installed in main, running on an
+        // alternate signal stack) must turn that into a clean diagnostic
+        // (`stack overflow (recursion too deep)`) and a defined non-zero exit
+        // (70) -- NEVER a silent raw signal (139/134) or exit-1-no-output.
         let src = "fn sumto(n: Int) -> Int = if n == 0 { 0 } else { n + sumto(n - 1) }\n\
                    fn main() -> Int = sumto(500000)";
         let c_src = compile_src(src).expect("c compile should succeed");
@@ -4966,7 +4994,8 @@ mod tests {
             return;
         }
         let (_stdout, stderr, status) = build_and_run_status(&c_src).expect("build+run native");
-        // Clean defined trap: exit code 70, NOT a signal/segfault.
+        // Clean defined trap: exit code 70, NOT a raw signal (status.code()==None
+        // on a SIGSEGV that escaped the handler).
         assert_eq!(
             status.code(),
             Some(70),
@@ -4975,8 +5004,51 @@ mod tests {
             stderr.trim()
         );
         assert!(
-            stderr.contains("maximum recursion depth (100000) exceeded"),
-            "expected the recursion-depth trap message, got stderr `{}`",
+            stderr.contains("stack overflow (recursion too deep)"),
+            "expected the stack-overflow trap message, got stderr `{}`",
+            stderr.trim()
+        );
+    }
+
+    #[test]
+    fn deep_large_frame_recursion_traps_cleanly_native() {
+        // The case the old frame-COUNT guard missed: a non-tail recursive fn with
+        // many live locals overflows the C stack well before any 100k count would
+        // trip. The signal-handler guard catches it regardless of frame size.
+        let src = "fn deep(n: Int) -> Int = if n == 0 { 0 } else {\n\
+                       let a = n + 1;\n\
+                       let b = a + 2;\n\
+                       let c = b + 3;\n\
+                       let d = c + 4;\n\
+                       let e = d + 5;\n\
+                       let f = e + 6;\n\
+                       let g = f + 7;\n\
+                       let h = g + 8;\n\
+                       let i = h + 9;\n\
+                       let j = i + 10;\n\
+                       let k = j + 11;\n\
+                       let l = k + 12;\n\
+                       let m = l + 13;\n\
+                       let o = m + 14;\n\
+                       let p = o + 15;\n\
+                       (a + b + c + d + e + f + g + h + i + j + k + l + m + o + p) % 2 + deep(n - 1)\n\
+                   }\n\
+                   fn main() -> Int = deep(2000000)";
+        let c_src = compile_src(src).expect("c compile should succeed");
+        if !cc_available() {
+            return;
+        }
+        let (_stdout, stderr, status) = build_and_run_status(&c_src).expect("build+run native");
+        assert_eq!(
+            status.code(),
+            Some(70),
+            "large-frame deep recursion should trap cleanly (exit 70), got {:?}; stderr `{}`",
+            status,
+            stderr.trim()
+        );
+        assert!(
+            stderr.contains("stack overflow (recursion too deep)"),
+            "expected the stack-overflow trap message, got stderr `{}`",
             stderr.trim()
         );
     }
@@ -5002,16 +5074,16 @@ mod tests {
     }
 
     #[test]
-    fn sequential_under_limit_recursions_do_not_leak_depth_native() {
-        // Three sequential non-tail calls each 20_000 deep (under the limit) but
-        // cumulatively 60_000: they only succeed if the depth counter is
-        // decremented on return, so a later sibling call can't falsely trip the
-        // guard. (Depth kept at 20_000 because the interpreter oracle recurses on
-        // the Rust stack and tops out well below 100_000.) Differential +
-        // garbage-free.
+    fn many_sequential_moderate_recursions_succeed_native() {
+        // With no per-call counter, the only thing that bounds non-tail recursion
+        // is the actual C stack. Many sequential moderate-depth (10_000) non-tail
+        // calls -- cumulatively far more than any old counter limit -- must all
+        // succeed, since each returns and unwinds its frames before the next.
+        // Differential against the interpreter oracle + garbage-free.
         differential(
             "fn sumto(n: Int) -> Int = if n == 0 { 0 } else { n + sumto(n - 1) }\n\
-             fn main() -> Int = sumto(20000) + sumto(20000) + sumto(20000)",
+             fn main() -> Int = sumto(10000) + sumto(10000) + sumto(10000) \
+                              + sumto(10000) + sumto(10000) + sumto(10000)",
         );
     }
 }

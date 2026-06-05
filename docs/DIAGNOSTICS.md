@@ -44,7 +44,7 @@ object:
 | field      | type            | meaning                                                                 |
 |------------|-----------------|-------------------------------------------------------------------------|
 | `severity` | string          | `"error"` today. Room for `"warning"` later.                            |
-| `phase`    | string          | Compiler phase: `lex`, `parse`, `type`, `shape`, `purity`, `exhaustiveness`. |
+| `phase`    | string          | Compiler phase: `lex`, `parse`, `type`, `shape`, `purity`, `exhaustiveness`, or `io` (file read). |
 | `code`     | string          | **Stable** short code per error *category* (see table). Match on this.  |
 | `message`  | string          | Human-readable text (identical to the non-`--json` path).               |
 | `line`     | int or `null`   | 1-based source line if known, else `null`.                              |
@@ -69,14 +69,15 @@ the stable contract.
 | code    | phase            | category                                                              |
 |---------|------------------|-----------------------------------------------------------------------|
 | `E0001` | `lex`            | Lexing error (bad character, malformed number, bad string/escape).    |
+| `E0002` | `io`             | File I/O error (the source file cannot be read / does not exist).     |
 | `E0100` | `parse`          | Parse error (unexpected token, missing delimiter, bad pattern).       |
 | `E0200` | `type`           | Unknown / undefined name (unbound variable, unknown function/constructor/record). |
 | `E0201` | `type`           | Type mismatch (return/body, comparison, application, branch, `let`…). |
-| `E0202` | `type`           | Wrong arity (arguments, constructor/record fields, method params, type args). |
+| `E0202` | `type`           | Constructor / record fields: wrong arity (arguments, method params, type args) **and** named-field shape (missing / duplicate / unknown field). |
 | `E0203` | `exhaustiveness` | Non-exhaustive `match` (a constructor / nested case is unhandled).     |
 | `E0204` | `type`           | Unknown type or type parameter.                                       |
 | `E0205` | `type`           | Unused / un-inferable (phantom) type parameter.                       |
-| `E0206` | `type`           | Trait / bound resolution failure (method not callable, missing bound).|
+| `E0206` | `type`           | Trait / interface / impl: bound resolution failure (method not callable, missing bound) **and** interface/impl method-arity mismatch (reported as `type`/E0206 even though it is raised during parser-time trait lowering). |
 | `E0207` | `type`           | Duplicate or illegal redefinition (type, ctor, fn, builtin).          |
 | `E0210` | `purity`         | Purity violation (a `pure` fn performs / may perform IO).             |
 | `E0300` | `shape`          | Tensor shape mismatch (matmul/transpose/add dimension error).         |
@@ -89,14 +90,19 @@ New categories will get new `E####` codes; existing codes keep their meaning.
 - **`lex` / `parse` errors:** `line` IS populated (the lexer tracks a 1-based
   line per token; these messages carry a `line N:` prefix). `col` is `null` —
   the lexer does not track columns yet.
-- **`type` / `shape` / `purity` / `exhaustiveness` errors:** `function` IS
-  populated (extracted from the message, which already names the enclosing
-  function). `line`/`col` are `null` for these: attaching a precise source span
-  would require threading a span through every AST node, which is deferred. The
-  schema already has the fields, so adding precision later is non-breaking.
+- **`type` / `shape` / `purity` / `exhaustiveness` errors:** `function` is
+  populated **for function-scoped errors** (extracted from the message, which
+  names the enclosing function). It is `null` for declaration-level errors that
+  are not inside any function body — e.g. duplicate-declaration / redefinition
+  errors (`duplicate type`, `duplicate function`, `cannot redefine built-in`)
+  and `io` file-read errors. `line`/`col` are `null` for the semantic phases:
+  attaching a precise source span would require threading a span through every
+  AST node, which is deferred. The schema already has the fields, so adding
+  precision later is non-breaking. Consumers must always tolerate `function:
+  null` (per the forward-compatibility rules).
 
 This is a deliberate first-milestone scope: line-level for lex/parse,
-function-level for the semantic phases.
+function-level for function-scoped semantic errors.
 
 ## Examples
 

@@ -219,6 +219,7 @@ fn main_return_kind(path: &str) -> String {
         })?;
         Some(match &main.ret {
             ast::Ty::Str => "str".to_string(),
+            ast::Ty::Float => "float".to_string(),
             _ => "scalar".to_string(),
         })
     })();
@@ -312,10 +313,12 @@ fn run_wasm_run(args: &[String]) -> ExitCode {
          WebAssembly.instantiate(b,imp).then(r=>{{\
          try{{const ex=r.instance.exports;memref=ex.memory;\
          const isStr={};\
+         const isFloat={};\
          const v=ex.main();\
          if(isStr){{process.stdout.write(decodeStr(v));\
          if(ex.__drop_str){{ex.__drop_str(v);}}}}\
          else if(typeof v==='bigint'){{process.stdout.write(String(v));}}\
+         else if(isFloat){{process.stdout.write(fmtFloat(v));}}\
          else{{process.stdout.write(String(v));}}\
          if(ex.__live){{process.stderr.write('__live='+String(ex.__live()));}}\
          if(ex.__reuses){{process.stderr.write(' __reuses='+String(ex.__reuses()));}}}}\
@@ -323,7 +326,8 @@ fn run_wasm_run(args: &[String]) -> ExitCode {
          }}).catch(e=>{{process.stdout.write('TRAP');process.exitCode=1;}});}}\
          catch(e){{process.stdout.write('TRAP');process.exitCode=1;}}",
         path.to_string_lossy(),
-        if main_ret == "str" { "true" } else { "false" }
+        if main_ret == "str" { "true" } else { "false" },
+        if main_ret == "float" { "true" } else { "false" }
     );
     // `--stack-size` raises V8's stack so compiled wasm can recurse as deeply as
     // the interpreter / native backend (wasm under Node's default stack traps on

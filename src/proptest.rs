@@ -1326,7 +1326,6 @@ fn native_matches_interpreter_fuzz() {
                 skipped += 1;
                 continue;
             }
-            cov.observe(&src);
             let prog = parser::parse(lexer::lex(&src).expect("lex")).expect("parse");
             let c_src = match crate::c_backend::compile(&prog) {
                 Ok(c) => c,
@@ -1336,6 +1335,11 @@ fn native_matches_interpreter_fuzz() {
                     continue;
                 }
             };
+            // Only count coverage for programs that actually reached native
+            // codegen (mirrors the wasm fuzzer): if a Map/Set/Vector program ever
+            // falls out of the native subset it Err-skips and no longer masks a
+            // gap by still satisfying the coverage assertion.
+            cov.observe(&src);
             let interp = ast_run(&src);
             let (nat, live) = run_native_live(&c_src).unwrap_or_else(|e| {
                 panic!("{} seed {}: native runner failed: {}\n{}", tag, seed, e, src)
@@ -3185,6 +3189,8 @@ fn dvar(x: Float) -> Dual = Dual { v: x, d: 1.0 }
 fn dadd(a: Dual, b: Dual) -> Dual = Dual { v: a.v + b.v, d: a.d + b.d }
 fn dsub(a: Dual, b: Dual) -> Dual = Dual { v: a.v - b.v, d: a.d - b.d }
 fn dmul(a: Dual, b: Dual) -> Dual = Dual { v: a.v * b.v, d: a.d * b.v + a.v * b.d }
+fn ddiv(a: Dual, b: Dual) -> Dual = Dual { v: a.v / b.v, d: (a.d * b.v - a.v * b.d) / (b.v * b.v) }
+fn dscale(a: Dual, s: Float) -> Dual = Dual { v: a.v * s, d: a.d * s }
 fn grad1(f: (Dual) -> Dual, x: Float) -> Float = (f(dvar(x))).d
 "#;
 
@@ -3197,7 +3203,9 @@ fn parse_float_result(s: &str) -> f64 {
 fn autodiff_dual_matches_finite_difference() {
     // Each case: an Aria function body of a `Dual -> Dual` named `fcase`, the
     // point x, and the equivalent plain-f64 closure for the finite-difference
-    // reference. The dual rules above cover +, -, * which is enough for these.
+    // reference. The dual rules above cover +, -, *, / (quotient rule) and scale
+    // by a constant — so a wrong ddiv/dscale rule would be caught here, not slip
+    // through CI.
     struct Case {
         body: &'static str,           // body of `fn fcase(x: Dual) -> Dual = ...`
         f: fn(f64) -> f64,            // same function on plain f64
@@ -3212,6 +3220,16 @@ fn autodiff_dual_matches_finite_difference() {
         Case { body: "dadd(dmul(x, x), dmul(dconst(2.0), x))", f: |x| x * x + 2.0 * x, x: 0.7 },
         // (x - 3)^2
         Case { body: "{ let t = dsub(x, dconst(3.0)); dmul(t, t) }", f: |x| (x - 3.0) * (x - 3.0), x: 5.0 },
+        // ddiv: f(x) = x / (x + 1)  =>  f'(x) = 1 / (x + 1)^2
+        Case { body: "ddiv(x, dadd(x, dconst(1.0)))", f: |x| x / (x + 1.0), x: 2.0 },
+        // ddiv: f(x) = 1 / x  =>  f'(x) = -1 / x^2  (constant numerator)
+        Case { body: "ddiv(dconst(1.0), x)", f: |x| 1.0 / x, x: 4.0 },
+        // ddiv with a non-trivial numerator: f(x) = (x^2) / (x + 2)
+        Case { body: "ddiv(dmul(x, x), dadd(x, dconst(2.0)))", f: |x| (x * x) / (x + 2.0), x: 1.5 },
+        // dscale: f(x) = 5 * x  =>  f'(x) = 5
+        Case { body: "dscale(x, 5.0)", f: |x| 5.0 * x, x: -0.6 },
+        // dscale composed: f(x) = 3 * x^2  =>  f'(x) = 6x
+        Case { body: "dscale(dmul(x, x), 3.0)", f: |x| 3.0 * x * x, x: 2.2 },
     ];
 
     let cc = cc_available();

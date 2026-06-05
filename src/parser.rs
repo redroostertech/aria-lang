@@ -25,6 +25,39 @@ pub struct Parser {
     /// Tuple arities used anywhere in the source, so `parse_program` can inject a
     /// synthetic `$TupleN` ADT for exactly those (and no others).
     tuple_arities: std::collections::HashSet<usize>,
+    /// Current recursion depth of the recursive-descent expression/type parser.
+    /// Bounded by `MAX_NESTING_DEPTH` so pathological nesting (e.g. 100k nested
+    /// parens) yields a CLEAN parse error instead of overflowing the Rust stack
+    /// (which would abort the process with SIGSEGV/exit 134 and break the
+    /// "`--json` always emits valid JSON or a clean error" contract).
+    depth: usize,
+}
+
+/// Maximum nesting depth for the expression / type parser. Set far above any
+/// real program (deeply nested but human-authored code is nowhere near this)
+/// while still bounding the Rust call stack well below an overflow.
+const MAX_NESTING_DEPTH: usize = 2048;
+
+/// RAII guard returned by `Parser::enter_depth`: decrements the parser's nesting
+/// counter when it drops, so the depth is restored on every control-flow path
+/// (normal return or `?` early-exit) without manual bookkeeping. It holds a raw
+/// pointer (not a `&mut`) so the parser body can keep using `&mut self` freely
+/// while the guard is alive; the pointer targets `self.depth`, which outlives
+/// the guard (the guard is a local in a `&mut self` method), so the deref is
+/// sound and single-threaded.
+struct DepthGuard {
+    depth: *mut usize,
+}
+
+impl Drop for DepthGuard {
+    fn drop(&mut self) {
+        // SAFETY: `depth` points at the live `Parser::depth` field for the
+        // duration of the borrowing method call (the guard never outlives it),
+        // and the parser is single-threaded, so this is the only access.
+        unsafe {
+            *self.depth -= 1;
+        }
+    }
 }
 
 fn is_upper(name: &str) -> bool {
@@ -59,7 +92,26 @@ impl Parser {
             lambda_counter: 0,
             no_record_literal: false,
             tuple_arities: std::collections::HashSet::new(),
+            depth: 0,
         }
+    }
+
+    /// Enter one level of expression/type recursion, erroring cleanly if the
+    /// nesting limit is exceeded. The returned guard decrements on drop, so the
+    /// counter is correct on every path (including early `?` returns).
+    fn enter_depth(&mut self) -> Result<DepthGuard, String> {
+        self.depth += 1;
+        if self.depth > MAX_NESTING_DEPTH {
+            // Decrement before bailing so a recovering caller sees a consistent
+            // counter (the guard is not constructed on this path).
+            self.depth -= 1;
+            return Err(format!(
+                "line {}: expression nesting too deep (limit {})",
+                self.line(),
+                MAX_NESTING_DEPTH
+            ));
+        }
+        Ok(DepthGuard { depth: &mut self.depth as *mut usize })
     }
 
     /// Record that an `n`-tuple is used and return its synthetic ADT name.
@@ -409,6 +461,9 @@ impl Parser {
     // a bare name found there becomes a `Ty::Var`, builtins map to their concrete
     // types, and anything else is a `Ty::Named` with optional `[..]` arguments.
     fn parse_type(&mut self, tparams: &[String]) -> Result<Ty, String> {
+        // Bound the recursion depth (nested function/parameterised types) so
+        // pathological nesting yields a clean error, not a stack overflow.
+        let _guard = self.enter_depth()?;
         // Function type: `(T1, T2, ...) -> R`. The leading `(` unambiguously
         // distinguishes it from a named/builtin type (which starts with an
         // identifier).
@@ -499,6 +554,12 @@ impl Parser {
     }
 
     fn parse_expr(&mut self, min_bp: u8) -> Result<Expr, String> {
+        // Bound the recursive-descent depth: every nested sub-expression (parens,
+        // operands, args, blocks) re-enters here, so a pathological nest (e.g.
+        // 100k nested `(`) hits the limit and returns a clean parse error instead
+        // of overflowing the Rust stack (which would SIGSEGV / exit 134 and break
+        // the `--json` "valid JSON or clean error" contract).
+        let _guard = self.enter_depth()?;
         let mut lhs = self.parse_unary()?;
         loop {
             let (op, lbp, rbp) = match Parser::bin_power(self.peek()) {
@@ -990,4 +1051,67 @@ impl Parser {
 
 pub fn parse(toks: Vec<Token>) -> Result<Program, String> {
     Parser::new(toks).parse_program()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_src(src: &str) -> Result<Program, String> {
+        let toks = crate::lexer::lex(src)?;
+        parse(toks)
+    }
+
+    #[test]
+    fn deeply_nested_parens_yield_clean_error_not_overflow() {
+        // ~200k nested parens previously overflowed the recursive-descent stack
+        // (SIGSEGV / exit 134, no output). The depth guard must instead return a
+        // clean parse error (a normal `Err`, never a crash).
+        let n = 200_000;
+        let src = format!(
+            "fn main() -> Int = {}1{}",
+            "(".repeat(n),
+            ")".repeat(n)
+        );
+        let err = parse_src(&src).expect_err("deep nesting should be a clean parse error");
+        assert!(
+            err.contains("expression nesting too deep"),
+            "expected the nesting-depth error, got `{}`",
+            err
+        );
+    }
+
+    #[test]
+    fn deeply_nested_types_yield_clean_error_not_overflow() {
+        // The type parser is mutually recursive too; nest parameterised types
+        // pathologically and confirm a clean error rather than a stack overflow.
+        let n = 100_000;
+        let src = format!(
+            "fn main() -> {}Int{} = 0",
+            "Array[".repeat(n),
+            "]".repeat(n)
+        );
+        let err = parse_src(&src).expect_err("deep type nesting should be a clean parse error");
+        assert!(
+            err.contains("expression nesting too deep"),
+            "expected the nesting-depth error, got `{}`",
+            err
+        );
+    }
+
+    #[test]
+    fn normal_nesting_parses_fine() {
+        // A few hundred levels deep is comfortably under the limit and must parse.
+        let n = 300;
+        let src = format!(
+            "fn main() -> Int = {}1{}",
+            "(".repeat(n),
+            ")".repeat(n)
+        );
+        let prog = parse_src(&src).expect("normal nesting should parse");
+        assert!(
+            prog.items.iter().any(|it| matches!(it, Item::Fn(f) if f.name == "main")),
+            "parsed program should contain `main`"
+        );
+    }
 }

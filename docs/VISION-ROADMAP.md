@@ -562,8 +562,13 @@ $ aria wasm-run   examples/autodiff.aria     # compile to wasm, run via Node
 ```
 `diff` of all three outputs: **IDENTICAL**. Native reports `aria_live=0
 aria_reuses=0`; wasm reports `__live=0 __reuses=0` — **garbage-free** on both
-compiled backends. (Float formatting is identical by construction: `aria_fmt_float`
-in the C runtime and the wasm JS renderer both match Rust's `format!("{}", f)`.)
+compiled backends. (Float formatting is kept in agreement deliberately, not "for
+free": the C runtime's `aria_fmt_float` and the wasm JS `fmtFloat` renderer each
+reproduce Rust's `format!("{}", f)` shortest-round-trip output — including the
+special cases `inf`/`-inf`/`NaN`/`-0` — for both printed floats and a `main` that
+*returns* a Float. This is enforced by differential tests across run/native-run/
+wasm-run rather than guaranteed by a shared implementation, so it holds today but
+is a property the tests defend, not a structural impossibility of divergence.)
 
 **Where the Dual library lives — decision.** *Inside the example*, not the
 prelude. The prelude (`src/prelude.rs`) currently holds only generic

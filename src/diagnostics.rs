@@ -43,7 +43,12 @@ impl Diagnostic {
     pub fn error(phase: &'static str, message: String) -> Diagnostic {
         let function = extract_function(&message);
         let line = extract_line(&message);
-        let code = classify(phase, &message);
+        // Some errors are RAISED in one phase but logically belong to another
+        // (e.g. a file-read failure arrives via the `lex` construction site; an
+        // interface/impl arity mismatch is raised during parser-time trait
+        // lowering). Reclassify by message content so the reported (phase, code)
+        // matches the documented bucket regardless of where it was raised.
+        let (phase, code) = reclassify(phase, &message);
         Diagnostic {
             severity: "error",
             phase,
@@ -169,12 +174,66 @@ fn extract_line(message: &str) -> Option<usize> {
 /// avoids a large refactor while still giving consumers stable codes. The codes
 /// (not the heuristics) are the contract.
 pub fn classify(phase: &str, message: &str) -> &'static str {
+    reclassify(phase, message).1
+}
+
+/// Returns true for messages that are file/stream I/O failures (a missing or
+/// unreadable source file), which are NOT a compiler phase.
+fn is_io_message(m: &str) -> bool {
+    m.starts_with("cannot read ")
+}
+
+/// Returns true for interface/impl/trait-resolution messages. These can arrive
+/// via the parse path (parser-time trait lowering) but logically belong to the
+/// type phase under the trait/bound code (E0206).
+fn is_trait_message(m: &str) -> bool {
+    m.contains("the interface declares")
+        || m.contains("interface")
+        || m.contains("impl `")
+        || m.contains("requires its type parameter")
+        || m.contains("is not bounded by")
+        || m.contains("trait method")
+}
+
+/// Map a raised `(phase, message)` to the documented `(phase, code)`, letting
+/// message content override the raising phase for cross-cutting categories
+/// (I/O, trait/interface) that don't belong to the phase that produced them.
+fn reclassify(phase: &str, message: &str) -> (&'static str, &'static str) {
+    // File I/O: distinct `io` phase + `E0002` (NOT a lex error).
+    if is_io_message(message) {
+        return ("io", "E0002");
+    }
+    // Trait / interface / impl: type phase + E0206, even via the parse path.
+    if is_trait_message(message) {
+        return ("type", "E0206");
+    }
+    (static_phase(phase), classify_by_phase(phase, message))
+}
+
+/// The canonical `phase` string (interned) for a raised phase, used when no
+/// content-based reclassification applies.
+fn static_phase(phase: &str) -> &'static str {
+    match phase {
+        "lex" => "lex",
+        "parse" => "parse",
+        "type" => "type",
+        "shape" => "shape",
+        "purity" => "purity",
+        "exhaustiveness" => "exhaustiveness",
+        "io" => "io",
+        _ => "type",
+    }
+}
+
+/// Phase-driven code for the non-reclassified path.
+fn classify_by_phase(phase: &str, message: &str) -> &'static str {
     match phase {
         "lex" => "E0001",
         "parse" => "E0100",
         "shape" => "E0300",
         "purity" => "E0210",
         "exhaustiveness" => "E0203",
+        "io" => "E0002",
         "type" => classify_type(message),
         _ => "E0900",
     }
@@ -212,11 +271,17 @@ fn classify_type(m: &str) -> &'static str {
     if m.contains("is unused (cannot be inferred)") {
         return "E0205";
     }
-    // Arity: wrong number of arguments / fields / parameters / type arguments.
+    // Arity / constructor-and-record field shape: wrong number of arguments /
+    // fields / parameters / type arguments, AND named-field shape errors
+    // (missing / duplicate / unknown field) all live in the constructor/record
+    // fields bucket (E0202).
     if m.contains("expects") && (m.contains("argument(s)") || m.contains("field(s)"))
         || m.contains("takes") && m.contains("parameter(s)")
         || m.contains("type argument(s)")
         || m.contains("element tuple pattern cannot match")
+        || m.contains("missing field `")
+        || m.contains("duplicate field `")
+        || m.contains("has no field `")
     {
         return "E0202";
     }
@@ -346,5 +411,55 @@ mod tests {
             classify("purity", "function `g` is declared `pure` but performs IO (calls `print_int`)"),
             "E0210"
         );
+    }
+
+    #[test]
+    fn record_field_shape_errors_are_e0202() {
+        // Record named-field shape errors live in the constructor/record-fields
+        // bucket (E0202), NOT the type-mismatch family (E0201).
+        for m in [
+            "record `Point`: missing field `y`",
+            "record `Point`: duplicate field `x`",
+            "record `Point` has no field `z`",
+            "type `Point` has no field `z`",
+            "record update: duplicate field `x`",
+        ] {
+            let d = Diagnostic::error("type", m.into());
+            assert_eq!(d.code, "E0202", "expected E0202 for `{}`, got {}", m, d.code);
+            assert_eq!(d.phase, "type");
+        }
+    }
+
+    #[test]
+    fn interface_impl_arity_is_type_phase_e0206_even_via_parse() {
+        // The interface/impl method-arity mismatch is RAISED during parser-time
+        // trait lowering (phase `parse`), but must be reported as a trait/bound
+        // error: phase `type`, code E0206.
+        let m = "impl `Show` for `Point`: method `show` takes 2 parameter(s) but the interface declares 1";
+        let d = Diagnostic::error("parse", m.into());
+        assert_eq!(d.phase, "type", "interface arity should be type phase");
+        assert_eq!(d.code, "E0206", "interface arity should be E0206");
+    }
+
+    #[test]
+    fn file_read_error_is_io_phase_e0002() {
+        // A missing/unreadable source file is an I/O failure, not a lex error.
+        let d = Diagnostic::error("lex", "cannot read foo.aria: No such file or directory (os error 2)".into());
+        assert_eq!(d.phase, "io", "file read error should be io phase");
+        assert_eq!(d.code, "E0002", "file read error should be E0002");
+    }
+
+    #[test]
+    fn declaration_level_errors_have_null_function() {
+        // Declaration-level errors legitimately carry `function: null` (the doc's
+        // softened wording): they are not scoped to a function body.
+        for m in [
+            "duplicate type `Point`",
+            "duplicate function `f`",
+            "cannot redefine built-in `print_int`",
+        ] {
+            let d = Diagnostic::error("type", m.into());
+            assert!(d.function.is_none(), "`{}` should have function: null", m);
+        }
     }
 }
