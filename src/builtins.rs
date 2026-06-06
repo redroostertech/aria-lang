@@ -89,6 +89,14 @@ fn build_signatures() -> Vec<(&'static str, Vec<Ty>, Ty)> {
         ("softmax", vec![tensor()], tensor()),
         ("relu", vec![tensor()], tensor()),
         ("embed_similarity", vec![Str, Str], Float),
+        // `embed(text)` -> the LEARNED count-based (PPMI + truncated-SVD)
+        // distributional embedding of `text` as a first-class `Vector`, so it
+        // composes with the retrieval prelude (`nearest`/`similarities` over
+        // `Array[Vector]`). INTERPRETER-ONLY: the learned vocabulary->vector
+        // table is a Rust-runtime artifact, so the compiled backends reject
+        // `embed` (and `embed_similarity`) with a clean Err, like the codec
+        // builtins.
+        ("embed", vec![Str], vector()),
         ("compressed_size", vec![Str], Int),
         ("neural_bits_per_byte", vec![Str], Float),
         // ---- Arrays (generic, functional with FBIP in-place reuse) ---------

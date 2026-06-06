@@ -34,6 +34,7 @@ mod builtins;
 mod c_backend;
 mod dataflow;
 mod diagnostics;
+mod embed;
 mod gbnf;
 mod interp;
 mod ir;

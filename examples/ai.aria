@@ -27,13 +27,15 @@ fn main() -> Int = {
   print_str("matmul(a, identity) element (1,1):");
   print_float(tensor_get(prod, 1, 1));
 
-  -- Embedding similarity: related strings score higher than unrelated ones.
+  -- Embedding similarity: with LEARNED count-based (PPMI + truncated-SVD)
+  -- distributional embeddings, semantically related strings score higher than
+  -- unrelated ones — real semantics, not token hashing.
   print_str("similarity (related):");
-  print_float(embed_similarity("cosine similarity over vectors",
-                               "vectors ranked by cosine similarity"));
+  print_float(embed_similarity("the cat is a small pet animal",
+                               "the dog is a loyal pet animal"));
   print_str("similarity (unrelated):");
-  print_float(embed_similarity("cosine similarity over vectors",
-                               "a balanced breakfast of fruit and grains"));
+  print_float(embed_similarity("the cat is a small pet animal",
+                               "the king rules the kingdom from the throne"));
 
   -- Compression: rANS-coded size in bytes of a repetitive string.
   print_str("compressed_size of repetitive text:");

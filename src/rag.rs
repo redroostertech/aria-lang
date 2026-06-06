@@ -3,12 +3,15 @@
 //! Retrieval in Aria is not a library bolted on top of the language: it is a
 //! built-in capability backed by the same numeric core as the rest of the
 //! runtime. This module provides a small, dependency-free vector store with
-//! cosine-similarity search and a deterministic hashing embedder, so a demo
-//! (and the tests) need no external model or network access.
+//! cosine-similarity search, so a demo (and the tests) need no external model
+//! or network access.
 //!
-//! Embeddings are plain `Vec<f32>` rows. Swapping in real model embeddings
-//! later only changes how vectors are produced, not how they are stored or
-//! searched.
+//! Embeddings are plain `Vec<f32>` rows. The `demo` retrieves over the LEARNED
+//! count-based (PPMI + truncated-SVD) distributional embeddings in
+//! `crate::embed` — real semantics, not a hash. The `hash_embed` lexical
+//! embedder below is retained only as a tiny deterministic baseline used by
+//! this module's own unit tests; it is no longer on the `embed_similarity` /
+//! `embed` runtime path.
 
 /// One stored document: an identifier, its raw text, and its embedding.
 #[derive(Debug, Clone)]
@@ -143,30 +146,39 @@ fn l2_normalize(v: &mut [f32]) {
 }
 
 /// Build a tiny corpus, embed a query, and print the ranked retrieval results.
+///
+/// Uses the LEARNED count-based (PPMI + truncated-SVD) distributional model
+/// (`crate::embed`) — real semantics, not a hash — so a query retrieves
+/// documents that are *meaning*-related, not merely token-overlapping.
 pub fn demo() {
-    const DIM: usize = 64;
+    let dim = crate::embed::DIM;
 
     let corpus = [
-        ("d1", "the cat sat on the warm windowsill in the sun"),
-        ("d2", "dogs are loyal companions that love long walks"),
-        ("d3", "rust is a systems programming language with no garbage collector"),
-        ("d4", "vectors and cosine similarity power semantic search"),
-        ("d5", "the quick brown fox jumps over the lazy dog"),
-        ("d6", "neural networks learn embeddings from large text corpora"),
-        ("d7", "a balanced breakfast includes fruit and whole grains"),
+        ("d1", "the cat is a small pet that sleeps in the warm sun"),
+        ("d2", "the dog is a loyal pet that loves a long walk"),
+        ("d3", "the king and the queen rule the kingdom from the castle"),
+        ("d4", "the apple and the orange are sweet fruit that people eat"),
+        ("d5", "the river flows through the green valley to the wide sea"),
+        ("d6", "the car drives fast along the long open road"),
+        ("d7", "the mother and the father love their son and daughter"),
     ];
 
     let mut store = EmbeddingStore::new();
     for (id, text) in corpus.iter() {
-        store.add(*id, *text, hash_embed(text, DIM));
+        store.add(*id, *text, crate::embed::embed(text));
     }
 
-    let query = "semantic search with cosine similarity over vectors";
-    let q = hash_embed(query, DIM);
+    let query = "a kitten is a young animal kept as a pet at home";
+    let q = crate::embed::embed(query);
 
-    println!("RAG demo: {} docs, dim={}", store.len(), DIM);
+    println!(
+        "RAG demo (learned PPMI+SVD embeddings): {} docs, dim={}, vocab={}",
+        store.len(),
+        dim,
+        crate::embed::model().vocab_len()
+    );
     println!("query: {:?}", query);
-    println!("top-3 results:");
+    println!("top-3 results (cosine over learned embeddings):");
     for (rank, (score, id, text)) in store.top_k(&q, 3).into_iter().enumerate() {
         println!("  {}. [{:.4}] {}: {}", rank + 1, score, id, text);
     }

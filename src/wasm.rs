@@ -2746,14 +2746,16 @@ fn emit_bytes_builtin(
 
 /// The Tensor / embedding builtins the wasm backend implements (Phase 2f).
 /// Returns the wasm result type of `name`, or `None` if it is not one of them.
-/// The codec builtins (`compressed_size`, `neural_bits_per_byte`) are
-/// intentionally NOT here — they remain a clean Err (deferred).
+/// The codec builtins (`compressed_size`, `neural_bits_per_byte`) and the
+/// learned-embedding builtins (`embed`, `embed_similarity`) are intentionally
+/// NOT here — they are interpreter-only (the learned PPMI+SVD vocabulary table
+/// is a Rust-runtime artifact) and remain a clean Err (deferred).
 fn tensor_builtin_ret(name: &str) -> Option<WType> {
     Some(match name {
         "tensor_zeros" | "tensor_set" | "matmul" | "transpose" | "softmax" | "relu" => {
             WType::Tensor
         }
-        "tensor_get" | "embed_similarity" => WType::F64,
+        "tensor_get" => WType::F64,
         "tensor_rows" | "tensor_cols" => WType::I64,
         "tensor_row" => WType::Vector,
         "tensor_from_rows" => WType::Tensor,
@@ -2827,11 +2829,6 @@ fn emit_tensor_builtin(
         "transpose" => (vec![WType::Tensor], HeapHelper::Transpose, WType::Tensor),
         "relu" => (vec![WType::Tensor], HeapHelper::Relu, WType::Tensor),
         "softmax" => (vec![WType::Tensor], HeapHelper::Softmax, WType::Tensor),
-        "embed_similarity" => (
-            vec![WType::Str, WType::Str],
-            HeapHelper::EmbedSim,
-            WType::F64,
-        ),
         _ => return Err(format!("wasm backend: unknown tensor builtin `{}`", name)),
     };
     push_args(env, code, &expect)?;
@@ -14575,18 +14572,19 @@ mod tests {
     }
 
     #[test]
-    fn embed_similarity_matches_interpreter() {
-        // Identical strings -> cosine ~1.0; both backends agree (approx, since
-        // FNV/normalization is f32 and division may round slightly).
-        differential_float_approx(
-            "fn main() -> Float = embed_similarity(\"cosine similarity over vectors\", \"cosine similarity over vectors\")",
-            1e-5,
-        );
-        // Unrelated strings -> a much smaller similarity; agreement within tol.
-        differential_float_approx(
-            "fn main() -> Float = embed_similarity(\"cosine similarity over vectors\", \"the weather is cold and rainy today\")",
-            1e-5,
-        );
+    fn learned_embedding_builtins_are_interpreter_only() {
+        // `embed_similarity` and `embed` now use a LEARNED count-based
+        // (PPMI + truncated-SVD) distributional model whose vocabulary->vector
+        // table is a Rust-runtime artifact. They are interpreter-only and the
+        // wasm backend must reject them with a clean Err (no panic), exactly
+        // like the codec builtins — never a silently divergent result.
+        for src in [
+            "fn main() -> Float = embed_similarity(\"the cat\", \"the dog\")",
+            "fn main() -> Int = vec_len(embed(\"the cat\"))",
+        ] {
+            let r = compile_src(src);
+            assert!(r.is_err(), "expected wasm Err (interpreter-only) for:\n{}", src);
+        }
     }
 
     #[test]

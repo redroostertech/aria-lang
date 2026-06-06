@@ -1767,11 +1767,22 @@ fn builtin(name: &str, args: &[Value]) -> Result<Option<Value>, String> {
         },
         "embed_similarity" => match args {
             [Value::Str(a), Value::Str(b)] => {
-                let va = crate::rag::hash_embed(a, 64);
-                let vb = crate::rag::hash_embed(b, 64);
-                Ok(Some(Value::Float(crate::rag::cosine_similarity(&va, &vb) as f64)))
+                // Cosine over the LEARNED count-based (PPMI + truncated-SVD)
+                // distributional embeddings of each text — real semantics, not
+                // a hash. Related texts score higher than unrelated ones.
+                Ok(Some(Value::Float(crate::embed::embed_similarity(a, b) as f64)))
             }
             _ => Err("embed_similarity expects (String, String)".into()),
+        },
+        "embed" => match args {
+            [Value::Str(s)] => {
+                // The learned embedding of `s` as a first-class Vector (length
+                // crate::embed::DIM), so it composes with the retrieval prelude
+                // (`nearest`/`similarities` over `Array[Vector]`).
+                let v = crate::embed::embed(s);
+                Ok(Some(Value::Vector(v.into_iter().map(|f| f as f64).collect())))
+            }
+            _ => Err("embed expects (String)".into()),
         },
         "compressed_size" => match args {
             [Value::Str(s)] => {
@@ -3110,16 +3121,62 @@ fn main() -> Int = boom(20)
 
     #[test]
     fn embed_similarity_related_beats_unrelated() {
-        // Identical strings -> cosine ~1.0.
-        let src = r#"
+        // `embed_similarity` now uses the LEARNED count-based (PPMI + truncated
+        // SVD) distributional model: identical text -> cosine ~1.0, AND a
+        // semantically related pair must out-score an unrelated pair (a hash
+        // could not do this — it is the proof the embedding is real).
+        let identical = run(r#"
             fn main() -> Float =
-                embed_similarity("cosine similarity over vectors",
-                                 "cosine similarity over vectors")
-        "#;
-        match run(src) {
-            Value::Float(f) => assert!((f - 1.0).abs() < 1e-5, "identical text similarity was {f}"),
+                embed_similarity("the cat is a small pet animal",
+                                 "the cat is a small pet animal")
+        "#);
+        match identical {
+            Value::Float(f) => assert!((f - 1.0).abs() < 1e-4, "identical text similarity was {f}"),
             v => panic!("expected Float, got {}", v.display()),
         }
+
+        let related = match run(r#"
+            fn main() -> Float =
+                embed_similarity("the cat is a small pet animal",
+                                 "the dog is a loyal pet animal")
+        "#) {
+            Value::Float(f) => f,
+            v => panic!("expected Float, got {}", v.display()),
+        };
+        let unrelated = match run(r#"
+            fn main() -> Float =
+                embed_similarity("the cat is a small pet animal",
+                                 "the king rules the kingdom from his throne")
+        "#) {
+            Value::Float(f) => f,
+            v => panic!("expected Float, got {}", v.display()),
+        };
+        assert!(
+            related > unrelated,
+            "related pair {related} should out-score unrelated pair {unrelated}"
+        );
+    }
+
+    #[test]
+    fn embed_builtin_returns_vector_and_retrieves() {
+        // `embed(text) -> Vector` produces a first-class learned embedding that
+        // composes with the retrieval prelude (`nearest`/`similarities` over an
+        // `Array[Vector]`). End-to-end real-embedding retrieval: a cat query
+        // must retrieve the dog document (index 0) over the king document
+        // (index 1).
+        // `nearest` comes from the retrieval prelude, so wrap the program.
+        let v = run(&crate::prelude::wrap(r#"
+            fn main() -> Int = {
+                let store: Array[Vector] = [ embed("the dog is a loyal pet animal"),
+                                             embed("the king rules the kingdom") ];
+                nearest(store, embed("a cat is a small pet"))
+            }
+        "#));
+        assert!(matches!(v, Value::Int(0)), "expected nearest = 0 (dog doc), got {}", v.display());
+
+        // `embed` yields a Vector of the model dimension.
+        let d = run(r#"fn main() -> Int = vec_len(embed("the cat"))"#);
+        assert!(matches!(d, Value::Int(64)), "expected dim 64, got {}", d.display());
     }
 
     // ---- self-tail-call optimization -----------------------------------
