@@ -1391,6 +1391,212 @@ fn native_matches_interpreter_fuzz() {
 }
 
 // ---------------------------------------------------------------------------
+// 7b) Reverse-mode autodiff `grad` on the NATIVE backend: differential vs. the
+//     interpreter oracle, AND vs. central finite differences (so the test
+//     proves the gradients are genuinely CORRECT, not merely matching a
+//     possibly-wrong oracle). Each program returns the gradient Vector through
+//     `main`, compared bit-for-bit interp-vs-native and within a tight tolerance
+//     against finite differences. Also checks garbage-freedom (aria_live == 0)
+//     and the gating of unsupported `f` bodies and the wasm/mem backends.
+// ---------------------------------------------------------------------------
+
+/// Parse a `Vector[a, b, c]` rendering into its f64 components.
+fn parse_vector(s: &str) -> Option<Vec<f64>> {
+    let inner = s.trim().strip_prefix("Vector[")?.strip_suffix(']')?;
+    if inner.trim().is_empty() {
+        return Some(vec![]);
+    }
+    inner.split(',').map(|p| p.trim().parse::<f64>().ok()).collect()
+}
+
+/// The native grad programs: each is a `grad(f, x)` over a supported `f`, paired
+/// with a Rust closure computing the SAME scalar `f(x)` (for the finite-diff
+/// oracle) and the input point `x`.
+#[allow(clippy::type_complexity)]
+fn grad_diff_programs() -> Vec<(&'static str, String, fn(&[f64]) -> f64, Vec<f64>)> {
+    vec![
+        // f(v) = dot(v, v)  ->  grad = 2v
+        (
+            "dot_self",
+            "fn main() -> Vector = { let x = vec_from_array([1.0, -2.0, 3.5, 0.25]); \
+             grad(\\v -> vec_dot(v, v), x) }"
+                .to_string(),
+            (|v: &[f64]| v.iter().map(|a| a * a).sum()) as fn(&[f64]) -> f64,
+            vec![1.0, -2.0, 3.5, 0.25],
+        ),
+        // f(v) = v0 * v1  ->  grad = [v1, v0]
+        (
+            "get_mul",
+            "fn main() -> Vector = { let x = vec_from_array([3.0, 5.0, 7.0]); \
+             grad(\\v -> vec_get(v, 0) * vec_get(v, 1), x) }"
+                .to_string(),
+            (|v: &[f64]| v[0] * v[1]) as fn(&[f64]) -> f64,
+            vec![3.0, 5.0, 7.0],
+        ),
+        // f(v) = dot(v, c)  ->  grad = c  (a captured constant Vector)
+        (
+            "dot_const",
+            "fn main() -> Vector = { let x = vec_from_array([1.0, -1.0, 2.0, 0.5]); \
+             let c = vec_from_array([2.0, 3.0, -1.0, 0.25]); grad(\\v -> vec_dot(v, c), x) }"
+                .to_string(),
+            (|v: &[f64]| {
+                let c = [2.0, 3.0, -1.0, 0.25];
+                v.iter().zip(c).map(|(a, b)| a * b).sum()
+            }) as fn(&[f64]) -> f64,
+            vec![1.0, -1.0, 2.0, 0.5],
+        ),
+        // MSE-style loss: f(v) = dot(v - t, v - t)  ->  grad = 2(v - t)
+        (
+            "mse",
+            "fn main() -> Vector = { let x = vec_from_array([0.0, 1.0, -1.0, 2.0]); \
+             let t = vec_from_array([2.0, -1.0, 3.0, 0.5]); \
+             grad(\\w -> { let d = vec_sub(w, t); vec_dot(d, d) }, x) }"
+                .to_string(),
+            (|v: &[f64]| {
+                let t = [2.0, -1.0, 3.0, 0.5];
+                v.iter().zip(t).map(|(a, b)| (a - b) * (a - b)).sum()
+            }) as fn(&[f64]) -> f64,
+            vec![0.0, 1.0, -1.0, 2.0],
+        ),
+        // vec_scale + vec_add: f(w) = dot(3w + w, 3w + w) = 16||w||^2 -> grad = 32 w
+        (
+            "scale_add",
+            "fn main() -> Vector = { let x = vec_from_array([1.0, 2.0, 3.0, 4.0]); \
+             grad(\\w -> { let s = vec_scale(w, 3.0); let a = vec_add(s, w); vec_dot(a, a) }, x) }"
+                .to_string(),
+            (|v: &[f64]| {
+                let a: Vec<f64> = v.iter().map(|c| 3.0 * c + c).collect();
+                a.iter().map(|c| c * c).sum()
+            }) as fn(&[f64]) -> f64,
+            vec![1.0, 2.0, 3.0, 4.0],
+        ),
+        // f(v) = norm(v) = ||v||  ->  grad = v / ||v||
+        (
+            "norm",
+            "fn main() -> Vector = { let x = vec_from_array([3.0, 4.0, 12.0]); \
+             grad(\\v -> vec_norm(v), x) }"
+                .to_string(),
+            (|v: &[f64]| v.iter().map(|a| a * a).sum::<f64>().sqrt()) as fn(&[f64]) -> f64,
+            vec![3.0, 4.0, 12.0],
+        ),
+    ]
+}
+
+/// Central finite-difference gradient of `f` at `x` (the independent oracle).
+fn finite_diff(f: &dyn Fn(&[f64]) -> f64, x: &[f64]) -> Vec<f64> {
+    let h = 1e-6;
+    (0..x.len())
+        .map(|i| {
+            let mut xp = x.to_vec();
+            let mut xm = x.to_vec();
+            xp[i] += h;
+            xm[i] -= h;
+            (f(&xp) - f(&xm)) / (2.0 * h)
+        })
+        .collect()
+}
+
+#[test]
+fn native_grad_matches_interpreter_and_finite_diff() {
+    if !cc_available() {
+        return;
+    }
+    let mut checked = 0u64;
+    for (tag, src, f, x) in grad_diff_programs() {
+        assert!(well_typed(&src), "{}: program is not well-typed\n{}", tag, src);
+        let prog = parser::parse(lexer::lex(&src).expect("lex")).expect("parse");
+
+        // Oracle 1: the tree-walking interpreter's reverse-mode tape.
+        let interp = ast_run(&src).unwrap_or_else(|e| panic!("{}: interp failed: {}", tag, e));
+
+        // The native backend: traced AriaTape grad must compile and run.
+        let c_src = crate::c_backend::compile(&prog)
+            .unwrap_or_else(|e| panic!("{}: native grad failed to compile: {}\n{}", tag, e, src));
+        let (nat, live) = run_native_live(&c_src)
+            .unwrap_or_else(|e| panic!("{}: native runner failed: {}", tag, e));
+
+        // (a) Native gradient is BIT-FOR-BIT identical to the interpreter (both
+        //     f64, same op set, same summation order, `-ffp-contract=off`).
+        assert_eq!(
+            interp, nat,
+            "{}: native grad != interpreter grad\n--- program ---\n{}\n interp={} native={}",
+            tag, src, interp, nat
+        );
+        // (b) Garbage-free: the tape is freed; the gradient Vector is the only
+        //     survivor, then dropped before exit.
+        assert_eq!(live, 0, "{}: native grad leaked {} live cell(s)", tag, live);
+
+        // Oracle 2: central finite differences — proves CORRECTNESS, not just
+        // agreement with the interpreter. Tolerance is loose enough for the
+        // O(h^2) truncation + O(eps/h) rounding of central differences.
+        let nat_grad = parse_vector(&nat).unwrap_or_else(|| panic!("{}: not a Vector: {}", tag, nat));
+        let fd = finite_diff(&f, &x);
+        assert_eq!(nat_grad.len(), fd.len(), "{}: gradient length mismatch", tag);
+        for (i, (g, d)) in nat_grad.iter().zip(&fd).enumerate() {
+            let tol = 1e-4 * (1.0 + d.abs());
+            assert!(
+                (g - d).abs() <= tol,
+                "{}: component {} grad={} but finite-diff={} (|Δ|={} > tol={})",
+                tag, i, g, d, (g - d).abs(), tol
+            );
+        }
+        checked += 1;
+    }
+    eprintln!("native_grad_matches_interpreter_and_finite_diff: {} grad programs checked", checked);
+    assert!(checked >= 6, "expected >=6 native grad programs, got {}", checked);
+}
+
+#[test]
+fn native_grad_gates_unsupported_f_and_other_backends() {
+    // (1) An `f` body using control flow (`if`) is outside the supported subset:
+    //     the native backend must reject it with a clean `grad: ...` error
+    //     (never a panic, never a wrong gradient). The interpreter also rejects
+    //     a comparison on a differentiated value, so this is a shared limit.
+    let if_src = "fn main() -> Vector = { let x = vec_from_array([1.0, 2.0]); \
+                  grad(\\w -> if vec_get(w, 0) > 0.0 { vec_dot(w, w) } else { 0.0 }, x) }";
+    let prog = parser::parse(lexer::lex(if_src).expect("lex")).expect("parse");
+    let err = crate::c_backend::compile(&prog).expect_err("if-in-f must be gated natively");
+    assert!(
+        err.contains("grad") && err.to_lowercase().contains("if"),
+        "expected a clean grad/if gating error, got: {}",
+        err
+    );
+
+    // (2) An `f` that calls another user function is gated (not inlined).
+    let call_src = "fn sq(w: Vector) -> Float = vec_dot(w, w)\n\
+                    fn main() -> Vector = { let x = vec_from_array([1.0, 2.0]); \
+                    grad(\\w -> sq(w), x) }";
+    let prog = parser::parse(lexer::lex(call_src).expect("lex")).expect("parse");
+    let err = crate::c_backend::compile(&prog).expect_err("fn-call-in-f must be gated natively");
+    assert!(err.contains("grad") && err.contains("sq"), "unexpected error: {}", err);
+
+    // (3) A named top-level helper `f` whose body IS straight-line over the
+    //     supported subset is inlined and compiles fine (the example's shape).
+    let named_src = "fn loss(w: Vector) -> Float = { let t = vec_from_array([2.0, -1.0]); \
+                     let d = vec_sub(w, t); vec_dot(d, d) }\n\
+                     fn main() -> Vector = { let x = vec_from_array([0.0, 0.0]); grad(loss, x) }";
+    let prog = parser::parse(lexer::lex(named_src).expect("lex")).expect("parse");
+    assert!(
+        crate::c_backend::compile(&prog).is_ok(),
+        "a straight-line named helper `f` should compile on the native backend"
+    );
+
+    // (4) The IR memory path (`aria mem`) and the WASM backend keep `grad`
+    //     GATED with a clean, specific error (never a panic). `main` returns a
+    //     Float (a scalar reduction of the gradient) so the wasm backend reaches
+    //     the grad gate rather than rejecting a Vector-returning `main` first.
+    let grad_src = "fn main() -> Float = { let x = vec_from_array([1.0, 2.0]); \
+                    vec_get(grad(\\v -> vec_dot(v, v), x), 0) }";
+    let prog = parser::parse(lexer::lex(grad_src).expect("lex")).expect("parse");
+    // mem path: IR lowering rejects grad.
+    let mem_err = ir::lower_program(&prog).expect_err("mem path must gate grad");
+    assert!(mem_err.contains("grad"), "mem gate message: {}", mem_err);
+    // wasm path: compilation rejects grad.
+    let wasm_err = wasm::compile(&prog).expect_err("wasm must gate grad");
+    assert!(wasm_err.contains("grad"), "wasm gate message: {}", wasm_err);
+}
+
+// ---------------------------------------------------------------------------
 // 8) Traits / interfaces (M3): differential interp vs. native vs. wasm.
 //    Static dispatch through monomorphization must agree with the interpreter's
 //    runtime-constructor dispatch, for a trait over an ADT, over a record, and

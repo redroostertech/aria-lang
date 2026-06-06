@@ -469,7 +469,7 @@ fn cvar(name: &str) -> String {
 }
 
 /// Map an Aria function name to its emitted C function name.
-fn cfn(name: &str) -> String {
+pub(crate) fn cfn(name: &str) -> String {
     let mut s = String::from("af_");
     for b in name.bytes() {
         if b.is_ascii_alphanumeric() || b == b'_' {
@@ -762,6 +762,10 @@ fn iexpr_type(e: &IExpr, env: &Env) -> Result<CType, String> {
 /// The builtins the C backend implements inline. Returns the C result type, or
 /// `None` if `name` is not a supported builtin.
 fn builtin_ret(name: &str) -> Option<CType> {
+    // Generated reverse-mode-autodiff helpers (`vec_grad$N`): `Vector -> Vector`.
+    if name.starts_with("vec_grad$") {
+        return Some(CType::Vector);
+    }
     match name {
         "concat" | "int_to_str" | "bytes_to_str" => Some(CType::Str),
         // print_* are logically Unit; we model them as Int 0 (never used).
@@ -1407,6 +1411,27 @@ fn emit_builtin(
     }
     if let Some(base) = parse_map_set_builtin(name) {
         return emit_map_set_builtin(base, name, args, dst, env, ind, out);
+    }
+    // Generated reverse-mode-autodiff helper:
+    //   `vec_grad$N(x: Vector, <captures: Vector|Float>...) -> Vector`.
+    // The first argument is the input Vector; any trailing arguments are the
+    // captured free variables of `f` (Vectors or Floats), passed straight
+    // through. The helper consumes its input (and any captured Vectors), exactly
+    // matching the rc pass's "Call arguments are consumed" rule, and returns a
+    // fresh gradient AriaVector.
+    if name.starts_with("vec_grad$") {
+        if args.is_empty() || atom_type(&args[0], env)? != CType::Vector {
+            return Err("c backend: grad helper expects a Vector as its first argument".into());
+        }
+        let mut parts = Vec::with_capacity(args.len());
+        for a in args {
+            // A captured Vector argument must be a Vector; a captured Float a
+            // Float — but we just forward the atom's C expression either way.
+            let (_, ex) = emit_atom(a, env, out)?;
+            parts.push(ex);
+        }
+        let _ = writeln!(out, "{}{} = {}({});", ind, dst, cfn(name), parts.join(", "));
+        return Ok(());
     }
     match name {
         "concat" => {
@@ -3010,6 +3035,153 @@ static void aria_print_vec_value(void* p) {
     fputs("]\n", stdout);
 }
 
+/* ---- Reverse-mode autodiff tape (the native `grad` runtime) --------------
+   A Wengert list mirroring the interpreter's `Tape` (src/interp.rs). Each node
+   records its forward `value` and up to two (parent node-id, local-partial)
+   pairs -- the local derivative of this node w.r.t. that parent. A vec_dot /
+   vec_norm over an n-vector fans out to n parents, so those ops record a CHAIN
+   of binary `+` nodes (each a 2-parent add) rather than one n-ary node, keeping
+   the node shape fixed at <=2 parents while matching the interpreter's
+   left-to-right summation order EXACTLY (so the forward value is bit-identical).
+
+   The tape is a single growable array, freed wholesale after the backward sweep
+   (no per-node allocation -> garbage-free: aria_live is untouched by tracing).
+   It is THREAD-LOCAL-free: each `grad` call uses one fresh stack-local AriaTape.
+
+   A traced scalar is an int64 node-id into the tape; a traced vector is a small
+   stack/heap array of node-ids. The generated `af_vec_grad$N` helper builds one
+   leaf per input coordinate, runs the traced body, seeds the scalar result's
+   adjoint to 1, sweeps in reverse, and returns the leaves' adjoints. */
+/* Each node records its forward `value`, an adjoint accumulator, and a slice
+   `[poff, poff+np)` of the shared `parents` arena -- one (parent node-id, local
+   partial) pair per entry. This flat (id, partial) representation mirrors the
+   interpreter's `TapeNode { value, parents: Vec<(usize, f64)> }` EXACTLY, so
+   vec_dot / vec_norm can record a single n-parent node with the identical
+   partials and the backward sweep accumulates in the identical order. */
+typedef struct { double value; double adj; int64_t poff; int64_t np; } AriaTNode;
+typedef struct {
+    AriaTNode* nodes; int64_t len; int64_t cap;
+    int64_t* pid; double* ppart; int64_t plen; int64_t pcap;  /* parents arena */
+} AriaTape;
+
+static void aria_tape_init(AriaTape* t) {
+    t->nodes = NULL; t->len = 0; t->cap = 0;
+    t->pid = NULL; t->ppart = NULL; t->plen = 0; t->pcap = 0;
+}
+static void aria_tape_free(AriaTape* t) {
+    free(t->nodes); free(t->pid); free(t->ppart);
+    t->nodes = NULL; t->len = 0; t->cap = 0;
+    t->pid = NULL; t->ppart = NULL; t->plen = 0; t->pcap = 0;
+}
+/* Append one (parent, partial) pair to the arena, returning nothing. */
+static void aria_tape_ppush(AriaTape* t, int64_t pid, double part) {
+    if (t->plen == t->pcap) {
+        int64_t ncap = t->pcap > 0 ? t->pcap * 2 : 64;
+        int64_t* gi = (int64_t*)realloc(t->pid, (size_t)ncap * sizeof(int64_t));
+        double* gp = (double*)realloc(t->ppart, (size_t)ncap * sizeof(double));
+        if (!gi || !gp) aria_trap();
+        t->pid = gi; t->ppart = gp; t->pcap = ncap;
+    }
+    t->pid[t->plen] = pid; t->ppart[t->plen] = part; t->plen++;
+}
+static int64_t aria_tape_node(AriaTape* t, double v, int64_t poff, int64_t np) {
+    if (t->len == t->cap) {
+        int64_t ncap = t->cap > 0 ? t->cap * 2 : 16;
+        AriaTNode* g = (AriaTNode*)realloc(t->nodes, (size_t)ncap * sizeof(AriaTNode));
+        if (!g) aria_trap();
+        t->nodes = g; t->cap = ncap;
+    }
+    int64_t id = t->len++;
+    AriaTNode* n = &t->nodes[id];
+    n->value = v; n->adj = 0.0; n->poff = poff; n->np = np;
+    return id;
+}
+/* A leaf (input / constant): no parents. */
+static int64_t aria_tape_leaf(AriaTape* t, double v) { return aria_tape_node(t, v, t->plen, 0); }
+/* A unary op: result `v`, local partial d_dx w.r.t. the single parent `x`. */
+static int64_t aria_tape_unary(AriaTape* t, int64_t x, double v, double d) {
+    int64_t off = t->plen;
+    aria_tape_ppush(t, x, d);
+    return aria_tape_node(t, v, off, 1);
+}
+/* A binary op: result `v`, partials da/db w.r.t. parents a/b. */
+static int64_t aria_tape_binary(AriaTape* t, int64_t a, int64_t b, double v, double da, double db) {
+    int64_t off = t->plen;
+    aria_tape_ppush(t, a, da);
+    aria_tape_ppush(t, b, db);
+    return aria_tape_node(t, v, off, 2);
+}
+static double aria_tape_value(AriaTape* t, int64_t id) { return t->nodes[id].value; }
+/* Reverse sweep from `out` (seeded adjoint 1), accumulating parent adjoints in
+   the SAME order the interpreter does (node order descending; within a node,
+   parents in recorded order). */
+static void aria_tape_backward(AriaTape* t, int64_t out) {
+    t->nodes[out].adj = 1.0;
+    for (int64_t i = t->len - 1; i >= 0; i--) {
+        double a = t->nodes[i].adj;
+        if (a == 0.0) continue;
+        int64_t off = t->nodes[i].poff, np = t->nodes[i].np;
+        for (int64_t k = 0; k < np; k++) t->nodes[t->pid[off + k]].adj += a * t->ppart[off + k];
+    }
+}
+/* A traced vector: a small heap array of node-ids (one per coordinate). Freed
+   wholesale; never escapes the grad helper, so it does not touch aria_live. */
+typedef struct { int64_t* ids; int64_t len; } AriaTVec;
+static AriaTVec aria_tvec_alloc(int64_t n) {
+    AriaTVec v; v.len = n;
+    v.ids = (int64_t*)malloc((size_t)(n > 0 ? n : 1) * sizeof(int64_t));
+    if (!v.ids) aria_trap();
+    return v;
+}
+static void aria_tvec_free(AriaTVec* v) { free(v->ids); v->ids = NULL; v->len = 0; }
+/* Lift a concrete AriaVector to a traced vector of fresh constant leaves (its
+   partials are discarded -- it is not an input). Does NOT consume the vector. */
+static AriaTVec aria_tvec_from_vec(AriaTape* t, void* p) {
+    AriaVector* x = (AriaVector*)p;
+    AriaTVec v = aria_tvec_alloc(x->len);
+    for (int64_t i = 0; i < x->len; i++) v.ids[i] = aria_tape_leaf(t, x->elems[i]);
+    return v;
+}
+/* dot(a,b) = Σ a_i*b_i, recorded as ONE node with 2n parents (∂/∂a_i = b_i,
+   ∂/∂b_i = a_i) -- bit-identical to the interpreter's `record_many`, including
+   the left-to-right `acc += a_i*b_i` summation order. Returns a node-id. */
+static int64_t aria_trace_dot(AriaTape* t, AriaTVec* a, AriaTVec* b) {
+    if (a->len != b->len) aria_trap_msg("vector length mismatch");
+    int64_t off = t->plen;
+    double acc = 0.0;
+    for (int64_t i = 0; i < a->len; i++) {
+        int64_t ai = a->ids[i], bi = b->ids[i];
+        double av = t->nodes[ai].value, bv = t->nodes[bi].value;
+        acc += av * bv;                 /* same order as the interpreter `dot` */
+        aria_tape_ppush(t, ai, bv);     /* (a_i, b_i) */
+        aria_tape_ppush(t, bi, av);     /* (b_i, a_i) */
+    }
+    return aria_tape_node(t, acc, off, 2 * a->len);
+}
+/* norm(a) = sqrt(Σ a_i^2), ONE node with n parents (∂/∂a_i = a_i/norm; 0 at
+   norm==0) -- bit-identical to the interpreter's `vec_norm` recorder. */
+static int64_t aria_trace_norm(AriaTape* t, AriaTVec* a) {
+    double sumsq = 0.0;
+    for (int64_t i = 0; i < a->len; i++) {
+        double v = t->nodes[a->ids[i]].value;
+        sumsq += v * v;
+    }
+    double nv = sqrt(sumsq);
+    int64_t off = t->plen;
+    for (int64_t i = 0; i < a->len; i++) {
+        double v = t->nodes[a->ids[i]].value;
+        aria_tape_ppush(t, a->ids[i], nv == 0.0 ? 0.0 : v / nv);
+    }
+    return aria_tape_node(t, nv, off, a->len);
+}
+/* Build the gradient AriaVector from the input leaves' adjoints. */
+static void* aria_tvec_to_grad(AriaTape* t, AriaTVec* leaves) {
+    AriaVector* g = (AriaVector*)aria_vec_alloc(leaves->len > 0 ? leaves->len : 0);
+    g->len = leaves->len;
+    for (int64_t i = 0; i < leaves->len; i++) g->elems[i] = t->nodes[leaves->ids[i]].adj;
+    return (void*)g;
+}
+
 /* ---- Tensor (dense, row-major f32, shape [rows, cols]) -------------------
    An AriaTensor is a refcounted heap object mirroring `crate::tensor::Tensor`
    (the interpreter oracle). Data is f32 (NOT f64), row-major; every kernel
@@ -3831,7 +4003,15 @@ static void aria_print_str(void* p) {
 pub fn compile(program: &Program) -> Result<String, String> {
     // 0. Monomorphize: specialize every generic function/ADT reachable from main
     //    so the rest of the backend sees only concrete types.
-    let mono = crate::monomorphize::monomorphize(program)?;
+    let mut mono = crate::monomorphize::monomorphize(program)?;
+
+    // 0b. Reverse-mode autodiff: rewrite every `grad(f, x)` to a generated
+    //     `vec_grad$N(x)` builtin call, compiling `f`'s body into a traced
+    //     AriaTape helper (emitted at step 5c). On an unsupported `f`, this
+    //     returns a clean `Err` so the native compile fails with a specific
+    //     message (the interpreter `aria run` remains the fallback). Runs after
+    //     monomorphization so the traced body sees concrete (suffixed) builtins.
+    let grad_sites = crate::grad_native::rewrite_grad(&mut mono)?;
     let program = &mono;
 
     // 1. Function signatures (declaration order).
@@ -3975,6 +4155,17 @@ pub fn compile(program: &Program) -> Result<String, String> {
     // 5. Emit the per-tag structural-equality and child-release helpers.
     emit_eq_helper(&ctors, &mut src);
     emit_drop_children_helper(&ctors, &closures, &fns, &mut src)?;
+
+    // 5c. Emit the traced reverse-mode-autodiff `grad` helpers (one per
+    //     `grad(f, x)` call site). Each is
+    //     `void* af_vec_grad$N(void* x, <captures..>)`, consuming the input
+    //     AriaVector (and any captured Vectors) and returning the gradient
+    //     AriaVector. The definitions reference only the runtime, so emitting
+    //     them here (before user functions) doubles as their declarations.
+    for site in &grad_sites {
+        src.push_str(&site.c_def);
+    }
+    src.push('\n');
 
     // 6. Emit each user function body.
     for name in &order {

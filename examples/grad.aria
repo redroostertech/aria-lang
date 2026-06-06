@@ -4,10 +4,11 @@
 -- `grad(f, x)` returns the gradient ∂f/∂x of a scalar function `f` at the point
 -- `x`, computed by ONE reverse-mode (tape) backward pass — O(1) in the number
 -- of inputs, the correct asymptotics for training (many parameters, one scalar
--- loss). It is implemented in the interpreter only (the tape lives in the
--- runtime, hidden from Aria, exactly as `matmul` hides a mutable out-buffer), so
--- this example runs under `aria run`. The compiled backends (`aria native-run`,
--- `aria wasm-run`) reject `grad` CLEANLY — they cannot run it.
+-- loss). The tape lives in the runtime, hidden from Aria, exactly as `matmul`
+-- hides a mutable out-buffer. It runs under BOTH `aria run` (interpreter tape)
+-- AND `aria native-run` (a runtime AriaTape + a traced compilation of `loss`),
+-- which produce BIT-FOR-BIT identical output. `aria wasm-run` / `aria mem` keep
+-- `grad` GATED CLEANLY — they cannot run it.
 --
 -- Here we minimize the squared distance to a target vector:
 --   f(w) = dot(w - target, w - target)

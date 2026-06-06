@@ -36,6 +36,7 @@ mod dataflow;
 mod diagnostics;
 mod embed;
 mod gbnf;
+mod grad_native;
 mod interp;
 mod ir;
 mod lexer;

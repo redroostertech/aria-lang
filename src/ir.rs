@@ -512,15 +512,17 @@ impl Lowerer {
                         name
                     )));
                 }
-                // `grad` (reverse-mode autodiff) runs the differentiated function
-                // over a tape that lives in the tree-walking interpreter only.
-                // Reject it on every compiled/IR path with a specific message.
+                // `grad` (reverse-mode autodiff) runs over a tape. It is supported
+                // in the interpreter (`aria run`) and the native backend
+                // (`aria native-run`, via a traced compilation onto an AriaTape),
+                // but not the wasm backend or the IR memory path (`aria mem`),
+                // which lower through this IR. Reject it here with that message.
                 if name == "grad" {
                     return Err(LowerError(
-                        "grad (reverse-mode autodiff) is only supported in the \
-                         interpreter (`aria run`); the compiled backends \
-                         (native/wasm) and the IR memory path (`aria mem`) cannot \
-                         run it"
+                        "grad (reverse-mode autodiff) runs in the interpreter \
+                         (`aria run`) and the native backend (`aria native-run`); \
+                         it is not supported in the wasm backend or the IR memory \
+                         path (`aria mem`)"
                             .to_string(),
                     ));
                 }

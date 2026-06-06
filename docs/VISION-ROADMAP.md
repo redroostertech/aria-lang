@@ -69,12 +69,16 @@ ground truth from the current source is:
 ### What is conspicuously absent for "learning / adapting"
 
 - ~~**No automatic differentiation. No gradients. No `backward`/`grad`.**~~
-  *(Updated 2026-06 — see §G.4.)* Aria now has **both** forward-mode AD (dual
+  *(Updated 2026-06 — see §G.4, §G.6.)* Aria now has **both** forward-mode AD (dual
   numbers in pure Aria, `examples/autodiff.aria`) **and** a reverse-mode `grad`
-  builtin (tape-based, one backward pass, **interpreter-only**) validated against
-  finite differences and the forward oracle. The remaining gap for Capability 1 is
-  bringing `grad` to the **compiled** backends (a native tape runtime or the
-  source-to-source adjoint of §B.1 Option 3) and the speed/persistence work below.
+  builtin (tape-based, one backward pass) validated against finite differences and
+  the forward oracle. `grad` runs in **both the interpreter AND the native (C)
+  backend** — the native path uses a runtime `AriaTape` + a traced source-to-source
+  compilation of `f`, producing gradients **bit-for-bit identical** to the
+  interpreter oracle on the supported op subset (§G.6); `examples/grad.aria` now
+  converges identically under `aria native-run`. WASM and `aria mem` keep `grad`
+  gated cleanly. The remaining work for Capability 1 is broadening the native op
+  subset (control flow / inter-procedural `f`) and the speed/persistence work below.
 - **Scalar f32 kernels only.** `src/tensor.rs` and the C runtime are triple-nested
   scalar loops — **no BLAS, no SIMD, no Accelerate/Metal/CUDA.** Fine for tiny
   demos, orders of magnitude off real training.
@@ -732,17 +736,14 @@ automatically, since the interpreter takes the actual branch during the forward
 trace (the checkpoint/trace problem does not arise for a tape-based interpreter
 reverse mode).
 
-**Interpreter-only, gated cleanly elsewhere.** `f` is function-typed (`Ty::Fn`),
-which the compiled backends already reject. The IR lowering (`src/ir.rs`) adds an
-explicit, specific gate so `aria native-run` / `aria wasm-run` / `aria mem` all
-fail with `grad (reverse-mode autodiff) is only supported in the interpreter
-(\`aria run\`); the compiled backends (native/wasm) and the IR memory path (\`aria
-mem\`) cannot run it` — a clean error, no panic. **Path to compiled-backend
-support:** the tape would need to be emitted/threaded into the native runtime —
-either a native tape runtime mirroring the interpreter one, or the source-to-source
-adjoint of §B.1 Option 3 / Phase 3a (where Aria's immutability is a decisive
-advantage). The type checker required **no changes**: the existing builtin-call
-path already checks a lambda argument bidirectionally against `(Vector)->Float`.
+**Originally interpreter-only; now ALSO native (see §G.6).** As first shipped,
+`grad` ran only in the interpreter; `aria native-run`/`aria wasm-run`/`aria mem`
+rejected it cleanly. As of the native milestone (§G.6) **`grad` now runs on the
+native (C) backend too**, via a runtime tape that mirrors this interpreter one,
+validated bit-for-bit against this oracle. `aria wasm-run` and `aria mem` remain
+gated (clean error). The type checker required **no changes**: the existing
+builtin-call path already checks a lambda argument bidirectionally against
+`(Vector)->Float`.
 
 **Validation (the gradients are CORRECT, not merely produced).** New tests in
 `src/proptest.rs`:
@@ -761,10 +762,75 @@ path already checks a lambda argument bidirectionally against `(Vector)->Float`.
 **Demo.** `examples/grad.aria` minimizes `f(w)=dot(w−target, w−target)` by
 reverse-mode gradient descent on a 4-element Vector parameter: from the origin,
 `aria run examples/grad.aria` drives `w` to the target `[2,−1,3,0.5]` with the
-loss falling from 14.25 to ~2.6e-31. `aria native-run`/`aria wasm-run` reject it
-cleanly (it is interp-only). Test count: **339 → 342**, all green
-(`RUST_MIN_STACK=536870912 cargo test`); `"grad"` added to the GBNF acceptor
-corpus.
+loss falling from 14.25 to ~2.6e-31. **`aria native-run examples/grad.aria` now
+produces the identical output (§G.6)**; `aria wasm-run`/`aria mem` reject it
+cleanly (gated). `"grad"` added to the GBNF acceptor corpus.
+
+### G.6 Reverse-mode `grad` — NATIVE backend (traced runtime tape, 2026-06)
+
+`grad` now **compiles and runs on the native (C) backend**, producing gradients
+**bit-for-bit identical** to the interpreter oracle of §G.4 (and matching central
+finite differences). Approach: a **runtime tape in C** plus a **traced
+source-to-source compilation** of the function `f`.
+
+**`AriaTape` runtime (`src/c_backend.rs`).** A Wengert list mirroring the
+interpreter's `Tape`: a growable array of nodes `{ double value; double adj;
+int64 poff; int64 np; }` over a shared flat parents arena of `(parent_id,
+local_partial)` pairs — the same `(id, partial)` representation as the interp's
+`TapeNode.parents`, so `vec_dot`/`vec_norm` record a single n-parent node with the
+identical partials and the backward sweep accumulates in the identical order
+(bit-exact f64; built with `-ffp-contract=off`). `aria_tape_leaf/unary/binary`
+push nodes; `aria_tape_backward(out)` seeds the output adjoint to 1 and sweeps in
+reverse. The whole tape (nodes + arena) is freed wholesale after the sweep, so
+tracing never touches `aria_live` — native grad programs report `aria_live=0`.
+
+**Traced compilation of `f` (`src/grad_native.rs`).** During native compilation
+(after monomorphization), every `grad(f, x)` call site is rewritten to a generated
+builtin call `vec_grad$N(x, <captures…>)`, and `f`'s body is compiled into a C
+helper `void* af_vec_grad$N(void* x, …)` that: builds one tape **leaf** per input
+coordinate, evaluates a **traced** version of `f`'s body where each supported
+scalar/vector op records a tape node instead of computing a bare `double`, seeds
+the scalar result's adjoint to 1, sweeps the tape, and returns the input leaves'
+adjoints as a fresh `AriaVector` (the gradient, which the helper's caller
+consumes). This rewrite happens **only** for the `f` argument of a `grad` call;
+ordinary code's codegen and results are completely untouched (the full 4-backend
+differential fuzzer stays green).
+
+**Supported op subset (a SOUND subset of the interpreter's).** Scalars: Float/Int
+literals, Float-typed locals, `+ − * /` and unary `−`, and the scalar-producing
+vec builtins `vec_get` (constant index), `vec_dot`, `vec_norm`. Vectors: the input
+vector, vec-typed locals, captured Vector/Float free variables (e.g. the `c` in
+`grad(\v -> vec_dot(v, c), x)`, passed to the helper as extra parameters),
+`vec_add`, `vec_sub`, `vec_scale`, `vec_from_array([..])` (inline literal),
+`vec_push`. `let` bindings (in a block) of either kind. `f` may be a **lambda
+literal** `\v -> ..` OR a **named top-level function** `grad(loss, x)` whose body
+is inlined — as long as that body is **straight-line** over this subset.
+
+**Gated cleanly on the native backend (clean `grad: …` error, never a panic,
+never a wrong gradient):** control flow (`if`/`match`) inside `f`, calls to other
+user functions inside `f` (inline them, or use `aria run`), `f` passed as anything
+other than a lambda/named-fn, a non-constant `vec_get` index, a non-literal
+`vec_from_array`, records/tuples/closures, and any op outside the subset. These
+limits are **at or narrower than** the interpreter's (e.g. the interpreter also
+rejects `if` on a differentiated value — a comparison on a tracing scalar). **WASM
+and `aria mem` keep `grad` fully gated** (the IR-lowering gate in `src/ir.rs`); the
+native backend is the deploy target.
+
+**Validation (gradients are CORRECT on native, not merely produced).** New tests
+in `src/proptest.rs` (cc-gated):
+- `native_grad_matches_interpreter_and_finite_diff` — for `dot(v,v)` (∇=2v),
+  `v0·v1` (∇=[v1,v0]), `dot(v,c)` (∇=c, captured const), MSE `dot(w−t,w−t)`
+  (∇=2(w−t)), a `vec_scale`+`vec_add` case (∇=32w), and `vec_norm` (∇=v/‖v‖):
+  asserts the native gradient is **bit-for-bit equal to the interpreter** AND
+  within tolerance of **central finite differences**, AND `aria_live==0`.
+- `native_grad_gates_unsupported_f_and_other_backends` — `if`-in-`f` and
+  fn-call-in-`f` are gated with clean native errors; a straight-line named helper
+  `f` compiles; `aria mem`/`wasm` still gate `grad`.
+
+**Demo on native.** `aria native-run examples/grad.aria` now converges to
+`[2,−1,3,0.5]` with the loss falling 14.25 → ~2.6e-31 — **identical output to
+`aria run`** — and reports `aria_live=0` (garbage-free). Test count: **473 → 475**,
+all green (`RUST_MIN_STACK=536870912 cargo test`).
 
 ### G.5 Summary
 
@@ -772,5 +838,6 @@ corpus.
 |---|---|
 | Forward-mode AD (dual numbers), pure Aria | **DONE** — `examples/autodiff.aria`, all 3 backends identical, garbage-free |
 | A program that *learns* (GD on a loss) | **DONE** — `(x-3)^2`→3 and a line-fit recovering `y=2x+1` |
-| Correctness proof (AD vs finite-diff) | **DONE** — `examples/autodiff.aria` + `examples/grad.aria`, 342 green |
-| Reverse-mode `grad` builtin | **DONE (interpreter)** — tape-based, one backward pass, op set above; validated vs finite-diff AND the forward dual oracle; gated cleanly off the compiled backends |
+| Correctness proof (AD vs finite-diff) | **DONE** — `examples/autodiff.aria` + `examples/grad.aria`, all green |
+| Reverse-mode `grad` builtin (interpreter) | **DONE** — tape-based, one backward pass, op set above; validated vs finite-diff AND the forward dual oracle |
+| Reverse-mode `grad` on the NATIVE backend | **DONE (§G.6)** — runtime AriaTape + traced compilation of `f`; bit-for-bit equal to the interp oracle + finite-diff; `examples/grad.aria` runs on `aria native-run`; wasm/mem gated; garbage-free |
