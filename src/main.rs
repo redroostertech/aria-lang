@@ -59,6 +59,18 @@ mod wasm;
 
 use std::process::ExitCode;
 
+/// Stack reservation for any worker thread that RUNS the tree-walking interpreter
+/// (each Aria call consumes native stack). The interpreter's depth guard
+/// (`interp::MAX_CALL_DEPTH` = 100_000) is the real bound on runaway recursion,
+/// but it can only fire cleanly if the native stack is big enough to hold that
+/// many frames. DEBUG frames are large (~26 KiB each measured for the worst-case
+/// non-tail recursion), so 100k frames need ~2.6 GiB; a 1 GiB stack would
+/// overflow (`Abort trap`) BELOW the guard in a debug build. We reserve 4 GiB so
+/// the guard wins in BOTH debug and release. A thread stack is virtual address
+/// space on 64-bit, committed lazily, so reserving 4 GiB is cheap. (Tail
+/// recursion is unbounded regardless via TCO — it consumes no extra frames.)
+const INTERP_STACK_SIZE: usize = 1 << 32; // 4 GiB
+
 fn main() -> ExitCode {
     // Run the real work on a worker thread with a large stack. The compiler
     // pipeline (parser, type-checker, monomorphizer) is deeply recursive on
@@ -155,7 +167,7 @@ fn run_mem(args: &[String]) -> ExitCode {
     // and cross-check them, so `aria mem` can never silently report a result the
     // two backends disagree on.
     let outcome = std::thread::Builder::new()
-        .stack_size(1 << 30)
+        .stack_size(INTERP_STACK_SIZE)
         .spawn(move || {
             let mut runner = ir::IrInterp::new(fns);
             let ir_res = runner.run_main().map(|v| runner.render(&v));
@@ -590,7 +602,7 @@ fn run_agent(args: &[String]) -> ExitCode {
     // Run the loop on a large-stack thread (it executes model-generated Aria via
     // the interpreter, which uses native stack per Aria call — mirroring `run`).
     let outcome = std::thread::Builder::new()
-        .stack_size(1 << 30)
+        .stack_size(INTERP_STACK_SIZE)
         .spawn(move || agent::run_loop(provider.as_ref(), &task, max_iters, verbose))
         .expect("spawn agent thread")
         .join()
@@ -755,7 +767,7 @@ fn run_agent_bench(args: &[String]) -> ExitCode {
     // the interpreter, which uses native stack per Aria call — like `run`/`agent`).
     let spec = provider_spec.clone();
     let (results, agg) = std::thread::Builder::new()
-        .stack_size(1 << 30)
+        .stack_size(INTERP_STACK_SIZE)
         .spawn(move || agent_bench::run(&spec, &tasks, max_iters, verbose))
         .expect("spawn bench thread")
         .join()
@@ -984,7 +996,7 @@ fn run_source(args: &[String]) -> ExitCode {
     // run (frames are recorded but never alter values/output); on an error it
     // returns the call chain so we can print a stack trace after the message.
     let result = std::thread::Builder::new()
-        .stack_size(1 << 30) // 1 GiB
+        .stack_size(INTERP_STACK_SIZE)
         .spawn(move || interp.run_main_traced())
         .expect("spawn interpreter thread")
         .join()

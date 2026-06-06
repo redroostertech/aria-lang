@@ -209,16 +209,29 @@ fn is_io_message(m: &str) -> bool {
     m.starts_with("cannot read ")
 }
 
-/// Returns true for interface/impl/trait-resolution messages. These can arrive
-/// via the parse path (parser-time trait lowering) but logically belong to the
-/// type phase under the trait/bound code (E0206).
+/// Returns true for interface/impl/trait-resolution SEMANTIC messages. These can
+/// arrive via the parse path (parser-time trait lowering raises with phase
+/// `parse`) but logically belong to the type phase under the trait/bound code
+/// (E0206). The markers are deliberately SPECIFIC: a bare mention of the word
+/// "interface" is NOT enough, because a structural PARSE error lists `interface`
+/// as one of the keywords it expected (e.g. "expected `fn`, `pure`, `type`,
+/// `interface`, or `impl`, found ...") — that is a genuine parse error (E0100),
+/// not a trait error. We therefore match only phrasings the trait/impl checker
+/// itself emits (a quoted `impl`/`interface` head, an explicit declares/method/
+/// bound clause), never the keyword in isolation.
 fn is_trait_message(m: &str) -> bool {
     m.contains("the interface declares")
-        || m.contains("interface")
         || m.contains("impl `")
+        || m.contains("duplicate interface `")
+        // A genuine trait-checker complaint about a specific interface METHOD
+        // (`interface `Show` method `show`: ...`). Structural PARSE errors about a
+        // malformed interface DECLARATION (`interface `Show` must declare ...`)
+        // deliberately do NOT match — they stay parse/E0100.
+        || (m.contains("interface `") && m.contains(" method `"))
         || m.contains("requires its type parameter")
         || m.contains("is not bounded by")
         || m.contains("trait method")
+        || m.contains("trait bound")
 }
 
 /// Map a raised `(phase, message)` to the documented `(phase, code)`, letting
@@ -465,6 +478,36 @@ mod tests {
         let d = Diagnostic::error("parse", m.into());
         assert_eq!(d.phase, "type", "interface arity should be type phase");
         assert_eq!(d.code, "E0206", "interface arity should be E0206");
+    }
+
+    #[test]
+    fn parse_error_listing_interface_keyword_is_not_e0206() {
+        // A structural PARSE error whose message merely LISTS `interface` as one of
+        // the expected keywords (e.g. a file containing just `x`) must stay phase
+        // `parse` / E0100 — it is NOT a trait/impl semantic error. (Regression for
+        // the `is_trait_message` bare-"interface" false positive.)
+        let m = "line 1: expected `fn`, `pure`, `type`, `interface`, or `impl`, found Ident(\"x\")";
+        let d = Diagnostic::error("parse", m.into());
+        assert_eq!(d.phase, "parse", "must remain a parse error: {}", m);
+        assert_eq!(d.code, "E0100", "must remain E0100: {}", m);
+    }
+
+    #[test]
+    fn malformed_interface_declaration_is_a_parse_error_not_e0206() {
+        // A structural complaint about a malformed interface DECLARATION
+        // (`interface `Show` must declare ...`) is a parse-phase error, not a
+        // trait-resolution semantic error. Only a complaint about a specific
+        // interface METHOD (`interface `Show` method `show`: ...`) is E0206.
+        let decl = "line 1: interface `Show` must declare exactly one type parameter (the implementing type), e.g. `interface Show[T]`";
+        let d = Diagnostic::error("parse", decl.into());
+        assert_eq!(d.phase, "parse", "interface decl shape is a parse error");
+        assert_eq!(d.code, "E0100");
+
+        // ...whereas a method-level interface complaint IS a trait error.
+        let method = "interface `Show` method `show` must take a `self` receiver parameter";
+        let d2 = Diagnostic::error("parse", method.into());
+        assert_eq!(d2.phase, "type", "interface method error is a trait error");
+        assert_eq!(d2.code, "E0206");
     }
 
     #[test]

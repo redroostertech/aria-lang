@@ -136,7 +136,7 @@ pub fn tasks() -> Vec<Task> {
             name: "fib_20",
             prompt: "Write a program whose `main` prints the 20th Fibonacci number using \
                      print_int, and returns 0. Define Fibonacci with fib(0) = 0, \
-                     fib(1) = 1, fib(n) = fib(n-1) + fib(n-2). So fib(20) = 6765.",
+                     fib(1) = 1, fib(n) = fib(n-1) + fib(n-2), and print fib(20).",
             expected_output: Some("6765\n"),
             expected_return: Some("0"),
             reference: "fn fib(n: Int) -> Int =\n  \
@@ -163,7 +163,7 @@ pub fn tasks() -> Vec<Task> {
             prompt: "Define an algebraic list type `type List[T] = | Nil | Cons(T, List[T])`. \
                      Build the list 1, 2, 3, 4 (in that order), reverse it, and have `main` \
                      print the reversed list's elements with print_int, one per line, in \
-                     reversed order: 4 then 3 then 2 then 1. Return 0.",
+                     the reversed order (last element first). Return 0.",
             expected_output: Some("4\n3\n2\n1\n"),
             expected_return: Some("0"),
             reference: "type List[T] = | Nil | Cons(T, List[T])\n\n\
@@ -186,7 +186,7 @@ pub fn tasks() -> Vec<Task> {
             name: "sum_array",
             prompt: "Write a program that builds the array [10, 20, 30, 40] (using \
                      array_new and array_push) and has `main` print the sum of its \
-                     elements with print_int, then returns 0. The sum is 100.",
+                     elements with print_int, then returns 0.",
             expected_output: Some("100\n"),
             expected_return: Some("0"),
             reference: "fn main() -> Int = {\n  \
@@ -203,7 +203,7 @@ pub fn tasks() -> Vec<Task> {
             prompt: "Write a program that, using range(10) to get [0,1,...,9], counts how \
                      many of those numbers are even (divisible by 2) with array_filter and \
                      array_fold, and has `main` print that count with print_int, then \
-                     returns 0. There are 5 even numbers in [0,9].",
+                     returns 0.",
             expected_output: Some("5\n"),
             expected_return: Some("0"),
             reference: "fn main() -> Int = {\n  \
@@ -216,7 +216,7 @@ pub fn tasks() -> Vec<Task> {
             prompt: "Write a program that maps x -> x*x over range(5) (i.e. over \
                      [0,1,2,3,4]) with array_map, sums the resulting squares with \
                      array_fold, and has `main` print that sum with print_int, then \
-                     returns 0. The squares are 0,1,4,9,16 and sum to 30.",
+                     returns 0.",
             expected_output: Some("30\n"),
             expected_return: Some("0"),
             reference: "fn main() -> Int = {\n  \
@@ -229,7 +229,7 @@ pub fn tasks() -> Vec<Task> {
             prompt: "Build a Map (with map_new and map_insert) holding the entries \
                      1 -> 100, 2 -> 200, 3 -> 300. Have `main` print the sum of its \
                      values with print_int (using map_values and array_fold), then return \
-                     0. The sum of the values is 600.",
+                     0.",
             expected_output: Some("600\n"),
             expected_return: Some("0"),
             reference: "fn main() -> Int = {\n  \
@@ -244,7 +244,7 @@ pub fn tasks() -> Vec<Task> {
             name: "max_of_list",
             prompt: "Define `type List[T] = | Nil | Cons(T, List[T])`, build the list \
                      3, 7, 2, 9, 4, and have `main` print the maximum element with \
-                     print_int using recursion and match, then return 0. The maximum is 9.",
+                     print_int using recursion and match, then return 0.",
             expected_output: Some("9\n"),
             expected_return: Some("0"),
             reference: "type List[T] = | Nil | Cons(T, List[T])\n\n\
@@ -261,7 +261,7 @@ pub fn tasks() -> Vec<Task> {
         Task {
             name: "record_field",
             prompt: "Define a record `type Point = { x: Int, y: Int }`, construct the point \
-                     with x = 3 and y = 4, and have `main` print x + y (i.e. 7) with \
+                     with x = 3 and y = 4, and have `main` print the sum x + y with \
                      print_int via field access, then return 0.",
             expected_output: Some("7\n"),
             expected_return: Some("0"),
@@ -274,8 +274,7 @@ pub fn tasks() -> Vec<Task> {
             name: "gcd",
             prompt: "Write a program that computes the greatest common divisor (GCD) of \
                      48 and 36 using Euclid's algorithm (recursion with the modulo \
-                     operator %), and has `main` print it with print_int, then return 0. \
-                     gcd(48, 36) = 12.",
+                     operator %), and has `main` print it with print_int, then return 0.",
             expected_output: Some("12\n"),
             expected_return: Some("0"),
             reference: "fn gcd(a: Int, b: Int) -> Int =\n  \
@@ -287,7 +286,7 @@ pub fn tasks() -> Vec<Task> {
             prompt: "Build a Set (with set_new and set_add) by adding the numbers \
                      5, 3, 5, 1, 3, 5 in that order (with duplicates). Have `main` print \
                      the number of DISTINCT elements with print_int (using set_len), then \
-                     return 0. There are 3 distinct values (1, 3, 5).",
+                     return 0.",
             expected_output: Some("3\n"),
             expected_return: Some("0"),
             reference: "fn main() -> Int = {\n  \
@@ -302,10 +301,10 @@ pub fn tasks() -> Vec<Task> {
         },
         Task {
             name: "string_build",
-            prompt: "Write a program whose `main` uses concat and int_to_str to build the \
-                     string `sum = 15` (computing 15 as 1+2+3+4+5 however you like) and \
-                     prints it with print_str on its own line, then returns 0. The printed \
-                     line must be exactly `sum = 15`.",
+            prompt: "Write a program whose `main` computes the sum 1+2+3+4+5 and uses \
+                     concat and int_to_str to build a string of the form `sum = N` where \
+                     N is that sum (the literal text `sum = ` followed by the number), \
+                     prints it with print_str on its own line, then returns 0.",
             expected_output: Some("sum = 15\n"),
             expected_return: Some("0"),
             reference: "fn main() -> Int = {\n  \
@@ -423,5 +422,62 @@ mod tests {
         assert!(task_by_name("gcd").is_some());
         assert!(task_by_name("does_not_exist").is_none());
         assert!(n >= 12, "expected a spread of >=12 tasks, got {}", n);
+    }
+
+    // No prompt may STATE its expected answer in prose ("the sum is 100",
+    // "gcd(48,36) = 12", ...): such phrasing lets a model echo the constant
+    // (`print_int(100)`) and grade CORRECT without computing, inflating the
+    // author-correctness measure. We check that none of the specific answer-
+    // revealing phrases the prompts previously carried remain. (A bare answer
+    // digit that legitimately appears among the INPUTS — e.g. `9` in the list
+    // `3,7,2,9,4` for max_of_list — is not a leak; only an answer STATEMENT is.)
+    #[test]
+    fn no_prompt_states_its_answer() {
+        // (task, banned answer-revealing substrings that must NOT appear).
+        let banned: &[(&str, &[&str])] = &[
+            ("fib_20", &["6765"]),
+            ("sum_array", &["sum is 100", "= 100", "is 100"]),
+            ("count_evens", &["5 even", "are 5"]),
+            ("map_squares", &["sum to 30", "= 30", "is 30", "0,1,4,9,16"]),
+            ("map_sum_values", &["is 600", "= 600", "sum of the values is"]),
+            ("max_of_list", &["maximum is 9", "is 9", "= 9"]),
+            ("record_field", &["i.e. 7", "= 7", "is 7"]),
+            ("gcd", &["= 12", "is 12", "gcd(48, 36) ="]),
+            ("set_dedup_count", &["3 distinct", "are 3", "(1, 3, 5)"]),
+            ("string_build", &["15"]),
+            ("reverse_list", &["4 then 3 then 2 then 1"]),
+        ];
+        for (name, subs) in banned {
+            let t = task_by_name(name).unwrap_or_else(|| panic!("task `{}` exists", name));
+            for s in *subs {
+                assert!(
+                    !t.prompt.contains(s),
+                    "task `{}` prompt reveals its answer via {:?}:\n{}",
+                    name,
+                    s,
+                    t.prompt
+                );
+            }
+        }
+    }
+
+    // Spot-check: a constant-echo program (`print_int(<answer>)`) is NOT derivable
+    // straight from the prompt text — the literal answer is absent — so a model
+    // cannot copy it without doing the computation. (Grading is out-of-band, so
+    // such an echo still grades CORRECT if it prints the right value; the point is
+    // the PROMPT can no longer be the source of the constant.)
+    #[test]
+    fn constant_echo_not_copyable_from_prompt() {
+        // These answers do NOT coincide with any number appearing in their prompt.
+        for (name, answer) in [("sum_array", "100"), ("count_evens", "5"), ("gcd", "12")] {
+            let t = task_by_name(name).expect("task exists");
+            assert_eq!(t.expected_output, Some(format!("{}\n", answer).as_str()));
+            assert!(
+                !t.prompt.contains(answer),
+                "task `{}` prompt still contains the constant {:?}",
+                name,
+                answer
+            );
+        }
     }
 }

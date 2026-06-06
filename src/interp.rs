@@ -536,9 +536,15 @@ pub struct Interp {
     depth: std::cell::Cell<usize>,
 }
 
-/// Maximum Aria function-call nesting. The interpreter runs on a large-stack
-/// thread (see main.rs), so this is generous; it exists to catch genuinely
-/// non-terminating recursion as an error rather than crashing the process.
+/// Maximum Aria function-call nesting (NON-tail; tail calls are eliminated and
+/// never count). This is the real bound that turns runaway recursion into a clean
+/// `Err` instead of crashing the process. For the guard to win the race against a
+/// native stack overflow, the interpreter must run on a thread whose stack holds
+/// this many frames: each Aria call consumes native stack, and worst-case
+/// non-tail recursion costs ~26 KiB/frame in a DEBUG (unoptimized) build, so 100k
+/// frames need ~2.6 GiB. The CLI therefore runs the interpreter on a 4 GiB stack
+/// (`main::INTERP_STACK_SIZE`) so this guard fires cleanly in BOTH debug and
+/// release before any `stack overflow`/`Abort trap`.
 const MAX_CALL_DEPTH: usize = 100_000;
 
 impl Interp {
@@ -3179,5 +3185,38 @@ fn main() -> Int = boom(20)
             .join()
             .expect("non-tail recursion must not crash at this depth");
         assert!(matches!(v, Value::Int(2001000)), "got {}", v.display());
+    }
+
+    #[test]
+    fn runaway_non_tail_recursion_hits_guard_cleanly_not_stack_overflow() {
+        // Runaway NON-tail recursion (the call is an operand of `+`, so it cannot
+        // be TCO'd and consumes one native frame per level) must hit the depth
+        // guard as a clean `Err` — NOT a native stack overflow / Abort trap.
+        // We run on the SAME 4 GiB stack the CLI reserves for the interpreter
+        // (`main::INTERP_STACK_SIZE`), which is what lets the 100k-frame guard win
+        // the race against an overflow even in a worst-case debug build. This is
+        // the regression for FIX 2 (the guard must fire before the worker stack
+        // overflows in debug too). `boom(200000)` is well past MAX_CALL_DEPTH, so
+        // the guard fires; `boom(40000)`/`boom(99000)` (below the guard) instead
+        // run to completion on this stack, which the CLI-level check covers.
+        const INTERP_STACK_SIZE: usize = 1 << 32; // mirror main::INTERP_STACK_SIZE
+        let src = "fn boom(n: Int) -> Int = if n == 0 { 0 } else { 1 + boom(n - 1) }\n\
+                   fn main() -> Int = boom(200000)";
+        let res = std::thread::Builder::new()
+            .stack_size(INTERP_STACK_SIZE)
+            .spawn(move || {
+                let prog = parser::parse(lexer::lex(src).unwrap()).unwrap();
+                Interp::new(&prog).unwrap().run_main()
+            })
+            .unwrap()
+            .join()
+            .expect("runaway recursion must NOT abort the process (clean Err, not overflow)");
+        match res {
+            Err(msg) => assert!(
+                msg.contains("maximum recursion depth"),
+                "expected a clean recursion-depth error, got: {msg}"
+            ),
+            Ok(v) => panic!("expected a recursion-depth Err, got Ok({})", v.display()),
+        }
     }
 }

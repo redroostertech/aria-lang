@@ -48,8 +48,16 @@
 //! exfiltration, no shelling out: executing a hallucinated program cannot harm
 //! the host. The one residual cost is unbounded computation (a program can
 //! loop/recurse), and that is bounded by the interpreter's call-depth guard
-//! (`MAX_CALL_DEPTH`) plus the large-but-finite worker stack, which turn runaway
-//! recursion into a clean `Err` rather than a crash. This is a genuine,
+//! (`MAX_CALL_DEPTH` = 100_000 Aria frames) which turns runaway recursion into a
+//! clean `Err` rather than a crash. For the guard to win the race against a
+//! native stack overflow, the interpreter must run on a thread whose stack can
+//! hold that many frames: each Aria call consumes native stack, and worst-case
+//! non-tail recursion costs ~26 KiB/frame in an UNOPTIMIZED (debug) build, so
+//! 100k frames need ~2.6 GiB. The CLI therefore reserves a 4 GiB interpreter
+//! stack (`main::INTERP_STACK_SIZE`) so the depth guard fires cleanly in BOTH
+//! debug and release before any `stack overflow`/`Abort trap`. (Tail recursion
+//! is unbounded regardless: TCO reuses one frame, so it never grows the stack and
+//! is intentionally NOT subject to the depth guard.) This is a genuine,
 //! honestly-stated advantage of an effect-free language for AI authoring.
 //!
 //! NOTE on real providers: the `cmd:` / preset providers shell out to external

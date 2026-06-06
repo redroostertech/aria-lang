@@ -225,10 +225,17 @@ pub fn analyze(program: &Program, prelude_names: &HashSet<String>) -> CallGraph 
     let mut call_sites: BTreeMap<String, BTreeMap<String, BTreeSet<(u32, u32)>>> = BTreeMap::new();
     for item in &program.items {
         if let Item::Fn(f) = item {
+            // The function's PARAMS are in-scope locals that shadow any top-level
+            // function of the same name for the whole body. Seed the lexical scope
+            // with them before walking.
+            let mut scope: Scope = Scope::new();
+            for p in &f.params {
+                scope.push(&p.name);
+            }
             let mut names: BTreeSet<String> = BTreeSet::new();
-            collect_call_names(&f.body, &mut names);
+            collect_call_names(&f.body, &mut names, &mut scope);
             let sites = call_sites.entry(f.name.clone()).or_default();
-            collect_call_sites(&f.body, sites);
+            collect_call_sites(&f.body, sites, &mut scope);
             let u = callees_user.entry(f.name.clone()).or_default();
             let l = callees_lib.entry(f.name.clone()).or_default();
             for n in names {
@@ -333,72 +340,174 @@ pub fn analyze(program: &Program, prelude_names: &HashSet<String>) -> CallGraph 
     CallGraph { functions, entry, unused, unreachable, cycles }
 }
 
+/// A lexical scope of IN-SCOPE LOCAL binders (function params, `let` bindings,
+/// lambda params, and match-arm pattern variables). A name present here SHADOWS
+/// any top-level function of the same name, so a reference to it is NOT a call-
+/// graph edge. Implemented as a stack of names with a parallel count map for
+/// O(1) "is this name shadowed?" queries that respect nested re-bindings of the
+/// same name (push/pop are balanced per lexical region).
+struct Scope {
+    /// Push order, so a block/lambda/arm can `truncate` back to its entry depth.
+    stack: Vec<String>,
+    /// How many times each name is currently in scope (handles shadowing of the
+    /// same name across nested regions). Non-zero ⇒ shadowed.
+    counts: HashMap<String, usize>,
+}
+
+impl Scope {
+    fn new() -> Scope {
+        Scope { stack: Vec::new(), counts: HashMap::new() }
+    }
+    /// Current binder depth — capture before entering a region, restore after.
+    fn depth(&self) -> usize {
+        self.stack.len()
+    }
+    fn push(&mut self, name: &str) {
+        self.stack.push(name.to_string());
+        *self.counts.entry(name.to_string()).or_insert(0) += 1;
+    }
+    /// Pop every binder introduced after `depth` (leaving the region).
+    fn truncate(&mut self, depth: usize) {
+        while self.stack.len() > depth {
+            let name = self.stack.pop().unwrap();
+            if let Some(c) = self.counts.get_mut(&name) {
+                *c -= 1;
+                if *c == 0 {
+                    self.counts.remove(&name);
+                }
+            }
+        }
+    }
+    /// Is `name` currently bound by an in-scope local (and thus shadows a
+    /// top-level function of the same name)?
+    fn is_local(&self, name: &str) -> bool {
+        self.counts.get(name).copied().unwrap_or(0) > 0
+    }
+    /// Bind every variable a pattern introduces (record-field binders, ctor
+    /// sub-binders, var patterns) into scope for the arm body.
+    fn bind_pattern(&mut self, pat: &crate::ast::Pattern) {
+        use crate::ast::Pattern;
+        match pat {
+            Pattern::Var(name) => self.push(name),
+            Pattern::Ctor(_, subs) => {
+                for s in subs {
+                    self.bind_pattern(s);
+                }
+            }
+            Pattern::Record(_, fields) => {
+                for (name, sub) in fields {
+                    match sub {
+                        // `Point { x }` shorthand binds the field name itself.
+                        Pattern::Var(v) => self.push(v),
+                        // `Point { x: <pat> }` binds whatever the nested pattern does.
+                        _ => {
+                            let _ = name;
+                            self.bind_pattern(sub);
+                        }
+                    }
+                }
+            }
+            Pattern::Wild | Pattern::Int(_) | Pattern::Bool(_) => {}
+        }
+    }
+}
+
 /// Walk `e`, inserting every `Expr::Call` callee name and every bare function-name
-/// reference (an `Expr::Var` used as a value) into `out`. Constructor applications
-/// (`Expr::Ctor`) are data, not control flow, and are deliberately skipped.
-fn collect_call_names(e: &Expr, out: &mut BTreeSet<String>) {
+/// reference (an `Expr::Var` used as a value) into `out` — but ONLY when the name
+/// is NOT shadowed by an in-scope local binding. `scope` tracks the lexical
+/// binders (function params, `let`s, lambda params, match-arm pattern variables);
+/// a name that resolves to a local is not a top-level-function reference and is
+/// skipped. Constructor applications (`Expr::Ctor`) are data, not control flow,
+/// and are deliberately skipped.
+fn collect_call_names(e: &Expr, out: &mut BTreeSet<String>, scope: &mut Scope) {
     match &e.kind {
         ExprKind::Call(name, args) => {
-            out.insert(name.clone());
+            // A `Call(name)` where `name` is a shadowing local (a function-valued
+            // param/`let` invoked as `f(x)`) is NOT a top-level edge.
+            if !scope.is_local(name) {
+                out.insert(name.clone());
+            }
             for a in args {
-                collect_call_names(a, out);
+                collect_call_names(a, out, scope);
             }
         }
         // A bare lowercase identifier that is NOT a local binding may be a
-        // top-level function used as a value (`array_map(xs, helper)`). We record
-        // every `Var` name; the caller filters by which names are actual function
-        // nodes, so a plain variable reference simply finds no node and is ignored.
+        // top-level function used as a value (`array_map(xs, helper)`). A name
+        // bound by an in-scope local is just a variable read and not an edge.
         ExprKind::Var(name) => {
-            out.insert(name.clone());
+            if !scope.is_local(name) {
+                out.insert(name.clone());
+            }
         }
         ExprKind::Ctor(_, args) => {
             for a in args {
-                collect_call_names(a, out);
+                collect_call_names(a, out, scope);
             }
         }
         ExprKind::Record(_, fields) => {
             for (_, v) in fields {
-                collect_call_names(v, out);
+                collect_call_names(v, out, scope);
             }
         }
-        ExprKind::Field(obj, _) => collect_call_names(obj, out),
+        ExprKind::Field(obj, _) => collect_call_names(obj, out, scope),
         ExprKind::Update(base, updates) => {
-            collect_call_names(base, out);
+            collect_call_names(base, out, scope);
             for (_, v) in updates {
-                collect_call_names(v, out);
+                collect_call_names(v, out, scope);
             }
         }
-        ExprKind::Lambda(_, body, _) => collect_call_names(body, out),
+        ExprKind::Lambda(params, body, _) => {
+            // Lambda params are in scope for the body only.
+            let depth = scope.depth();
+            for (name, _) in params {
+                scope.push(name);
+            }
+            collect_call_names(body, out, scope);
+            scope.truncate(depth);
+        }
         ExprKind::Apply(callee, args, _) => {
-            collect_call_names(callee, out);
+            collect_call_names(callee, out, scope);
             for a in args {
-                collect_call_names(a, out);
+                collect_call_names(a, out, scope);
             }
         }
-        ExprKind::Unary(_, inner) => collect_call_names(inner, out),
+        ExprKind::Unary(_, inner) => collect_call_names(inner, out, scope),
         ExprKind::Binary(_, lhs, rhs) => {
-            collect_call_names(lhs, out);
-            collect_call_names(rhs, out);
+            collect_call_names(lhs, out, scope);
+            collect_call_names(rhs, out, scope);
         }
         ExprKind::If(c, t, e2) => {
-            collect_call_names(c, out);
-            collect_call_names(t, out);
-            collect_call_names(e2, out);
+            collect_call_names(c, out, scope);
+            collect_call_names(t, out, scope);
+            collect_call_names(e2, out, scope);
         }
         ExprKind::Match(scrut, arms) => {
-            collect_call_names(scrut, out);
+            collect_call_names(scrut, out, scope);
             for arm in arms {
-                collect_call_names(&arm.body, out);
+                // The arm's pattern variables are in scope for the arm body only.
+                let depth = scope.depth();
+                scope.bind_pattern(&arm.pat);
+                collect_call_names(&arm.body, out, scope);
+                scope.truncate(depth);
             }
         }
         ExprKind::Block(stmts, last) => {
+            // A `let` binding is in scope for the REMAINDER of the block. Capture
+            // the entry depth and drop all block-local binders when leaving.
+            let depth = scope.depth();
             for s in stmts {
                 match s {
-                    Stmt::Let(_, _, v) => collect_call_names(v, out),
-                    Stmt::Expr(ex) => collect_call_names(ex, out),
+                    Stmt::Let(name, _, v) => {
+                        // The bound expression is evaluated in the PRE-binding
+                        // scope; then the name comes into scope for the rest.
+                        collect_call_names(v, out, scope);
+                        scope.push(name);
+                    }
+                    Stmt::Expr(ex) => collect_call_names(ex, out, scope),
                 }
             }
-            collect_call_names(last, out);
+            collect_call_names(last, out, scope);
+            scope.truncate(depth);
         }
         ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Str(_) | ExprKind::Unit => {}
     }
@@ -410,7 +519,11 @@ fn collect_call_names(e: &Expr, out: &mut BTreeSet<String>) {
 /// source-located. A `Call` records the `Call` expression's span; a bare
 /// function-name `Var` records the `Var`'s span. Synthesized nodes (no span)
 /// contribute nothing. The caller filters which names are real graph nodes.
-fn collect_call_sites(e: &Expr, out: &mut BTreeMap<String, BTreeSet<(u32, u32)>>) {
+fn collect_call_sites(
+    e: &Expr,
+    out: &mut BTreeMap<String, BTreeSet<(u32, u32)>>,
+    scope: &mut Scope,
+) {
     let note = |name: &str, span: crate::ast::Span, out: &mut BTreeMap<String, BTreeSet<(u32, u32)>>| {
         if !span.is_none() {
             out.entry(name.to_string())
@@ -420,62 +533,83 @@ fn collect_call_sites(e: &Expr, out: &mut BTreeMap<String, BTreeSet<(u32, u32)>>
     };
     match &e.kind {
         ExprKind::Call(name, args) => {
-            note(name, e.span, out);
+            // A `Call` of a shadowing local (function-valued param/`let`) is not a
+            // top-level edge and contributes no site.
+            if !scope.is_local(name) {
+                note(name, e.span, out);
+            }
             for a in args {
-                collect_call_sites(a, out);
+                collect_call_sites(a, out, scope);
             }
         }
         ExprKind::Var(name) => {
-            note(name, e.span, out);
+            if !scope.is_local(name) {
+                note(name, e.span, out);
+            }
         }
         ExprKind::Ctor(_, args) => {
             for a in args {
-                collect_call_sites(a, out);
+                collect_call_sites(a, out, scope);
             }
         }
         ExprKind::Record(_, fields) => {
             for (_, v) in fields {
-                collect_call_sites(v, out);
+                collect_call_sites(v, out, scope);
             }
         }
-        ExprKind::Field(obj, _) => collect_call_sites(obj, out),
+        ExprKind::Field(obj, _) => collect_call_sites(obj, out, scope),
         ExprKind::Update(base, updates) => {
-            collect_call_sites(base, out);
+            collect_call_sites(base, out, scope);
             for (_, v) in updates {
-                collect_call_sites(v, out);
+                collect_call_sites(v, out, scope);
             }
         }
-        ExprKind::Lambda(_, body, _) => collect_call_sites(body, out),
+        ExprKind::Lambda(params, body, _) => {
+            let depth = scope.depth();
+            for (name, _) in params {
+                scope.push(name);
+            }
+            collect_call_sites(body, out, scope);
+            scope.truncate(depth);
+        }
         ExprKind::Apply(callee, args, _) => {
-            collect_call_sites(callee, out);
+            collect_call_sites(callee, out, scope);
             for a in args {
-                collect_call_sites(a, out);
+                collect_call_sites(a, out, scope);
             }
         }
-        ExprKind::Unary(_, inner) => collect_call_sites(inner, out),
+        ExprKind::Unary(_, inner) => collect_call_sites(inner, out, scope),
         ExprKind::Binary(_, lhs, rhs) => {
-            collect_call_sites(lhs, out);
-            collect_call_sites(rhs, out);
+            collect_call_sites(lhs, out, scope);
+            collect_call_sites(rhs, out, scope);
         }
         ExprKind::If(c, t, e2) => {
-            collect_call_sites(c, out);
-            collect_call_sites(t, out);
-            collect_call_sites(e2, out);
+            collect_call_sites(c, out, scope);
+            collect_call_sites(t, out, scope);
+            collect_call_sites(e2, out, scope);
         }
         ExprKind::Match(scrut, arms) => {
-            collect_call_sites(scrut, out);
+            collect_call_sites(scrut, out, scope);
             for arm in arms {
-                collect_call_sites(&arm.body, out);
+                let depth = scope.depth();
+                scope.bind_pattern(&arm.pat);
+                collect_call_sites(&arm.body, out, scope);
+                scope.truncate(depth);
             }
         }
         ExprKind::Block(stmts, last) => {
+            let depth = scope.depth();
             for s in stmts {
                 match s {
-                    Stmt::Let(_, _, v) => collect_call_sites(v, out),
-                    Stmt::Expr(ex) => collect_call_sites(ex, out),
+                    Stmt::Let(name, _, v) => {
+                        collect_call_sites(v, out, scope);
+                        scope.push(name);
+                    }
+                    Stmt::Expr(ex) => collect_call_sites(ex, out, scope),
                 }
             }
-            collect_call_sites(last, out);
+            collect_call_sites(last, out, scope);
+            scope.truncate(depth);
         }
         ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Str(_) | ExprKind::Unit => {}
     }
@@ -1060,5 +1194,109 @@ fn main() -> Int = if even(4) { 1 } else { 0 }
         assert!(h.contains("unused (dead code): dead"));
         assert!(h.contains("recursive cycles:"));
         assert!(h.contains("even <-> odd") || h.contains("odd <-> even"));
+    }
+
+    // ---- scope tracking: a local binder shadows a top-level function ----
+
+    #[test]
+    fn shadowed_let_is_not_a_call_edge() {
+        // `h` binds a local `let g`, so the reference to `g` is the local, NOT the
+        // top-level `fn g`. `g` therefore has no callers and is unused.
+        let src = "\
+fn g() -> Int = 5
+fn h() -> Int = { let g = 1; g + 1 }
+fn main() -> Int = h()
+";
+        let g = graph_of(src);
+        assert!(info(&g, "h").callees.is_empty(), "h calls nothing: {:?}", info(&g, "h").callees);
+        assert!(info(&g, "g").callers.is_empty(), "g has no callers");
+        assert!(g.unused.contains(&"g".to_string()), "g is unused: {:?}", g.unused);
+    }
+
+    #[test]
+    fn shadowed_param_is_not_a_call_edge() {
+        // The param `inc` shadows the top-level `fn inc`, so `inc(x)` in `use_it`
+        // calls the LOCAL value, not the top-level function.
+        let src = "\
+fn inc(n: Int) -> Int = n + 1
+fn use_it(inc: Int) -> Int = inc + 1
+fn main() -> Int = use_it(3)
+";
+        let g = graph_of(src);
+        assert!(info(&g, "use_it").callees.is_empty(), "use_it calls nothing");
+        assert!(g.unused.contains(&"inc".to_string()), "inc is unused: {:?}", g.unused);
+    }
+
+    #[test]
+    fn shadowed_param_local_recursion_is_not_self_recursive() {
+        // `loopy` binds a local `let loopy`; the reference is the local, so `loopy`
+        // is NOT self-recursive and forms no cycle.
+        let src = "\
+fn loopy(n: Int) -> Int = { let loopy = n + 1; loopy }
+fn main() -> Int = loopy(3)
+";
+        let g = graph_of(src);
+        assert!(!info(&g, "loopy").recursive, "loopy is not recursive");
+        assert!(g.cycles.is_empty(), "no cycles: {:?}", g.cycles);
+    }
+
+    #[test]
+    fn shadowed_lambda_param_is_not_a_call_edge() {
+        // The lambda param `target` shadows top-level `fn target`, so the body's
+        // reference is the param, not the function.
+        let src = "\
+fn target(x: Int) -> Int = x
+fn run() -> Int = { let f = \\(target: Int) -> target + 1; f(2) }
+fn main() -> Int = run()
+";
+        let g = graph_of(src);
+        assert!(info(&g, "run").callees.is_empty(), "run calls nothing: {:?}", info(&g, "run").callees);
+        assert!(g.unused.contains(&"target".to_string()), "target is unused: {:?}", g.unused);
+    }
+
+    #[test]
+    fn shadowed_match_var_is_not_a_call_edge() {
+        // The match-arm var `helper` shadows top-level `fn helper`; the arm body's
+        // reference is the bound pattern variable.
+        let src = "\
+fn helper() -> Int = 7
+fn pick(n: Int) -> Int = match n { helper => helper, }
+fn main() -> Int = pick(1)
+";
+        let g = graph_of(src);
+        assert!(info(&g, "pick").callees.is_empty(), "pick calls nothing: {:?}", info(&g, "pick").callees);
+        assert!(g.unused.contains(&"helper".to_string()), "helper is unused: {:?}", g.unused);
+    }
+
+    #[test]
+    fn user_fn_colliding_with_prelude_local_has_no_phantom_caller() {
+        // A user `fn x` collides in NAME with locals used inside prelude bodies
+        // (e.g. `x`/`f`/`n` in array combinators). Walking the prelude must NOT
+        // create a phantom caller for the user's `x`: it is unused.
+        let src = "\
+fn x(n: Int) -> Int = n + 1
+fn main() -> Int = 0
+";
+        let g = graph_of(src);
+        assert!(info(&g, "x").callers.is_empty(), "x has no callers: {:?}", info(&g, "x").callers);
+        assert!(g.unused.contains(&"x".to_string()), "x is unused: {:?}", g.unused);
+    }
+
+    #[test]
+    fn function_valued_local_called_is_not_a_user_edge() {
+        // `apply` takes a function-valued param `f` and calls `f(x)`. That call is
+        // to the LOCAL value, not a top-level function, so `apply` has no callee.
+        let src = "\
+fn dbl(x: Int) -> Int = x * 2
+fn apply(f: (Int) -> Int, x: Int) -> Int = f(x)
+fn main() -> Int = apply(dbl, 3)
+";
+        let g = graph_of(src);
+        // `apply`'s body call `f(x)` is the param, not an edge.
+        assert!(info(&g, "apply").callees.is_empty(), "apply has no user callee: {:?}", info(&g, "apply").callees);
+        // `dbl` is passed by NAME to `apply` from main -> it is a callee of main and used.
+        assert!(info(&g, "main").callees.contains(&"apply".to_string()));
+        assert!(info(&g, "main").callees.contains(&"dbl".to_string()));
+        assert!(!g.unused.contains(&"dbl".to_string()), "dbl is used as a value");
     }
 }
