@@ -273,6 +273,13 @@ claude` or `--provider 'cmd:my-llm --stdin'`. The same suite + grader then yield
 that provider's pass-rate and iterations-to-green. That is how we turn "LLMs
 write Aria correctly" into a number **per provider**.
 
+> **Getting a genuine LLM number:** see **[BENCHMARKING.md](BENCHMARKING.md)** for
+> exact, copy-paste commands — local `llama.cpp` + a named small GGUF with
+> grammar-constrained decoding (`scripts/bench-llm.sh`), a cloud API key via
+> `curl` (`--provider anthropic`/`openai`), and the `claude`/`codex` CLIs — plus
+> the fully-offline end-to-end proof of the pipeline via
+> `--provider "cmd:bash scripts/stub_model.sh"`.
+
 ### Output capture
 
 Grading needs to see what a program **prints**, not just what `main` returns. The

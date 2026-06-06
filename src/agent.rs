@@ -320,6 +320,17 @@ pub fn provider_from_spec(spec: &str) -> Result<Box<dyn Provider>, String> {
             _grammar_file: Some(gf),
         }));
     }
+    if let Some(model) = spec.strip_prefix("ollama:") {
+        if model.trim().is_empty() {
+            return Err("provider `ollama:` requires a model name".to_string());
+        }
+        // NOTE: ollama has NO GBNF/constrained-decoding support, so an `ollama:`
+        // model is NOT syntactically constrained — it relies on the structured-
+        // diagnostics FEEDBACK LOOP alone to reach valid Aria. The prompt arrives
+        // on stdin (`ollama run` reads a prompt from stdin when not a TTY).
+        let shell = ollama_command(model);
+        return Ok(Box::new(CmdProvider::named(format!("ollama:{}", model), shell)));
+    }
     if spec == "anthropic" {
         return Ok(Box::new(CmdProvider::named("anthropic", anthropic_command())));
     }
@@ -327,7 +338,7 @@ pub fn provider_from_spec(spec: &str) -> Result<Box<dyn Provider>, String> {
         return Ok(Box::new(CmdProvider::named("openai", openai_command())));
     }
     Err(format!(
-        "unknown provider `{}` (try: mock, cmd:<shell>, claude, codex, llama:<model.gguf>, anthropic, openai)",
+        "unknown provider `{}` (try: mock, cmd:<shell>, claude, codex, llama:<model.gguf>, ollama:<model>, anthropic, openai)",
         spec
     ))
 }
@@ -346,13 +357,39 @@ fn codex_command() -> String {
 
 /// A local llama.cpp command constrained by Aria's GBNF grammar. The model is
 /// loaded from `model`; `--grammar-file <grammar>` forces SYNTACTICALLY-VALID
-/// Aria. The prompt arrives on stdin (`-f /dev/stdin`).
+/// Aria (constrained decoding — the local model literally cannot emit a syntax
+/// error). The prompt arrives on stdin (`-f /dev/stdin`).
+///
+/// BINARY: we invoke `llama-completion`, llama.cpp's one-shot TEXT-COMPLETION
+/// tool. (Older llama.cpp shipped only `llama-cli`; modern builds split a
+/// non-interactive completion binary out as `llama-completion` — `llama-cli` in
+/// those builds drops into an interactive loop that floods stdout. If your
+/// llama.cpp predates the split, substitute `llama-cli`; the flags are identical.)
+///
+/// Flags chosen so the child's STDOUT is JUST the completion the extractor reads:
+///   - `-no-cnv`            one-shot completion, not interactive conversation;
+///   - `--no-display-prompt` do NOT echo the prompt back to stdout;
+///   - `--simple-io`        plain IO for better behaviour under a piped subprocess;
+///   - `-n 1024`            a sane token budget (enough for a whole program);
+///   - `--temp 0`           greedy/deterministic decoding for reproducible numbers;
+///   - `--no-warmup`        skip warmup for a faster cold start;
+///   - `2>/dev/null`        llama.cpp's load/perf logs go to stderr — drop them so
+///                          only the model's text reaches the provider.
 fn llama_command(model: &str, grammar: &str) -> String {
     format!(
-        "llama-cli -m {} --grammar-file {} -no-cnv -f /dev/stdin",
+        "llama-completion -m {} --grammar-file {} -no-cnv --no-display-prompt --simple-io \
+         --no-warmup --temp 0 -n 1024 -f /dev/stdin 2>/dev/null",
         shell_quote(model),
         shell_quote(grammar)
     )
+}
+
+/// A local ollama command. The prompt arrives on stdin (`ollama run <model>`
+/// reads its prompt from stdin when stdout is not a TTY). UNLIKE `llama:`, ollama
+/// offers NO GBNF/constrained decoding, so syntactic correctness relies on the
+/// feedback loop alone — documented in `docs/BENCHMARKING.md`.
+fn ollama_command(model: &str) -> String {
+    format!("ollama run {}", shell_quote(model))
 }
 
 /// Best-effort cloud Anthropic command: POST the prompt (read from stdin) to the
@@ -532,6 +569,10 @@ pub fn build_runtime_feedback(
 ///   - a bare program with no fences (returns it as-is, trimmed).
 /// Never panics; on an empty response returns an empty string.
 pub fn extract_program(response: &str) -> String {
+    // Cloud providers (`anthropic`/`openai`) return the model's text wrapped in a
+    // JSON envelope. If the response looks like such an envelope, unwrap the
+    // assistant text first, THEN run the normal fence/prose extraction on it.
+    let response = &unwrap_json_response(response);
     let blocks = fenced_blocks(response);
     if !blocks.is_empty() {
         // Prefer a block that defines `fn main`; else the last block (models tend
@@ -585,6 +626,100 @@ fn fenced_blocks(text: &str) -> Vec<String> {
         }
     }
     blocks
+}
+
+/// Unwrap a cloud-API JSON envelope to the assistant's TEXT, so the normal
+/// fence/prose extractor can then run on it. Handles the two shapes our cloud
+/// presets produce:
+///   - Anthropic Messages API: `{"content":[{"type":"text","text":"<code>"}],...}`
+///   - OpenAI chat completions: `{"choices":[{"message":{"content":"<code>"}}],...}`
+/// A non-JSON response (a local model's bare text, or already-extracted code) is
+/// returned unchanged — this is a no-op unless the input is clearly such an
+/// envelope. We do a tiny, dependency-free scan for the relevant key and decode
+/// the JSON string that follows it; if anything is off we return the input as-is
+/// (the downstream check loop then drives the fix), never panicking.
+fn unwrap_json_response(response: &str) -> String {
+    let trimmed = response.trim_start();
+    if !trimmed.starts_with('{') {
+        return response.to_string();
+    }
+    // Anthropic: the text lives under a `"text":` key inside the `content` array.
+    // OpenAI: under a `"content":` key inside `choices[].message`. We look for the
+    // OpenAI key first (more specific), then Anthropic's `"text"`.
+    if let Some(s) = json_string_after_key(trimmed, "\"content\"") {
+        // OpenAI's `message.content` is a plain string; Anthropic's top-level
+        // `content` is an ARRAY (so `json_string_after_key` returns None and we
+        // fall through to the `"text"` key below).
+        return s;
+    }
+    if let Some(s) = json_string_after_key(trimmed, "\"text\"") {
+        return s;
+    }
+    response.to_string()
+}
+
+/// Find `key` in `json`, and if it is immediately followed (modulo whitespace and
+/// a `:`) by a JSON STRING, decode and return that string. Returns `None` if the
+/// key is absent or its value is not a string (e.g. an array/object). This is a
+/// deliberately small, allocation-light scan — not a full JSON parser — because
+/// we only need to lift one text field out of a known-shape API response.
+fn json_string_after_key(json: &str, key: &str) -> Option<String> {
+    let mut search_from = 0;
+    while let Some(rel) = json[search_from..].find(key) {
+        let kpos = search_from + rel;
+        let mut rest = json[kpos + key.len()..].trim_start();
+        if let Some(after_colon) = rest.strip_prefix(':') {
+            rest = after_colon.trim_start();
+            if rest.starts_with('"') {
+                if let Some(decoded) = decode_json_string(rest) {
+                    return Some(decoded);
+                }
+            }
+            // Value is present but not a string (array/object/number) — this key
+            // isn't the text we want; keep scanning for a later occurrence.
+        }
+        search_from = kpos + key.len();
+    }
+    None
+}
+
+/// Decode a JSON string literal at the START of `s` (which must begin with `"`),
+/// honouring the standard JSON escapes (`\" \\ \/ \n \r \t \b \f` and `\uXXXX`).
+/// Returns the decoded contents (without the surrounding quotes), or `None` if
+/// the literal is unterminated/malformed.
+fn decode_json_string(s: &str) -> Option<String> {
+    let mut chars = s.chars();
+    if chars.next() != Some('"') {
+        return None;
+    }
+    let mut out = String::new();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => return Some(out),
+            '\\' => match chars.next()? {
+                '"' => out.push('"'),
+                '\\' => out.push('\\'),
+                '/' => out.push('/'),
+                'n' => out.push('\n'),
+                'r' => out.push('\r'),
+                't' => out.push('\t'),
+                'b' => out.push('\u{0008}'),
+                'f' => out.push('\u{000C}'),
+                'u' => {
+                    let mut code = 0u32;
+                    for _ in 0..4 {
+                        let h = chars.next()?;
+                        code = code * 16 + h.to_digit(16)?;
+                    }
+                    out.push(char::from_u32(code).unwrap_or('\u{FFFD}'));
+                }
+                other => out.push(other),
+            },
+            c => out.push(c),
+        }
+    }
+    // Unterminated string.
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -854,6 +989,64 @@ mod tests {
         assert_eq!(extract_program("   \n  "), "");
     }
 
+    // ---- JSON cloud-response unwrap (no network; canned API JSON) ------
+
+    #[test]
+    fn extract_from_anthropic_json_response() {
+        // A realistic Anthropic Messages API response: the program is in
+        // `content[0].text`, fenced, with the newlines JSON-escaped as `\n`.
+        let json = r#"{"id":"msg_01","type":"message","role":"assistant","model":"claude-3-5-sonnet","content":[{"type":"text","text":"Here you go:\n```aria\nfn main() -> Int = {\n  print_int(42);\n  0\n}\n```\n"}],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":20}}"#;
+        let p = extract_program(json);
+        assert!(p.contains("fn main() -> Int"), "got: {}", p);
+        assert!(p.contains("print_int(42)"), "got: {}", p);
+        // And the unwrapped+extracted program actually checks clean.
+        assert!(check_program(&p).is_empty(), "extracted program should check: {}", p);
+    }
+
+    #[test]
+    fn extract_from_openai_json_response() {
+        // OpenAI chat-completions: program in `choices[0].message.content`.
+        let json = r#"{"id":"chatcmpl-1","object":"chat.completion","model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":"```aria\nfn main() -> Int = 7\n```"},"finish_reason":"stop"}],"usage":{"total_tokens":30}}"#;
+        let p = extract_program(json);
+        assert_eq!(p, "fn main() -> Int = 7");
+    }
+
+    #[test]
+    fn extract_from_openai_bare_program_in_json() {
+        // OpenAI content with NO fences — a bare program string with escaped
+        // newlines. The JSON unwrap must still surface the program.
+        let json = r#"{"choices":[{"message":{"content":"fn main() -> Int = {\n  print_int(1);\n  0\n}\n"}}]}"#;
+        let p = extract_program(json);
+        assert!(p.contains("fn main"), "got: {}", p);
+        assert!(p.contains("print_int(1)"), "got: {}", p);
+    }
+
+    #[test]
+    fn unwrap_json_handles_unicode_and_quote_escapes() {
+        // `\uXXXX` and `\"` in the content must decode correctly.
+        let json = r#"{"choices":[{"message":{"content":"fn main() -> String = \"hi!\""}}]}"#;
+        let p = extract_program(json);
+        assert_eq!(p, "fn main() -> String = \"hi!\"");
+    }
+
+    #[test]
+    fn unwrap_non_json_is_passthrough() {
+        // A local model's bare response is NOT JSON; it must pass through intact.
+        assert_eq!(unwrap_json_response("fn main() -> Int = 0\n"), "fn main() -> Int = 0\n");
+        // A fenced response (no JSON envelope) is also untouched by the unwrap.
+        let fenced = "```aria\nfn main() -> Int = 0\n```";
+        assert_eq!(unwrap_json_response(fenced), fenced);
+    }
+
+    #[test]
+    fn decode_json_string_basic_escapes() {
+        assert_eq!(decode_json_string(r#""a\nb""#).as_deref(), Some("a\nb"));
+        assert_eq!(decode_json_string(r#""tab\there""#).as_deref(), Some("tab\there"));
+        assert_eq!(decode_json_string(r#""quote\"end""#).as_deref(), Some("quote\"end"));
+        // Unterminated -> None (never panics).
+        assert_eq!(decode_json_string(r#""unterminated"#), None);
+    }
+
     // ---- prompt assembly ----------------------------------------------
 
     #[test]
@@ -910,12 +1103,42 @@ mod tests {
     #[test]
     fn preset_llama_includes_grammar_file() {
         let cmd = llama_command("/models/m.gguf", "/tmp/g.gbnf");
-        assert!(cmd.contains("llama-cli"));
+        assert!(cmd.contains("llama-completion"), "use the one-shot completion binary");
         assert!(cmd.contains("-m '/models/m.gguf'"));
         assert!(cmd.contains("--grammar-file '/tmp/g.gbnf'"));
+        // Hardened flags: one-shot, prompt-on-stdin, quiet stdout, token budget.
+        assert!(cmd.contains("-no-cnv"), "must be one-shot, not conversational");
+        assert!(cmd.contains("--no-display-prompt"), "must not echo the prompt");
+        assert!(cmd.contains("-f /dev/stdin"), "prompt arrives on stdin");
+        assert!(cmd.contains("-n 1024"), "must set a token budget");
+        assert!(cmd.contains("--temp 0"), "deterministic decoding");
+        assert!(cmd.contains("2>/dev/null"), "drop llama.cpp logs from stdout");
         // And the spec path materialises a real grammar file + provider.
         let p = provider_from_spec("llama:/models/m.gguf").unwrap();
         assert!(p.label().starts_with("llama:"));
+    }
+
+    #[test]
+    fn preset_llama_materialises_real_grammar_file() {
+        // The `llama:` spec must WRITE the GBNF grammar to a temp file and embed
+        // that exact path in the command — proving constrained decoding is wired.
+        let gf = TempFile::write("aria_grammar_test", &crate::gbnf::grammar()).unwrap();
+        let path = gf.path().to_string_lossy().to_string();
+        assert!(std::path::Path::new(&path).exists(), "grammar temp file written");
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("root ::="), "temp file holds the real GBNF grammar");
+        let cmd = llama_command("/models/m.gguf", &path);
+        assert!(cmd.contains(&format!("--grammar-file '{}'", path)));
+    }
+
+    #[test]
+    fn preset_ollama_builds_run_command_and_notes_no_grammar() {
+        let cmd = ollama_command("qwen2.5:1.5b");
+        assert_eq!(cmd, "ollama run 'qwen2.5:1.5b'");
+        let p = provider_from_spec("ollama:qwen2.5:1.5b").unwrap();
+        assert_eq!(p.label(), "ollama:qwen2.5:1.5b");
+        // Empty model name is rejected.
+        assert!(provider_from_spec("ollama:").is_err());
     }
 
     #[test]

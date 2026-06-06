@@ -296,6 +296,71 @@ mod tests {
         assert!(!grade.is_correct(), "but it must grade INCORRECT");
     }
 
+    // END-TO-END OFFLINE PROOF: the deterministic `scripts/stub_model.sh` driven
+    // through the GENUINE external-subprocess provider (`cmd:bash ...`, NOT the
+    // built-in mock/reference) must produce the EXACT expected real report:
+    //   - 6 tasks solved CORRECT (constant, sum_1_to_100, factorial_10,
+    //     is_prime_97, record_field, gcd);
+    //   - sum_1_to_100 takes 2 iterations (buggy E0201 -> feedback -> fix),
+    //     proving the write->check->fix FEEDBACK LOOP over a real subprocess;
+    //   - fib_20 converges but grades INCORRECT (prints fib(19), not fib(20)) —
+    //     proving the runner separates "runs" from "right";
+    //   - string_build NEVER converges (budget exhausted) — the failure row.
+    // This is the offline "real number": 40% correctness / 93.3% convergence,
+    // produced by the same code path a real model uses.
+    #[test]
+    fn cmd_stub_model_produces_expected_real_report() {
+        // The script lives in the repo; address it via CARGO_MANIFEST_DIR so the
+        // test is CWD-independent.
+        let script = format!("{}/scripts/stub_model.sh", env!("CARGO_MANIFEST_DIR"));
+        assert!(
+            std::path::Path::new(&script).exists(),
+            "stub model script must exist at {}",
+            script
+        );
+        let spec = format!("cmd:bash {}", script);
+        let tasks = agent_tasks::tasks();
+        let (results, agg) = run(&spec, &tasks, 5, false);
+
+        // Aggregate headline numbers.
+        assert_eq!(agg.total, 15, "the suite has 15 tasks");
+        assert_eq!(agg.correct, 6, "stub solves exactly 6 tasks");
+        assert_eq!(agg.converged, 14, "14 converge; string_build does not");
+        assert!(
+            (agg.correctness_rate() - 40.0).abs() < 1e-9,
+            "correctness should be 40%, got {}",
+            agg.correctness_rate()
+        );
+        assert!(
+            (agg.convergence_rate() - 93.3).abs() < 0.1,
+            "convergence should be ~93.3%, got {}",
+            agg.convergence_rate()
+        );
+
+        // Per-task spot checks proving the three behaviours.
+        let by = |n: &str| results.iter().find(|r| r.name == n).expect("task present");
+        // CORRECT solves.
+        for n in ["constant", "sum_1_to_100", "factorial_10", "is_prime_97", "record_field", "gcd"] {
+            assert!(by(n).correct(), "task `{}` should grade correct", n);
+        }
+        // FEEDBACK LOOP: sum_1_to_100 needs 2 iterations (buggy -> fix).
+        assert_eq!(by("sum_1_to_100").iterations, 2, "sum_1_to_100 should take 2 iters");
+        // CONVERGED-BUT-INCORRECT: fib_20 runs but is wrong.
+        let fib = by("fib_20");
+        assert!(fib.converged, "fib_20 converges");
+        assert!(!fib.correct(), "fib_20 grades incorrect");
+        assert!(fib.note.contains("output mismatch"), "fib note: {}", fib.note);
+        // NON-CONVERGED: string_build exhausts the budget.
+        let sb = by("string_build");
+        assert!(!sb.converged, "string_build should not converge");
+        assert!(sb.grade.is_none(), "non-converged tasks aren't graded");
+
+        // The rendered report carries the headline correctness line.
+        let report = render_report(&spec, &results, &agg);
+        assert!(report.contains("BENCH correctness 40.0%"), "report:\n{}", report);
+        assert!(report.contains("BENCH convergence 93.3%"), "report:\n{}", report);
+    }
+
     // The runner never panics on a provider that always fails: the task is
     // recorded as non-converged, the sweep produces a sane (zero-correct)
     // aggregate.

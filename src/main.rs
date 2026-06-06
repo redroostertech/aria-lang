@@ -587,7 +587,7 @@ fn run_agent(args: &[String]) -> ExitCode {
             eprintln!(
                 "usage: aria agent [--provider <spec>] [--max-iters N] [--out <file.aria>] [--verbose] \"<task>\""
             );
-            eprintln!("providers: mock | cmd:<shell> | claude | codex | llama:<model.gguf> | anthropic | openai");
+            eprintln!("providers: mock | cmd:<shell> | claude | codex | llama:<model.gguf> | ollama:<model> | anthropic | openai");
             return ExitCode::from(2);
         }
     };
