@@ -229,7 +229,16 @@ pub fn check_text(text: &str) -> Vec<Diagnostic> {
         Err(e) => vec![Diagnostic::error("lex", e)],
         Ok(toks) => match crate::parser::parse(toks) {
             Err(e) => vec![Diagnostic::error("parse", e)],
-            Ok(program) => crate::typeck::check_structured(&program),
+            Ok(program) => {
+                let mut diags = crate::typeck::check_structured(&program);
+                // On an otherwise-clean program, surface advisory lint warnings
+                // (unused `let` bindings) as severity-2 LSP diagnostics so editors
+                // underline dead variables. Only lint when there are no errors.
+                if diags.is_empty() {
+                    diags.extend(crate::dataflow::warnings_for_source(text));
+                }
+                diags
+            }
         },
     }
 }
@@ -271,7 +280,8 @@ pub fn publish_diagnostics_notification(uri: &str, diags: &[Diagnostic], text: &
 ///   (`character 0 .. BIG`, which editors clamp to the line length).
 /// - All lines are clamped into `[0, last_line]` so the range can never point
 ///   past the user's document. A `null` line maps to line 0.
-/// - `severity` = 1 (Error). `source` = "aria". `code` = the Aria code.
+/// - `severity` = 1 (Error) for an error diagnostic, 2 (Warning) for a lint
+///   warning. `source` = "aria". `code` = the Aria code.
 fn lsp_diagnostic_json(d: &Diagnostic, last_line: usize) -> String {
     // LSP lines are 0-based; Aria lines are 1-based (or None → line 0).
     let l0 = match d.line {
@@ -298,12 +308,15 @@ fn lsp_diagnostic_json(d: &Diagnostic, last_line: usize) -> String {
         // No column: fall back to the whole-line range.
         None => (0, l0, EOL),
     };
+    // LSP DiagnosticSeverity: 1 = Error, 2 = Warning. Map from the Aria severity.
+    let severity = if d.severity == "warning" { 2 } else { 1 };
     format!(
-        r#"{{"range":{{"start":{{"line":{sl},"character":{sc}}},"end":{{"line":{el},"character":{ec}}}}},"severity":1,"source":"aria","code":"{code}","message":"{msg}"}}"#,
+        r#"{{"range":{{"start":{{"line":{sl},"character":{sc}}},"end":{{"line":{el},"character":{ec}}}}},"severity":{sev},"source":"aria","code":"{code}","message":"{msg}"}}"#,
         sl = l0,
         sc = start_char,
         el = end_line,
         ec = end_char,
+        sev = severity,
         code = d.code,
         msg = json_escape(&d.message),
     )
@@ -840,6 +853,23 @@ fn main() -> Int = code(Blue)
         assert!(note.contains(r#""severity":1"#));
         assert!(note.contains(r#""code":"E0203""#));
         assert!(!note.contains(r#""diagnostics":[]"#));
+    }
+
+    #[test]
+    fn unused_let_published_as_warning_severity_2() {
+        // A program that type-checks cleanly but has an unused `let` yields a
+        // single severity-2 (Warning) LSP diagnostic with code W0001 and a
+        // precise range — and NOT an error (severity 1).
+        let src = "fn f() -> Int = { let tmp = 99; 1 }\nfn main() -> Int = f()";
+        let diags = check_text(src);
+        assert_eq!(diags.len(), 1, "exactly one warning: {:?}", diags);
+        assert_eq!(diags[0].severity, "warning");
+        assert_eq!(diags[0].code, "W0001");
+        let note = publish_diagnostics_notification("file:///u.aria", &diags, src);
+        assert!(note.contains(r#""severity":2"#), "must be severity 2: {}", note);
+        assert!(note.contains(r#""code":"W0001""#), "{}", note);
+        // Precise range, not the whole-line fallback.
+        assert!(!note.contains("1000000"), "warning should carry a precise span: {}", note);
     }
 
     #[test]

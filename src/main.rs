@@ -32,6 +32,7 @@ mod arith;
 mod ast;
 mod builtins;
 mod c_backend;
+mod dataflow;
 mod diagnostics;
 mod gbnf;
 mod interp;
@@ -835,17 +836,29 @@ fn run_check_json(path: &str) -> ExitCode {
                 Ok(toks) => match parser::parse(toks) {
                     // Parse (fail-fast: no AST to type-check).
                     Err(e) => vec![Diagnostic::error("parse", e)],
-                    Ok(program) => typeck::check_structured(&program),
+                    Ok(program) => {
+                        let mut ds = typeck::check_structured(&program);
+                        // On an otherwise-CLEAN program, append advisory lint
+                        // warnings (unused `let` bindings). Warnings never change
+                        // the exit code: a program with only warnings is "clean"
+                        // for compilation. We only lint when there are no errors,
+                        // so the warning pass runs on well-formed code.
+                        if ds.is_empty() {
+                            ds.extend(dataflow::warnings_for_source(&src));
+                        }
+                        ds
+                    }
                 },
             }
         }
     };
 
     println!("{}", array_to_json(&diags));
-    if diags.is_empty() {
-        ExitCode::SUCCESS
-    } else {
+    // The exit code reflects HARD ERRORS only — warnings do not fail compilation.
+    if diags.iter().any(|d| d.severity == "error") {
         ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
     }
 }
 
@@ -880,7 +893,9 @@ fn run_analyze(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let program = match parser::parse(toks) {
+    // Parse capturing the binder side table (binder def spans for `let`/lambda/
+    // match binders), which the data-flow layer needs.
+    let (program, binders) = match parser::parse_with_binders(toks) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("parse error: {}", e);
@@ -902,11 +917,33 @@ fn run_analyze(args: &[String]) -> ExitCode {
         }
     };
 
-    let graph = analyze::analyze_typed(&program, &analyze::prelude_fn_names(), Some(&types));
+    let prelude_names = analyze::prelude_fn_names();
+    let graph = analyze::analyze_typed(&program, &prelude_names, Some(&types));
+    // Per-function VARIABLE data-flow (def-use chains, unused bindings, shadows).
+    let flows = dataflow::analyze(&program, &prelude_names, &types, &binders);
     if json {
-        println!("{}", graph.to_json());
+        // Emit a combined object: the call graph plus a `dataflow` member keyed by
+        // function name. All existing call-graph fields are unchanged.
+        let cg = graph.to_json();
+        // Splice `"dataflow":{...}` in before the call graph's closing brace so the
+        // top-level JSON object carries both views.
+        let df = dataflow::to_json(&flows);
+        let combined = format!("{},\"dataflow\":{}}}", &cg[..cg.len() - 1], df);
+        println!("{}", combined);
     } else {
         print!("{}", graph.to_human());
+        // Append a concise data-flow summary for functions with notable facts.
+        let mut any = false;
+        for fl in &flows {
+            let line = fl.to_human();
+            if !line.is_empty() {
+                if !any {
+                    println!("\ndata-flow:");
+                    any = true;
+                }
+                println!("  {}: {}", fl.name, line);
+            }
+        }
     }
     ExitCode::SUCCESS
 }

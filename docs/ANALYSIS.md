@@ -314,3 +314,79 @@ fn id[T](x: T) -> T  (line 2)
   span with no recorded type at all is `null`; neither fabricates a type. The
   types are observation only and never alter what typeck accepts or any backend's
   output.
+
+## Data-flow (`dataflow`)
+
+Alongside the call graph, `aria analyze --json` emits a top-level **`dataflow`**
+object that models how DATA moves *inside* each user function: the exact
+**def-use chain** of every local binding. Where the call graph answers "how do
+functions depend on each other?", the data-flow layer answers "how is each
+variable defined and used?".
+
+### The single-assignment exactness property
+
+Aria is **pure / immutable**: every binding — a function parameter, a `let`, a
+lambda parameter, or a match-arm pattern variable — is assigned **exactly once**.
+There is no mutation, no reassignment, no `var`. This makes def-use chains
+**EXACT**: a variable read binds to the one lexically-innermost binding of that
+name, with no reaching-definitions lattice and no flow-sensitive merge. The
+reported `uses` of a binding are therefore its **complete** set of reads — every
+read, and nothing but reads of *that* binding. (A name shadowed by an inner
+binding of the same name does not collect the inner uses; they belong to the
+inner binding.)
+
+### JSON schema
+
+`dataflow` is an object keyed by **function name**; each value is:
+
+```json
+{
+  "bindings": [
+    { "name": "x", "kind": "param", "def": [line, col], "type": "Int" | null,
+      "uses": [[line, col], ...], "use_count": N, "unused": false }
+  ],
+  "unused_bindings": [ { "name": "tmp", "def": [line, col] } ],
+  "shadows": [ { "name": "x", "def": [line, col], "shadows": [line, col] } ]
+}
+```
+
+- **`kind`** is one of `"param"`, `"let"`, `"lambda_param"`, `"match_binder"`.
+- **`def`** is the 1-based `[line, col]` of the binder's definition site.
+- **`type`** is the binding's rendered type: the *declared* type for a parameter
+  or lambda parameter, the *inferred* type for a `let` (or a match binder,
+  resolved from its first use). `null` when no type was recorded for that span.
+- **`uses`** lists every read location (sorted, de-duplicated); **`use_count`**
+  is its length; **`unused`** is `use_count == 0`.
+- **`unused_bindings`** is the dead-binding subset (defined, never read), each
+  with its def location. **`shadows`** reports every binding whose name shadows
+  an in-scope outer binding, giving the inner def (`def`) and the outer def it
+  shadows (`shadows`).
+
+Scoping mirrors the call graph's lexical walk exactly: parameters are in scope
+for the whole body, a `let` for the remainder of its block, lambda parameters for
+the lambda body, and match-arm pattern variables (including `Point { x, y }`
+record-field shorthand and constructor sub-binders) for the arm body. Top-level
+function names, prelude functions, and builtins are **not** local bindings and
+never appear here.
+
+### Human output
+
+The human `aria analyze` output appends a concise `data-flow:` section listing,
+per function with notable facts, its unused bindings and shadows, e.g.
+
+```text
+data-flow:
+  g: unused: `tmp` (line 2); shadows: `x` (line 3 shadows line 1)
+```
+
+### AI / tooling usage
+
+The `dataflow` object gives an AI or static-analysis tool a precise, deterministic
+view of intra-function data movement: "where is this variable used?" (`uses`),
+"is this binding dead?" (`unused` / `unused_bindings`), and "does this name
+shadow an outer one?" (`shadows`). Because of single-assignment exactness, a tool
+can rely on `uses` being the literal, complete read set — safe to drive a rename,
+a dead-code removal, or a shadowing cleanup. Dead `let` bindings are also surfaced
+as **`W0001` warnings** in `aria check --json` and the LSP (see
+`docs/DIAGNOSTICS.md`). The data-flow layer is pure **metadata**: it never changes
+any call-graph field, what `typeck` accepts, an exit code, or a backend's output.

@@ -31,6 +31,15 @@ pub struct Parser {
     /// (which would abort the process with SIGSEGV/exit 134 and break the
     /// "`--json` always emits valid JSON or a clean error" contract).
     depth: usize,
+    /// Side table of precise binder spans for `let`/lambda-param/match-binder
+    /// binders the AST does not itself carry a span for. Pure analysis METADATA
+    /// (see [`crate::ast::BinderSpans`]); consumed only by the data-flow analyzer.
+    binder_spans: BinderSpans,
+    /// Scratch accumulator for the binder `(name, span)` pairs a single match
+    /// pattern introduces, collected during `parse_pattern` (which runs before
+    /// the arm body span is known) and then committed to `binder_spans` keyed by
+    /// the arm body span in `parse_match`.
+    pat_binders: Vec<(String, Span)>,
 }
 
 /// Maximum nesting depth for the expression / type parser. Set far above any
@@ -93,6 +102,20 @@ impl Parser {
             no_record_literal: false,
             tuple_arities: std::collections::HashSet::new(),
             depth: 0,
+            binder_spans: BinderSpans::default(),
+            pat_binders: Vec::new(),
+        }
+    }
+
+    /// The precise span of the current (not-yet-consumed) token, as a [`Span`].
+    /// Used to record a binder's definition site (the identifier's exact extent).
+    fn cur_span(&self) -> Span {
+        let t = &self.toks[self.pos];
+        Span {
+            start_line: t.line as u32,
+            start_col: t.col as u32,
+            end_line: t.end_line as u32,
+            end_col: t.end_col as u32,
         }
     }
 
@@ -266,10 +289,11 @@ impl Parser {
             let mut mparams = Vec::new();
             if *self.peek() != Tok::RParen {
                 loop {
+                    let pspan = self.cur_span();
                     let pname = self.expect_ident()?;
                     self.expect(&Tok::Colon)?;
                     let ty = self.parse_type(&tps)?;
-                    mparams.push(Param { name: pname, ty });
+                    mparams.push(Param { name: pname, ty, span: pspan });
                     if *self.peek() == Tok::Comma {
                         self.advance();
                     } else {
@@ -348,10 +372,11 @@ impl Parser {
         let mut params = Vec::new();
         if *self.peek() != Tok::RParen {
             loop {
+                let pspan = self.cur_span();
                 let pname = self.expect_ident()?;
                 self.expect(&Tok::Colon)?;
                 let ty = self.parse_type(&type_params)?;
-                params.push(Param { name: pname, ty });
+                params.push(Param { name: pname, ty, span: pspan });
                 if *self.peek() == Tok::Comma {
                     self.advance();
                 } else {
@@ -645,15 +670,20 @@ impl Parser {
         let start = self.here();
         self.expect(&Tok::Backslash)?;
         let mut params = Vec::new();
+        // Parallel record of each parameter binder's precise def span, recorded
+        // below (keyed by the lambda body span) for the data-flow analyzer.
+        let mut pspans: Vec<Span> = Vec::new();
         if *self.peek() == Tok::LParen {
             self.advance();
             if *self.peek() != Tok::RParen {
                 loop {
+                    let pspan = self.cur_span();
                     let pname = self.expect_ident()?;
                     self.expect(&Tok::Colon)?;
                     let tps = self.type_params.clone();
                     let ty = self.parse_type(&tps)?;
                     params.push((pname, ty));
+                    pspans.push(pspan);
                     if *self.peek() == Tok::Comma {
                         self.advance();
                     } else {
@@ -664,11 +694,19 @@ impl Parser {
             self.expect(&Tok::RParen)?;
         } else {
             // Single unannotated parameter shorthand: `\x -> body`.
+            let pspan = self.cur_span();
             let pname = self.expect_ident()?;
             params.push((pname, Ty::Var(self.fresh_lambda_var())));
+            pspans.push(pspan);
         }
         self.expect(&Tok::Arrow)?;
         let body = self.parse_expr(0)?;
+        // Record each lambda parameter's def span, keyed by `(body span, index)`.
+        if !body.span.is_none() {
+            for (i, ps) in pspans.into_iter().enumerate() {
+                self.binder_spans.lambda_params.insert((body.span, i), ps);
+            }
+        }
         Ok(self.spanned(start, ExprKind::Lambda(params, Box::new(body), None)))
     }
 
@@ -895,11 +933,20 @@ impl Parser {
         self.expect(&Tok::LBrace)?;
         let mut arms = Vec::new();
         while *self.peek() != Tok::RBrace {
+            // Collect this arm's pattern binders (name + def span) while parsing
+            // the pattern, then commit them keyed by the arm body span below.
+            self.pat_binders.clear();
             let pat = self.parse_pattern()?;
+            let arm_binders = std::mem::take(&mut self.pat_binders);
             self.expect(&Tok::FatArrow)?;
             // An arm body is a fresh expression context: record literals are
             // allowed even when the enclosing `match` is in an `if`/`match` head.
             let body = self.parse_sub_expr(0)?;
+            if !body.span.is_none() {
+                for (name, span) in arm_binders {
+                    self.binder_spans.match_binders.insert((body.span, name), span);
+                }
+            }
             arms.push(Arm { pat, body });
             if *self.peek() == Tok::Comma {
                 self.advance();
@@ -950,6 +997,7 @@ impl Parser {
                 Ok(Pattern::Bool(false))
             }
             Tok::Ident(name) => {
+                let ident_span = self.cur_span();
                 self.advance();
                 if is_upper(&name) {
                     // Record pattern `Name { x, y }` (shorthand binds each field
@@ -959,11 +1007,14 @@ impl Parser {
                         let mut fields = Vec::new();
                         if *self.peek() != Tok::RBrace {
                             loop {
+                                let fspan = self.cur_span();
                                 let fname = self.expect_ident()?;
                                 let sub = if *self.peek() == Tok::Colon {
                                     self.advance();
                                     self.parse_pattern()?
                                 } else {
+                                    // `Point { x }` shorthand binds the field name.
+                                    self.pat_binders.push((fname.clone(), fspan));
                                     Pattern::Var(fname.clone())
                                 };
                                 fields.push((fname, sub));
@@ -994,6 +1045,8 @@ impl Parser {
                     }
                     Ok(Pattern::Ctor(name, subs))
                 } else {
+                    // A bare lowercase variable pattern: record its def span.
+                    self.pat_binders.push((name.clone(), ident_span));
                     Ok(Pattern::Var(name))
                 }
             }
@@ -1050,6 +1103,7 @@ impl Parser {
         loop {
             if *self.peek() == Tok::Let {
                 self.advance();
+                let binder_span = self.cur_span();
                 let name = self.expect_ident()?;
                 let mut ann = None;
                 if *self.peek() == Tok::Colon {
@@ -1060,6 +1114,11 @@ impl Parser {
                 self.expect(&Tok::Eq)?;
                 let value = self.parse_expr(0)?;
                 self.expect(&Tok::Semi)?;
+                // Record the binder's def span keyed by the RHS value span (a
+                // stable, unique in-AST key) for the data-flow analyzer.
+                if !value.span.is_none() {
+                    self.binder_spans.lets.insert(value.span, binder_span);
+                }
                 stmts.push(Stmt::Let(name, ann, value));
                 continue;
             }
@@ -1111,6 +1170,16 @@ impl Parser {
 
 pub fn parse(toks: Vec<Token>) -> Result<Program, String> {
     Parser::new(toks).parse_program()
+}
+
+/// Parse like [`parse`], additionally returning the [`BinderSpans`] side table of
+/// precise `let`/lambda-param/match-binder definition spans. Used by the
+/// data-flow analyzer (`aria analyze`) so it can report each local binding's
+/// definition site; ordinary compilation uses [`parse`] and ignores the table.
+pub fn parse_with_binders(toks: Vec<Token>) -> Result<(Program, BinderSpans), String> {
+    let mut p = Parser::new(toks);
+    let prog = p.parse_program()?;
+    Ok((prog, p.binder_spans))
 }
 
 #[cfg(test)]

@@ -457,6 +457,7 @@ impl<'a> Mono<'a> {
             params.push(Param {
                 name: p.name.clone(),
                 ty: pty,
+                span: p.span,
             });
         }
         let ret = self.subst_ty(&info.decl.ret, &map)?;

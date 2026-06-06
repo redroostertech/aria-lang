@@ -185,6 +185,11 @@ pub enum BinOp {
 pub struct Param {
     pub name: String,
     pub ty: Ty,
+    /// Precise source span of the parameter's BINDER (the parameter name
+    /// identifier), used by the data-flow analyzer to report the binding's
+    /// definition site. [`Span::none`] for compiler-synthesized parameters
+    /// (monomorphizer clones / lowered dispatchers).
+    pub span: Span,
 }
 
 #[derive(Debug, Clone)]
@@ -275,4 +280,27 @@ pub struct ImplDecl {
 #[derive(Debug, Clone)]
 pub struct Program {
     pub items: Vec<Item>,
+}
+
+/// A parser-built SIDE TABLE of precise binder source spans for the binders that
+/// the AST does not itself carry a span for (`let` names, lambda parameters, and
+/// match-arm pattern variables). It is pure METADATA consumed only by the
+/// data-flow analyzer to report each local binding's definition site; no backend,
+/// the monomorphizer, or the evaluator reads it, so it never affects codegen or a
+/// program's result.
+///
+/// Each binder is keyed by an in-AST span that survives unchanged from parse to
+/// analysis (the program is not monomorphized before `aria analyze`):
+///   * a `let` binder by the span of its right-hand-side value expression,
+///   * a lambda parameter by `(lambda-body span, parameter index)`,
+///   * a match-arm pattern variable by `(arm-body span, binder name)`.
+/// (Function parameters carry their own span directly on [`Param`].)
+#[derive(Debug, Clone, Default)]
+pub struct BinderSpans {
+    /// `let` binder span, keyed by the let's RHS value expression span.
+    pub lets: std::collections::HashMap<Span, Span>,
+    /// Lambda parameter binder span, keyed by `(lambda body span, param index)`.
+    pub lambda_params: std::collections::HashMap<(Span, usize), Span>,
+    /// Match-arm pattern-variable binder span, keyed by `(arm body span, name)`.
+    pub match_binders: std::collections::HashMap<(Span, String), Span>,
 }

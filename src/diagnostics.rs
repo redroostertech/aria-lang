@@ -17,7 +17,8 @@
 /// stable; new fields may be added later (consumers must ignore unknowns).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Diagnostic {
-    /// `"error"` today; room for `"warning"` later.
+    /// `"error"` (a hard compile error) or `"warning"` (a lint that does NOT
+    /// fail compilation / change the exit code). See `docs/DIAGNOSTICS.md`.
     pub severity: &'static str,
     /// The compiler phase that produced this: one of `lex`, `parse`, `type`,
     /// `shape`, `purity`, `exhaustiveness`.
@@ -67,6 +68,33 @@ impl Diagnostic {
             end_col: None,
             function,
         }
+    }
+
+    /// Build a `warning`-severity LINT diagnostic with an explicit stable `code`
+    /// (a `W`-prefixed warning code, e.g. `W0001`), `phase` (`lint`), and
+    /// `message`, plus the precise source `span` of the flagged construct. A
+    /// warning is ADVISORY: it never fails compilation and never changes an exit
+    /// code (see `docs/DIAGNOSTICS.md`). Unlike [`Diagnostic::error`], the code is
+    /// passed in directly (no message classification), since lints own their codes.
+    pub fn warning(
+        code: &'static str,
+        message: String,
+        span: crate::ast::Span,
+        function: Option<String>,
+    ) -> Diagnostic {
+        let mut d = Diagnostic {
+            severity: "warning",
+            phase: "lint",
+            code,
+            message,
+            line: None,
+            col: None,
+            end_line: None,
+            end_col: None,
+            function,
+        };
+        d.set_span(span);
+        d
     }
 
     /// Overwrite this diagnostic's location with a precise source span (1-based
@@ -516,6 +544,28 @@ mod tests {
         let d = Diagnostic::error("lex", "cannot read foo.aria: No such file or directory (os error 2)".into());
         assert_eq!(d.phase, "io", "file read error should be io phase");
         assert_eq!(d.code, "E0002", "file read error should be E0002");
+    }
+
+    #[test]
+    fn warning_severity_and_precise_span() {
+        let span = crate::ast::Span {
+            start_line: 4,
+            start_col: 7,
+            end_line: 4,
+            end_col: 10,
+        };
+        let d = Diagnostic::warning("W0001", "unused variable `tmp`".into(), span, Some("f".into()));
+        assert_eq!(d.severity, "warning");
+        assert_eq!(d.phase, "lint");
+        assert_eq!(d.code, "W0001");
+        assert_eq!(d.line, Some(4));
+        assert_eq!(d.col, Some(7));
+        assert_eq!(d.end_line, Some(4));
+        assert_eq!(d.end_col, Some(10));
+        assert_eq!(d.function.as_deref(), Some("f"));
+        let j = d.to_json();
+        assert!(j.contains("\"severity\":\"warning\""));
+        assert!(j.contains("\"code\":\"W0001\""));
     }
 
     #[test]

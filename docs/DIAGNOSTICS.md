@@ -11,10 +11,13 @@ aria check --json <file.aria>
 ```
 
 - Emits a JSON **array** of diagnostic objects to **stdout** — one object per
-  error.
-- Exits **non-zero (1)** if there are any diagnostics, **0** if the program is
-  clean.
-- A clean program prints exactly `[]` and exits 0.
+  error **or warning**.
+- Exits **non-zero (1)** if there are any **errors**, **0** otherwise.
+  **Warnings do NOT affect the exit code**: a program with only warnings still
+  exits 0 and is "clean" for compilation purposes.
+- A clean program prints exactly `[]` and exits 0. A program that type-checks but
+  has lint warnings (e.g. an unused `let`) prints an array of `"warning"` objects
+  and **still exits 0**.
 - The `--json` flag is accepted in any position (e.g.
   `aria check --json f.aria` or `aria check f.aria --json`) and is only valid
   for the `check` command.
@@ -43,8 +46,8 @@ object:
 
 | field      | type            | meaning                                                                 |
 |------------|-----------------|-------------------------------------------------------------------------|
-| `severity` | string          | `"error"` today. Room for `"warning"` later.                            |
-| `phase`    | string          | Compiler phase: `lex`, `parse`, `type`, `shape`, `purity`, `exhaustiveness`, or `io` (file read). |
+| `severity` | string          | `"error"` (a hard compile error) or `"warning"` (an advisory lint that does **not** fail compilation / change the exit code). |
+| `phase`    | string          | Compiler phase: `lex`, `parse`, `type`, `shape`, `purity`, `exhaustiveness`, `io` (file read), or `lint` (a warning). |
 | `code`     | string          | **Stable** short code per error *category* (see table). Match on this.  |
 | `message`  | string          | Human-readable text (identical to the non-`--json` path).               |
 | `line`     | int or `null`   | 1-based source line if known, else `null`.                              |
@@ -86,6 +89,35 @@ the stable contract.
 | `E0900` | (any)            | Uncategorized (reserved fallback; should not occur in practice).      |
 
 New categories will get new `E####` codes; existing codes keep their meaning.
+
+### Warning codes (`W####`)
+
+Warnings are **advisory lints** (severity `"warning"`, phase `lint`) surfaced on
+otherwise **well-formed** programs. They are emitted from the data-flow analysis
+(see `docs/ANALYSIS.md`). A warning carries a **precise span** (`line`/`col`/
+`end_line`/`end_col`) on the flagged construct and the enclosing `function`.
+
+| code    | phase  | severity  | category                                                        |
+|---------|--------|-----------|-----------------------------------------------------------------|
+| `W0001` | `lint` | `warning` | **Unused variable**: a `let` binding that is never read. Because Aria is single-assignment, an unused `let` is provably dead. |
+| `W0002` | `lint` | `warning` | **Unused parameter**. *Reserved / opt-in — NOT emitted by default*, because a parameter is frequently unused for a legitimate reason (a signature / interface / trait method requires it), which would make it false-positive noise. |
+
+By default only `W0001` (unused `let`) is emitted. Unused **parameters**,
+**lambda parameters**, and **match binders** are deliberately *not* warned about
+(pattern destructuring and callback shapes routinely leave some unused), to keep
+the lint low-noise for an AI authoring loop.
+
+### Where warnings are surfaced
+
+- **`aria check --json`**: warning objects are appended to the diagnostics array
+  (only when the program is otherwise error-free). They **do not change the exit
+  code** — a program with only warnings exits 0.
+- **`aria lsp`**: published as LSP diagnostics with **`severity: 2` (Warning)** and
+  the precise range, so editors underline dead variables and an agent loop sees
+  them.
+- **Human `aria check` (no `--json`)**: **unchanged** — warnings are NOT printed
+  on the human path. They are a machine/editor channel only. (`aria analyze` also
+  reports unused bindings in its `data-flow:` summary and `dataflow` JSON.)
 
 ## Location precision (what is populated today)
 
@@ -149,4 +181,15 @@ A parse error (note populated `line`):
 ```sh
 $ aria check --json parse_err.aria
 [{"severity":"error","phase":"parse","code":"E0100","message":"line 2: unexpected token Let in expression","line":2,"col":null,"end_line":null,"end_col":null,"function":null}]
+```
+
+A program that type-checks but has an **unused `let`** — a `W0001` warning with a
+precise span, and the exit code is still **0** (a warning is not a compile
+failure):
+
+```sh
+$ aria check --json unused.aria   # fn f() -> Int = { let tmp = 99; 1 }
+[{"severity":"warning","phase":"lint","code":"W0001","message":"unused variable `tmp`","line":1,"col":23,"end_line":1,"end_col":26,"function":"f"}]
+$ echo $?
+0
 ```
