@@ -28,7 +28,7 @@
 //! a bare function-name reference as a use). Constructor applications are not part
 //! of the call graph (they are data, not control flow).
 
-use crate::ast::{Expr, ExprKind, FnDecl, Item, Program, Stmt};
+use crate::ast::{Expr, ExprKind, FnDecl, Item, Program, Span, Stmt};
 use crate::diagnostics::json_escape;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -125,6 +125,31 @@ impl Signature {
     }
 }
 
+/// One TYPED CALL EDGE at a precise site: the callee, the exact `(line, col)` of
+/// the call expression, the INFERRED concrete type of each argument expression at
+/// THIS site (in source order), and the inferred type of the call's result. This
+/// is what turns the call graph into a typed-edge program model: not just *who
+/// calls whom from where*, but *what types actually flow on this call* — including
+/// the concrete instantiation of a generic at this site (`id(2)` -> `["Int"]`/
+/// `"Int"`, `id("hi")` -> `["String"]`/`"String"`). A type is `None` only when it
+/// is unavailable for that span (a synthesized node, or a non-`Call` edge such as
+/// a function passed by name with no applied arguments).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedSite {
+    /// The callee name (user, library, or builtin) — same name space as `call_sites`.
+    pub callee: String,
+    /// 1-based source line of the call expression.
+    pub line: u32,
+    /// 1-based source column of the call expression.
+    pub col: u32,
+    /// The inferred concrete type of each argument expression at this site, in
+    /// source order. `None` for an argument whose span carried no recorded type.
+    pub arg_types: Vec<Option<String>>,
+    /// The inferred concrete type of the call's RESULT at this site, or `None` if
+    /// the call expression's own span carried no recorded type.
+    pub result_type: Option<String>,
+}
+
 /// Per-function call-graph facts.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FnInfo {
@@ -162,6 +187,14 @@ pub struct FnInfo {
     /// exists. Synthesized calls (no source span) contribute no site. Keyed by
     /// callee name, sorted for stable output.
     pub call_sites: Vec<(String, Vec<(u32, u32)>)>,
+    /// TYPED CALL EDGES out of this function: for every located call, the
+    /// inferred argument types and result type AT THAT SITE (see [`TypedSite`]).
+    /// This is the per-call-site argument-type-inference view — the precise
+    /// "what types flow on this call" model, with generics concretely
+    /// instantiated per site. Sorted by `(line, col)` then callee for stable
+    /// output. Empty when no type map was supplied (an untyped analysis) or the
+    /// function makes no located calls.
+    pub typed_sites: Vec<TypedSite>,
 }
 
 /// Whole-program call-graph analysis.
@@ -186,8 +219,26 @@ pub struct CallGraph {
 
 /// Build the static call graph for a parsed (and ideally type-checked) program.
 /// `prelude_names` is the set of prelude function names (so they can be flagged
-/// as library, not user, code).
+/// as library, not user, code). Equivalent to [`analyze_typed`] with no type map
+/// (so every `typed_sites` list is empty); kept for callers that only want the
+/// structural graph.
 pub fn analyze(program: &Program, prelude_names: &HashSet<String>) -> CallGraph {
+    analyze_typed(program, prelude_names, None)
+}
+
+/// Build the static call graph, optionally enriched with PER-CALL-SITE argument
+/// and result types from `types` (a span -> rendered-concrete-type map produced
+/// by [`crate::typeck::check_with_types`]). When `types` is `Some`, every located
+/// call edge also carries its inferred argument types and result type at that
+/// site (see [`TypedSite`] / [`FnInfo::typed_sites`]); when `None`, the graph is
+/// purely structural and `typed_sites` is empty everywhere. The type map is
+/// METADATA: it never changes the structural fields (callees/callers/cycles/
+/// unused) — those are computed identically with or without it.
+pub fn analyze_typed(
+    program: &Program,
+    prelude_names: &HashSet<String>,
+    types: Option<&HashMap<Span, String>>,
+) -> CallGraph {
     // The set of all top-level function names (user + prelude + synthetic) and
     // their decls, so a call to one is a graph node and a call to anything else
     // is a builtin.
@@ -223,6 +274,8 @@ pub fn analyze(program: &Program, prelude_names: &HashSet<String>) -> CallGraph 
     let mut callees_user: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut callees_lib: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut call_sites: BTreeMap<String, BTreeMap<String, BTreeSet<(u32, u32)>>> = BTreeMap::new();
+    // Per-function TYPED call edges, collected only when a type map is supplied.
+    let mut typed_sites: BTreeMap<String, Vec<TypedSite>> = BTreeMap::new();
     for item in &program.items {
         if let Item::Fn(f) = item {
             // The function's PARAMS are in-scope locals that shadow any top-level
@@ -236,6 +289,16 @@ pub fn analyze(program: &Program, prelude_names: &HashSet<String>) -> CallGraph 
             collect_call_names(&f.body, &mut names, &mut scope);
             let sites = call_sites.entry(f.name.clone()).or_default();
             collect_call_sites(&f.body, sites, &mut scope);
+            // The typed walk re-uses a fresh scope (same shadowing rules), and only
+            // records when a type map is present.
+            if let Some(tm) = types {
+                let mut tscope: Scope = Scope::new();
+                for p in &f.params {
+                    tscope.push(&p.name);
+                }
+                let ts = typed_sites.entry(f.name.clone()).or_default();
+                collect_typed_sites(&f.body, ts, &mut tscope, tm);
+            }
             let u = callees_user.entry(f.name.clone()).or_default();
             let l = callees_lib.entry(f.name.clone()).or_default();
             for n in names {
@@ -290,6 +353,23 @@ pub fn analyze(program: &Program, prelude_names: &HashSet<String>) -> CallGraph 
             })
             .map(|(callee, sites)| (callee.clone(), sites.iter().copied().collect()))
             .collect();
+        // The typed sites, filtered to the SAME real-edge set as `call_sites`
+        // (drop a local function-valued application, which is not a graph edge),
+        // sorted by position then callee for stable output.
+        let mut fn_typed_sites: Vec<TypedSite> = typed_sites
+            .get(name)
+            .into_iter()
+            .flatten()
+            .filter(|s| {
+                decls.contains_key(s.callee.as_str())
+                    || builtin.contains(s.callee.as_str())
+                    || s.callee.as_str() == "grad"
+            })
+            .cloned()
+            .collect();
+        fn_typed_sites.sort_by(|a, b| {
+            (a.line, a.col, &a.callee).cmp(&(b.line, b.col, &b.callee))
+        });
         functions.push(FnInfo {
             name: name.clone(),
             signature: sigs.get(name).cloned().unwrap_or(Signature {
@@ -307,6 +387,7 @@ pub fn analyze(program: &Program, prelude_names: &HashSet<String>) -> CallGraph 
             lib_callees,
             callers: fn_callers,
             call_sites: fn_call_sites,
+            typed_sites: fn_typed_sites,
         });
     }
 
@@ -615,6 +696,130 @@ fn collect_call_sites(
     }
 }
 
+/// Walk `e`, emitting a [`TypedSite`] for every located call edge with its
+/// INFERRED argument and result types looked up from `tm` (the span -> rendered-
+/// type table). Mirrors [`collect_call_sites`]'s scope/shadowing rules so the
+/// same set of edges is produced; the only addition is per-site types:
+///
+///   * `Call(name, args)` where `name` is a real (non-shadowed) callee records
+///     each direct argument's span -> type as `arg_types`, and the `Call`
+///     expression's own span -> type as `result_type`. This is the headline:
+///     a generic call records its CONCRETE instantiation at this site.
+///   * a bare function-name `Var` used as a value records a zero-argument site
+///     whose `result_type` is the (instantiated) function type — a typed edge
+///     with no arguments.
+///
+/// A type missing for a span (synthesized node, or an unmapped span) yields
+/// `None` for that slot — never a fabricated type.
+fn collect_typed_sites(
+    e: &Expr,
+    out: &mut Vec<TypedSite>,
+    scope: &mut Scope,
+    tm: &HashMap<Span, String>,
+) {
+    let lookup = |span: Span| -> Option<String> {
+        if span.is_none() {
+            None
+        } else {
+            tm.get(&span).cloned()
+        }
+    };
+    match &e.kind {
+        ExprKind::Call(name, args) => {
+            if !scope.is_local(name) && !e.span.is_none() {
+                out.push(TypedSite {
+                    callee: name.clone(),
+                    line: e.span.start_line,
+                    col: e.span.start_col,
+                    arg_types: args.iter().map(|a| lookup(a.span)).collect(),
+                    result_type: lookup(e.span),
+                });
+            }
+            for a in args {
+                collect_typed_sites(a, out, scope, tm);
+            }
+        }
+        ExprKind::Var(name) => {
+            // A bare top-level function name used as a value: a zero-arg typed
+            // edge whose result type is the function's (instantiated) type.
+            if !scope.is_local(name) && !e.span.is_none() {
+                out.push(TypedSite {
+                    callee: name.clone(),
+                    line: e.span.start_line,
+                    col: e.span.start_col,
+                    arg_types: Vec::new(),
+                    result_type: lookup(e.span),
+                });
+            }
+        }
+        ExprKind::Ctor(_, args) => {
+            for a in args {
+                collect_typed_sites(a, out, scope, tm);
+            }
+        }
+        ExprKind::Record(_, fields) => {
+            for (_, v) in fields {
+                collect_typed_sites(v, out, scope, tm);
+            }
+        }
+        ExprKind::Field(obj, _) => collect_typed_sites(obj, out, scope, tm),
+        ExprKind::Update(base, updates) => {
+            collect_typed_sites(base, out, scope, tm);
+            for (_, v) in updates {
+                collect_typed_sites(v, out, scope, tm);
+            }
+        }
+        ExprKind::Lambda(params, body, _) => {
+            let depth = scope.depth();
+            for (name, _) in params {
+                scope.push(name);
+            }
+            collect_typed_sites(body, out, scope, tm);
+            scope.truncate(depth);
+        }
+        ExprKind::Apply(callee, args, _) => {
+            collect_typed_sites(callee, out, scope, tm);
+            for a in args {
+                collect_typed_sites(a, out, scope, tm);
+            }
+        }
+        ExprKind::Unary(_, inner) => collect_typed_sites(inner, out, scope, tm),
+        ExprKind::Binary(_, lhs, rhs) => {
+            collect_typed_sites(lhs, out, scope, tm);
+            collect_typed_sites(rhs, out, scope, tm);
+        }
+        ExprKind::If(c, t, e2) => {
+            collect_typed_sites(c, out, scope, tm);
+            collect_typed_sites(t, out, scope, tm);
+            collect_typed_sites(e2, out, scope, tm);
+        }
+        ExprKind::Match(scrut, arms) => {
+            collect_typed_sites(scrut, out, scope, tm);
+            for arm in arms {
+                let depth = scope.depth();
+                scope.bind_pattern(&arm.pat);
+                collect_typed_sites(&arm.body, out, scope, tm);
+                scope.truncate(depth);
+            }
+        }
+        ExprKind::Block(stmts, last) => {
+            let depth = scope.depth();
+            for s in stmts {
+                match s {
+                    Stmt::Let(name, _, v) => {
+                        collect_typed_sites(v, out, scope, tm);
+                        scope.push(name);
+                    }
+                    Stmt::Expr(ex) => collect_typed_sites(ex, out, scope, tm),
+                }
+            }
+            collect_typed_sites(last, out, scope, tm);
+            scope.truncate(depth);
+        }
+        ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Str(_) | ExprKind::Unit => {}
+    }
+}
+
 /// The set of USER functions reachable from `main` over user-to-user edges.
 fn reachable_from_main(
     callees_user: &BTreeMap<String, BTreeSet<String>>,
@@ -771,7 +976,7 @@ impl CallGraph {
                 s.push(',');
             }
             s.push_str(&format!(
-                "{{\"name\":\"{}\",\"signature\":{},\"line\":{},\"user\":{},\"callees\":{},\"lib_callees\":{},\"callers\":{},\"recursive\":{},\"fan_in\":{},\"fan_out\":{},\"call_sites\":{}}}",
+                "{{\"name\":\"{}\",\"signature\":{},\"line\":{},\"user\":{},\"callees\":{},\"lib_callees\":{},\"callers\":{},\"recursive\":{},\"fan_in\":{},\"fan_out\":{},\"call_sites\":{},\"typed_call_sites\":{}}}",
                 json_escape(&f.name),
                 f.signature.to_json(),
                 f.line,
@@ -783,6 +988,7 @@ impl CallGraph {
                 f.fan_in,
                 f.fan_out,
                 call_sites_json(&f.call_sites),
+                typed_sites_json(&f.typed_sites),
             ));
         }
         s.push(']');
@@ -831,6 +1037,31 @@ impl CallGraph {
             }
             if !f.callers.is_empty() {
                 s.push_str(&format!("  called by: {}\n", f.callers.join(", ")));
+            }
+            // Show a couple of TYPED call edges (the inferred argument/result types
+            // at the actual call sites) when available — kept short so the summary
+            // stays readable. Each line reads `callee(Int, Int) -> Int  @ L:C`.
+            for site in f.typed_sites.iter().take(2) {
+                let args: Vec<String> = site
+                    .arg_types
+                    .iter()
+                    .map(|a| a.clone().unwrap_or_else(|| "?".to_string()))
+                    .collect();
+                let ret = site.result_type.clone().unwrap_or_else(|| "?".to_string());
+                s.push_str(&format!(
+                    "  call:      {}({}) -> {}  @ {}:{}\n",
+                    site.callee,
+                    args.join(", "),
+                    ret,
+                    site.line,
+                    site.col
+                ));
+            }
+            if f.typed_sites.len() > 2 {
+                s.push_str(&format!(
+                    "             (+{} more typed call site(s))\n",
+                    f.typed_sites.len() - 2
+                ));
             }
         }
         s.push('\n');
@@ -894,6 +1125,44 @@ fn call_sites_json(sites: &[(String, Vec<(u32, u32)>)]) -> String {
     s
 }
 
+/// JSON-encode a function's TYPED call edges as an array of objects, each:
+/// `{"callee":"add","line":3,"col":20,"arg_types":["Int","Int"],"result_type":"Int"}`.
+/// `arg_types` is an array (per argument, in source order); a type that was
+/// unavailable for a span is encoded as JSON `null`. `result_type` is the call's
+/// inferred result type, or `null`. Empty `[]` when the function makes no located
+/// calls or the analysis carried no type map. This is the per-call-site argument-
+/// type-inference view: the SAME edges as `call_sites`, enriched with the concrete
+/// types that flow on each call (generics instantiated per site).
+fn typed_sites_json(sites: &[TypedSite]) -> String {
+    let opt = |t: &Option<String>| match t {
+        Some(s) => format!("\"{}\"", json_escape(s)),
+        None => "null".to_string(),
+    };
+    let mut s = String::from("[");
+    for (i, site) in sites.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(&format!(
+            "{{\"callee\":\"{}\",\"line\":{},\"col\":{},\"arg_types\":[",
+            json_escape(&site.callee),
+            site.line,
+            site.col
+        ));
+        for (j, at) in site.arg_types.iter().enumerate() {
+            if j > 0 {
+                s.push(',');
+            }
+            s.push_str(&opt(at));
+        }
+        s.push_str("],\"result_type\":");
+        s.push_str(&opt(&site.result_type));
+        s.push('}');
+    }
+    s.push(']');
+    s
+}
+
 /// The set of prelude function NAMES, derived by parsing the prelude source on its
 /// own. Used to classify a function in the combined (user + prelude) program as
 /// library code. Computed once.
@@ -927,6 +1196,34 @@ mod tests {
 
     fn info<'a>(g: &'a CallGraph, name: &str) -> &'a FnInfo {
         g.functions.iter().find(|f| f.name == name).unwrap_or_else(|| panic!("no fn {}", name))
+    }
+
+    /// Like [`graph_of`] but TYPED: runs `check_with_types` to get the span->type
+    /// table and threads it through `analyze_typed`, so each call edge carries its
+    /// per-site argument/result types.
+    fn typed_graph_of(src: &str) -> CallGraph {
+        let toks = crate::lexer::lex(&crate::prelude::wrap(src)).expect("lex");
+        let prog = crate::parser::parse(toks).expect("parse");
+        let types = crate::typeck::check_with_types(&prog).expect("typeck");
+        analyze_typed(&prog, &prelude_fn_names(), Some(&types))
+    }
+
+    /// The typed call sites of `name` to `callee`, as `(arg_types, result_type)`
+    /// with each type rendered (a missing type becomes `"?"`).
+    fn typed_sites_to(g: &CallGraph, name: &str, callee: &str) -> Vec<(Vec<String>, String)> {
+        info(g, name)
+            .typed_sites
+            .iter()
+            .filter(|s| s.callee == callee)
+            .map(|s| {
+                let args = s
+                    .arg_types
+                    .iter()
+                    .map(|a| a.clone().unwrap_or_else(|| "?".to_string()))
+                    .collect();
+                (args, s.result_type.clone().unwrap_or_else(|| "?".to_string()))
+            })
+            .collect()
     }
 
     #[test]
@@ -1298,5 +1595,185 @@ fn main() -> Int = apply(dbl, 3)
         assert!(info(&g, "main").callees.contains(&"apply".to_string()));
         assert!(info(&g, "main").callees.contains(&"dbl".to_string()));
         assert!(!g.unused.contains(&"dbl".to_string()), "dbl is used as a value");
+    }
+
+    // ---- typed call edges: per-call-site argument & result types -------
+
+    #[test]
+    fn typed_sites_record_concrete_arg_and_result_types() {
+        let src = "\
+fn add(a: Int, b: Int) -> Int = a + b
+fn main() -> Int = add(1, 2)
+";
+        let g = typed_graph_of(src);
+        let sites = typed_sites_to(&g, "main", "add");
+        assert_eq!(sites, vec![(vec!["Int".to_string(), "Int".to_string()], "Int".to_string())]);
+    }
+
+    #[test]
+    fn typed_sites_generic_instantiation_differs_per_site() {
+        // The headline: one generic `id`, two call sites, DIFFERENT concrete types.
+        let src = "\
+fn id[T](x: T) -> T = x
+fn main() -> Int = { let a = id(2); let s = id(\"hi\"); a }
+";
+        let g = typed_graph_of(src);
+        let sites = typed_sites_to(&g, "main", "id");
+        // Two sites: one instantiated at Int, one at String.
+        assert!(
+            sites.contains(&(vec!["Int".to_string()], "Int".to_string())),
+            "id(2) is Int->Int: {:?}",
+            sites
+        );
+        assert!(
+            sites.contains(&(vec!["String".to_string()], "String".to_string())),
+            "id(\"hi\") is String->String: {:?}",
+            sites
+        );
+        assert_eq!(sites.len(), 2);
+    }
+
+    #[test]
+    fn typed_sites_nested_call_argument_types() {
+        // `add(id(2), 3)`: the inner `id(2)` is Int->Int, and the outer `add` sees
+        // both arguments as Int.
+        let src = "\
+fn add(a: Int, b: Int) -> Int = a + b
+fn id[T](x: T) -> T = x
+fn main() -> Int = add(id(2), 3)
+";
+        let g = typed_graph_of(src);
+        let add_sites = typed_sites_to(&g, "main", "add");
+        assert_eq!(
+            add_sites,
+            vec![(vec!["Int".to_string(), "Int".to_string()], "Int".to_string())]
+        );
+        let id_sites = typed_sites_to(&g, "main", "id");
+        assert_eq!(id_sites, vec![(vec!["Int".to_string()], "Int".to_string())]);
+    }
+
+    #[test]
+    fn typed_sites_builtin_call_concrete_collection_types() {
+        // A builtin (Vector/Array) call carries the concrete instantiation.
+        let src = "\
+fn main() -> Int = { let v = [10, 20, 30]; array_len(v) }
+";
+        let g = typed_graph_of(src);
+        let sites = typed_sites_to(&g, "main", "array_len");
+        assert_eq!(
+            sites,
+            vec![(vec!["Array[Int]".to_string()], "Int".to_string())]
+        );
+    }
+
+    #[test]
+    fn typed_sites_record_and_float_argument_types() {
+        let src = "\
+type Point = { x: Float, y: Float }
+fn scale(p: Point, k: Float) -> Float = p.x + k
+fn main() -> Float = scale(Point { x: 1.0, y: 2.0 }, 3.5)
+";
+        let g = typed_graph_of(src);
+        let sites = typed_sites_to(&g, "main", "scale");
+        assert_eq!(
+            sites,
+            vec![(vec!["Point".to_string(), "Float".to_string()], "Float".to_string())]
+        );
+    }
+
+    #[test]
+    fn typed_sites_map_builtin_concrete_types() {
+        let src = "\
+fn main() -> Int = { let m0 = map_new(); let m1 = map_insert(m0, 1, 100); map_len(m1) }
+";
+        let g = typed_graph_of(src);
+        let new_sites = typed_sites_to(&g, "main", "map_new");
+        assert_eq!(new_sites, vec![(vec![], "Map[Int, Int]".to_string())]);
+        let ins_sites = typed_sites_to(&g, "main", "map_insert");
+        assert_eq!(
+            ins_sites,
+            vec![(
+                vec![
+                    "Map[Int, Int]".to_string(),
+                    "Int".to_string(),
+                    "Int".to_string()
+                ],
+                "Map[Int, Int]".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn untyped_analyze_has_empty_typed_sites() {
+        // The structural-only `analyze` (no type map) leaves `typed_sites` empty,
+        // and the structural fields are identical to before.
+        let src = "\
+fn helper(x: Int) -> Int = x + 1
+fn main() -> Int = helper(1)
+";
+        let g = graph_of(src);
+        assert!(info(&g, "main").typed_sites.is_empty());
+        // Structural fields unchanged.
+        assert!(info(&g, "main").callees.contains(&"helper".to_string()));
+    }
+
+    #[test]
+    fn typed_sites_graceful_null_when_type_unavailable() {
+        // A type map missing a span yields `None` (JSON null), never a fabricated
+        // type. Build a graph with an EMPTY type map and confirm null surfaces.
+        let toks = crate::lexer::lex(&crate::prelude::wrap(
+            "fn helper(x: Int) -> Int = x + 1\nfn main() -> Int = helper(1)",
+        ))
+        .expect("lex");
+        let prog = crate::parser::parse(toks).expect("parse");
+        let empty: HashMap<Span, String> = HashMap::new();
+        let g = analyze_typed(&prog, &prelude_fn_names(), Some(&empty));
+        let site = info(&g, "main")
+            .typed_sites
+            .iter()
+            .find(|s| s.callee == "helper")
+            .expect("helper edge");
+        assert_eq!(site.arg_types, vec![None]);
+        assert_eq!(site.result_type, None);
+    }
+
+    #[test]
+    fn typed_call_sites_json_is_well_formed_and_concrete() {
+        let src = "\
+fn id[T](x: T) -> T = x
+fn main() -> Int = { let a = id(2); let s = id(\"hi\"); a }
+";
+        let g = typed_graph_of(src);
+        let json = g.to_json();
+        // The new key is present and carries the per-site concrete instantiations.
+        assert!(json.contains("\"typed_call_sites\":"));
+        assert!(
+            json.contains("\"callee\":\"id\",\"line\":2,") && json.contains("\"arg_types\":[\"Int\"],\"result_type\":\"Int\""),
+            "id(2) typed site: {}",
+            json
+        );
+        assert!(
+            json.contains("\"arg_types\":[\"String\"],\"result_type\":\"String\""),
+            "id(\"hi\") typed site: {}",
+            json
+        );
+        // Balanced braces/brackets (well-formedness spot-check).
+        let ob = json.chars().filter(|&c| c == '{').count();
+        let cb = json.chars().filter(|&c| c == '}').count();
+        assert_eq!(ob, cb, "balanced braces");
+        let os = json.chars().filter(|&c| c == '[').count();
+        let cs = json.chars().filter(|&c| c == ']').count();
+        assert_eq!(os, cs, "balanced brackets");
+    }
+
+    #[test]
+    fn typed_human_summary_shows_call_types() {
+        let src = "\
+fn add(a: Int, b: Int) -> Int = a + b
+fn main() -> Int = add(1, 2)
+";
+        let g = typed_graph_of(src);
+        let h = g.to_human();
+        assert!(h.contains("call:      add(Int, Int) -> Int"), "human shows typed call:\n{}", h);
     }
 }

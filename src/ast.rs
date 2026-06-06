@@ -47,7 +47,7 @@ pub struct ClosureSig {
 /// result. They feed diagnostics, runtime stack traces, the call graph, and the
 /// LSP, which point at the EXACT sub-expression rather than the function's
 /// definition line.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Span {
     pub start_line: u32,
     pub start_col: u32,

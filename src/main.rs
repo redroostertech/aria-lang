@@ -888,16 +888,21 @@ fn run_analyze(args: &[String]) -> ExitCode {
         }
     };
     // Analyze a TYPE-CHECKED program: surface check errors first so analysis only
-    // ever runs on well-formed code.
-    if let Err(errors) = typeck::check(&program) {
-        eprintln!("type error{} in {}:", if errors.len() == 1 { "" } else { "s" }, path);
-        for e in &errors {
-            eprintln!("  - {}", e);
+    // ever runs on well-formed code. `check_with_types` runs the SAME check and,
+    // on success, also returns the span -> inferred-concrete-type table that feeds
+    // the typed call edges (per-call-site argument/result types).
+    let types = match typeck::check_with_types(&program) {
+        Ok(t) => t,
+        Err(errors) => {
+            eprintln!("type error{} in {}:", if errors.len() == 1 { "" } else { "s" }, path);
+            for e in &errors {
+                eprintln!("  - {}", e);
+            }
+            return ExitCode::FAILURE;
         }
-        return ExitCode::FAILURE;
-    }
+    };
 
-    let graph = analyze::analyze(&program, &analyze::prelude_fn_names());
+    let graph = analyze::analyze_typed(&program, &analyze::prelude_fn_names(), Some(&types));
     if json {
         println!("{}", graph.to_json());
     } else {

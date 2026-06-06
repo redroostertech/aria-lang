@@ -144,6 +144,17 @@ struct Checker {
     /// before each function body is checked. `None` (or a [`Span::none`] node)
     /// leaves the diagnostic's `col` unset.
     err_span: RefCell<Option<Span>>,
+    /// OPTIONAL span -> inferred-type side table for the typed-call-graph view
+    /// (`aria analyze`). When `Some`, every successful `synth` records the
+    /// expression's span -> the type it synthesized (resolved through the
+    /// substitution *as known so far*); a final pass re-resolves each entry once
+    /// unification is complete, so a per-call-site argument/result type is the
+    /// CONCRETE type that flows there (a generic call records its concrete
+    /// instantiation). `None` (the default for `check`/`check_structured`) makes
+    /// recording a no-op, so the existing callers pay nothing and see no change in
+    /// what is accepted/rejected — this is pure observation. Keyed by `Span`;
+    /// synthesized nodes ([`Span::none`]) are never recorded.
+    type_at: RefCell<Option<HashMap<Span, Ty>>>,
 }
 
 /// An error accumulator that records each message alongside an OPTIONAL precise
@@ -444,6 +455,7 @@ fn check_collect(program: &Program) -> Errors {
         counter: RefCell::new(0),
         lam_vars: RefCell::new(Vec::new()),
         err_span: RefCell::new(None),
+        type_at: RefCell::new(None),
     };
 
     // Pass 3: check each function body against its declared return type. Each
@@ -559,6 +571,134 @@ fn check_collect(program: &Program) -> Errors {
     errors
 }
 
+/// Type-check `program` and, for a WELL-TYPED program, return a span -> rendered
+/// CONCRETE-type side table: the typed-edge view `aria analyze` consumes. Each
+/// entry maps the source [`Span`] of an expression to the fully-resolved type
+/// that flows there (e.g. a generic call `id(2)` records its `2` argument span ->
+/// `"Int"` and the call span -> `"Int"`, while `id("x")` at a *different* site
+/// records `"String"`). For a program with type errors, returns `Err(messages)`
+/// — the SAME messages `check` produces (this runs `check_collect` first, so it
+/// never disagrees with the human/JSON diagnostics).
+///
+/// This is pure observation layered on top of the normal check: it activates the
+/// `type_at` side table while re-running Pass 3 (per-function body inference),
+/// re-resolving each function's recorded entries through that function's complete
+/// substitution *before* the next function clears it. It changes nothing about
+/// what is accepted or rejected; the existing `check`/`check_structured` entry
+/// points are untouched.
+pub fn check_with_types(program: &Program) -> Result<HashMap<Span, String>, Vec<String>> {
+    // Reuse the single source of truth for acceptance and error messages.
+    let errors = check_collect(program);
+    if !errors.is_empty() {
+        return Err(errors.msgs);
+    }
+
+    // Rebuild a checker (mirroring `check_collect`'s Pass 1) with the span->type
+    // table ACTIVE, then re-run body inference solely to populate it. The program
+    // already type-checked above, so every `synth` here succeeds.
+    let mut fns: HashMap<String, FnSig> = HashMap::new();
+    let mut ctors: HashMap<String, CtorSig> = HashMap::new();
+    let mut types: HashMap<String, (Vec<String>, Vec<String>)> = HashMap::new();
+    for item in &program.items {
+        match item {
+            Item::Type(t) => {
+                let mut variants = Vec::new();
+                for v in &t.variants {
+                    variants.push(v.name.clone());
+                    ctors.entry(v.name.clone()).or_insert(CtorSig {
+                        type_params: t.params.clone(),
+                        fields: v.fields.clone(),
+                        tyname: t.name.clone(),
+                        field_names: v.field_names.clone(),
+                    });
+                }
+                types.entry(t.name.clone()).or_insert((t.params.clone(), variants));
+            }
+            Item::Fn(f) => {
+                let params = f.params.iter().map(|p| p.ty.clone()).collect();
+                fns.entry(f.name.clone()).or_insert(FnSig {
+                    type_params: f.type_params.clone(),
+                    bounds: f.bounds.clone(),
+                    params,
+                    ret: f.ret.clone(),
+                });
+            }
+        }
+    }
+    let traits = crate::traits::index(program);
+    let checker = Checker {
+        fns,
+        ctors,
+        types,
+        traits,
+        cur_bounds: RefCell::new(HashMap::new()),
+        subst: RefCell::new(HashMap::new()),
+        counter: RefCell::new(0),
+        lam_vars: RefCell::new(Vec::new()),
+        err_span: RefCell::new(None),
+        type_at: RefCell::new(Some(HashMap::new())),
+    };
+
+    // The accumulated, fully-resolved table across all functions. We re-resolve
+    // each function's freshly-recorded entries through that function's COMPLETE
+    // substitution before the next function clears `subst`.
+    let mut out: HashMap<Span, String> = HashMap::new();
+    for item in &program.items {
+        if let Item::Fn(f) = item {
+            // Skip trait-method dispatchers exactly as Pass 3 does (their
+            // mechanically-generated body is not ordinarily well-typed).
+            if checker.traits.is_method(&f.name)
+                && f.bounds.iter().any(|(p, _)| f.type_params.contains(p))
+            {
+                continue;
+            }
+            checker.subst.borrow_mut().clear();
+            *checker.cur_bounds.borrow_mut() = f.bounds.iter().cloned().collect();
+            // Start each function with a fresh, empty span->type table so we can
+            // re-resolve exactly this function's entries against its final subst.
+            *checker.type_at.borrow_mut() = Some(HashMap::new());
+            let mut scope: Scope = vec![HashMap::new()];
+            for p in &f.params {
+                scope[0].insert(p.name.clone(), p.ty.clone());
+            }
+            // Re-run inference; on the (already-verified) clean program this
+            // succeeds and unifies the body against the declared return type, so
+            // the return-type context pins any otherwise-free result var.
+            if let Ok(t) = checker.synth(&f.body, &mut scope) {
+                let _ = checker.unify(&t, &f.ret);
+            }
+            // Drain this function's recorded spans, re-resolving each through the
+            // now-complete substitution so generics are CONCRETE.
+            if let Some(table) = checker.type_at.borrow().as_ref() {
+                for (span, ty) in table {
+                    out.insert(*span, render_resolved(&checker.resolve(ty)));
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Render a (already-resolved) type for the typed-edge view. Any still-unresolved
+/// fresh unification variable (`?N`) — an ambiguous/never-pinned type, possibly
+/// nested (e.g. `Array[?5]`) — is rewritten to the placeholder `?` rather than
+/// leaking an internal variable id; a rigid generic parameter (`T`) keeps its
+/// source name. The rewritten type is then rendered with the shared [`show`]
+/// pretty-printer so it matches the signatures elsewhere in the call graph.
+fn render_resolved(t: &Ty) -> String {
+    fn scrub(t: &Ty) -> Ty {
+        match t {
+            Ty::Var(n) if is_fresh(n) => Ty::Var("?".to_string()),
+            Ty::Named(n, args) => Ty::Named(n.clone(), args.iter().map(scrub).collect()),
+            Ty::Fn(ps, r) => {
+                Ty::Fn(ps.iter().map(scrub).collect(), Box::new(scrub(r)))
+            }
+            other => other.clone(),
+        }
+    }
+    show(&scrub(t))
+}
+
 /// Structured type/shape/purity/exhaustiveness checking for `aria check --json`.
 ///
 /// Runs the SAME `check` pipeline that the human path uses (single source of
@@ -664,6 +804,7 @@ pub fn annotate_lambda_params(program: &mut Program) {
         counter: RefCell::new(0),
         lam_vars: RefCell::new(Vec::new()),
         err_span: RefCell::new(None),
+        type_at: RefCell::new(None),
     };
     // Resolve each lambda placeholder by re-checking each body (a fresh context
     // per function, exactly like `check`'s Pass 3).
@@ -1174,10 +1315,33 @@ impl Checker {
     /// nodes do not overwrite it.
     fn synth(&self, e: &Expr, scope: &mut Scope) -> Result<Ty, String> {
         let r = self.synth_inner(e, scope);
-        if r.is_err() {
-            self.note_err_span(e.span);
+        match &r {
+            Err(_) => self.note_err_span(e.span),
+            Ok(t) => self.record_type_at(e.span, t),
         }
         r
+    }
+
+    /// If the span->type side table is active (the `aria analyze` typed-edge
+    /// view), record this expression's span -> its inferred type, resolved
+    /// through the substitution *as known so far*. A later final pass
+    /// re-resolves every entry once unification is complete, so even an
+    /// argument whose generic parameter is pinned by a *sibling* argument or
+    /// the return context ends up CONCRETE. Synthesized nodes ([`Span::none`])
+    /// carry no location and are skipped. A no-op (and zero cost) when the table
+    /// is `None`, which is the case for `check`/`check_structured` — so this is
+    /// pure observation and changes nothing about what the checker accepts.
+    fn record_type_at(&self, span: Span, t: &Ty) {
+        if span.is_none() {
+            return;
+        }
+        let mut slot = self.type_at.borrow_mut();
+        if let Some(table) = slot.as_mut() {
+            // Resolve as far as the current substitution allows; the final pass
+            // resolves again, but recording the best-known type here means a
+            // value never pinned later still renders usefully.
+            table.insert(span, self.resolve(t));
+        }
     }
 
     /// Record `span` as the location of the current error, unless one is already
@@ -3262,5 +3426,73 @@ mod tests {
         "#;
         let errs = check_src(src).unwrap_err();
         assert!(!errs.is_empty(), "expected a type error");
+    }
+
+    // ---- per-call-site span -> inferred type table (`check_with_types`) ----
+
+    /// Build the span -> rendered-type table for a well-typed program, and a
+    /// helper to query the type recorded at a given `(line, col)` start position.
+    fn types_of(src: &str) -> HashMap<Span, String> {
+        let toks = lexer::lex(src).expect("lex");
+        let prog = parser::parse(toks).expect("parse");
+        check_with_types(&prog).expect("well-typed")
+    }
+
+    fn type_at(table: &HashMap<Span, String>, line: u32, col: u32) -> Option<String> {
+        table
+            .iter()
+            .find(|(s, _)| s.start_line == line && s.start_col == col)
+            .map(|(_, t)| t.clone())
+    }
+
+    #[test]
+    fn span_types_capture_literals_and_calls() {
+        // `add(2, 3)` on line 2: the literals and the call result are all `Int`.
+        let src = "fn add(a: Int, b: Int) -> Int = a + b\nfn main() -> Int = add(2, 3)";
+        let t = types_of(src);
+        // The whole `add(2, 3)` call expression starts at col 20.
+        assert_eq!(type_at(&t, 2, 20).as_deref(), Some("Int"));
+        // Its two integer-literal arguments.
+        assert_eq!(type_at(&t, 2, 24).as_deref(), Some("Int")); // `2`
+        assert_eq!(type_at(&t, 2, 27).as_deref(), Some("Int")); // `3`
+    }
+
+    #[test]
+    fn span_types_record_generic_instantiation_per_site() {
+        // The SAME generic `id` is instantiated at DIFFERENT concrete types at two
+        // different call sites — the per-site headline.
+        let src = "fn id[T](x: T) -> T = x\nfn main() -> Int = { let a = id(2); let b = id(\"hi\"); a }";
+        let t = types_of(src);
+        // `id(2)` -> Int; `id("hi")` -> String. Located by the literal arg columns.
+        let int_site = t.iter().any(|(s, ty)| s.start_line == 2 && ty == "Int");
+        let str_site = t.iter().any(|(s, ty)| s.start_line == 2 && ty == "String");
+        assert!(int_site, "an Int-typed span exists on line 2: {:?}", t);
+        assert!(str_site, "a String-typed span exists on line 2: {:?}", t);
+    }
+
+    #[test]
+    fn span_types_resolve_builtin_generics_concretely() {
+        // A builtin generic call resolves to a CONCRETE type at the site.
+        let src = "fn main() -> Int = { let v = [10, 20, 30]; array_len(v) }";
+        let t = types_of(src);
+        // Some span carries the concrete `Array[Int]` element/collection type and
+        // the `array_len` result is `Int`.
+        assert!(
+            t.values().any(|ty| ty == "Array[Int]"),
+            "expected a concrete Array[Int] span: {:?}",
+            t
+        );
+        assert!(t.values().any(|ty| ty == "Int"));
+    }
+
+    #[test]
+    fn check_with_types_errors_match_check() {
+        // A type-error program returns the SAME messages as `check`.
+        let src = "fn main() -> Int = true";
+        let toks = lexer::lex(src).expect("lex");
+        let prog = parser::parse(toks).expect("parse");
+        let via_types = check_with_types(&prog).unwrap_err();
+        let via_check = check(&prog).unwrap_err();
+        assert_eq!(via_types, via_check);
     }
 }

@@ -144,10 +144,53 @@ line:col, and the type signature of every function* — exactly what a tool need
 to reason about the code precisely (e.g. "this function takes an `Array[Int]`
 and returns an `Int`; it is called from `main` at line 9:5; it is recursive").
 
-Signatures are **declared types, not inferred**: the analyzer renders what the
-source wrote (it runs after type-checking, so the program is well-formed). Full
-per-call-site *argument* type inference is intentionally out of scope (a bigger
-job); the strong typed model is function signatures + the call structure.
+Function `signature`s are **declared types**: the analyzer renders what the
+source wrote (it runs after type-checking, so the program is well-formed). On top
+of that, each call EDGE now also carries **per-call-site INFERRED types** —
+`typed_call_sites` (see below) — so the model is not only *who calls whom* but
+**what types actually flow on each call**, with generics concretely instantiated
+*at the site*. That makes `aria analyze --json` a **typed-EDGE** program model:
+the precise dataflow-of-types across calls.
+
+### Typed edges: per-call-site argument & result types
+
+Where a function's `signature` is its *declared* shape, a call site's
+`typed_call_sites` entry is the **inferred, fully-resolved** type that flows on
+that specific call. This is produced by the type checker
+(`typeck::check_with_types`), which records each expression's span → its inferred
+type and re-resolves it through the final substitution, so every recorded type is
+**concrete** (no leftover unification variables; an ambiguous/never-pinned type
+renders as `"?"`, never a raw internal id).
+
+The headline is **generic instantiation per site**. The same generic `id` called
+twice records *different* concrete types at each call:
+
+```aria
+fn id[T](x: T) -> T = x
+fn main() -> Int = { let a = id(2); let s = id("hi"); a }
+```
+
+```json
+"typed_call_sites": [
+  {"callee": "id", "line": 2, "col": 30, "arg_types": ["Int"],    "result_type": "Int"},
+  {"callee": "id", "line": 2, "col": 45, "arg_types": ["String"], "result_type": "String"}
+]
+```
+
+`id(2)` is `Int -> Int` *at its site*; `id("hi")` is `String -> String` *at
+its*. Nested calls resolve correctly too (`add(id(2), 3)` records `add`'s
+arguments as `["Int","Int"]` and the inner `id(2)` as `["Int"]`), and builtin
+generics are concrete (`array_len([10,20,30])` → `arg_types ["Array[Int]"]`,
+`result_type "Int"`; `map_new()` → `result_type "Map[Int, Int]"`). Record and
+`Float` arguments render as their concrete types (`scale(Point {..}, 3.5)` →
+`["Point","Float"]`).
+
+The typed table is **metadata**: it never changes what typeck accepts/rejects,
+nor any backend codegen or program result. The structural fields
+(`callees`/`callers`/`cycles`/`unused`) are computed identically with or without
+it. A type unavailable for a span (a synthesized node, or a non-`Call` edge such
+as a function passed by name with no applied arguments) is emitted as JSON `null`,
+never a fabricated type.
 
 ### JSON schema
 
@@ -171,7 +214,11 @@ job); the strong typed model is function signatures + the call structure.
       "recursive":   false,
       "fan_in":      1,
       "fan_out":     1,
-      "call_sites":  {"c": [[2, 27]], "array_get": [[2, 35]]}
+      "call_sites":  {"c": [[2, 27]], "array_get": [[2, 35]]},
+      "typed_call_sites": [
+        {"callee": "c",         "line": 2, "col": 27, "arg_types": [],      "result_type": "Int"},
+        {"callee": "array_get", "line": 2, "col": 35, "arg_types": ["Array[Int]", "Int"], "result_type": "Int"}
+      ]
     }
   ],
   "unused":      ["dead"],
@@ -196,6 +243,7 @@ job); the strong typed model is function signatures + the call structure.
 | `functions[].fan_in` | `callers.len()` — how many functions depend on this one. |
 | `functions[].fan_out` | `callees.len()` — how many user functions this one depends on. |
 | `functions[].call_sites` | **Precise call-site locations** of every edge out of this function: an object keyed by callee NAME (user, library, or builtin), each value the sorted, de-duplicated list of `[line, col]` positions where that callee is called in this function's body. A source-located call graph — jump to the exact `callee(..)`, not just the fact that the edge exists. Bare local-variable references are NOT calls and never appear here. Synthesized calls (no source span) contribute no site; a function with no located calls reports `{}`. |
+| `functions[].typed_call_sites` | **Typed call EDGES**: the per-call-site INFERRED types, as an array (one object per located call, sorted by `(line, col)` then callee). Each object is `{"callee", "line", "col", "arg_types", "result_type"}`: `callee` is the same name space as `call_sites`; `line`/`col` is the call expression's position; `arg_types` is the inferred CONCRETE type of each argument expression, in source order (a generic call shows its concrete instantiation *at this site*); `result_type` is the call's inferred result type. A type unavailable for a span is `null`. A function passed by NAME as a value (no applied args) records a zero-`arg_types` site whose `result_type` is its (instantiated) function type. Empty `[]` when the function makes no located calls. This is the precise "what types flow on this call" view, with generics instantiated per site. |
 | `unused` | User functions with **no callers** and not `main` — dead code. |
 | `unreachable` | User functions **not statically reachable** from `main` (transitive closure over user-to-user edges). Empty if there is no `main`. A function can be unreachable without being directly `unused` (e.g. only called by an unused function). |
 | `cycles` | Recursive groups: strongly-connected components of size > 1 (mutual recursion), plus self-recursive singletons. Each inner array is one cycle (sorted); the outer list is sorted for stable, diffable output. Computed with Tarjan's SCC algorithm (iterative, no external deps). |
@@ -206,6 +254,14 @@ job); the strong typed model is function signatures + the call structure.
   operates over (params, return, generics + bounds) without re-running the
   checker: it can verify an edge is type-compatible, suggest a call, or report a
   signature mismatch precisely.
+- **Dataflow-of-types across calls** — `typed_call_sites` gives the *inferred*
+  type that flows on each individual call: the model sees that `id` is used at
+  `Int` here and `String` there (the concrete generic instantiation per site),
+  that a nested `add(id(2), 3)` carries `Int` arguments, and that a builtin call
+  resolves to `Array[Int]` / `Map[Int, Int]`. It can trace a value's type from
+  caller to callee without re-running inference, spot a site where a generic is
+  instantiated unexpectedly, or confirm an argument's concrete type before
+  suggesting a refactor.
 - **Impact analysis** — *"what breaks if I change `f`?"* -> `callers` / `fan_in`,
   and the transitive closure of callers.
 - **Dependency understanding** — *"what does `f` rely on?"* -> `callees` +
@@ -223,17 +279,20 @@ job); the strong typed model is function signatures + the call structure.
 Without `--json`, `aria analyze` prints a readable summary: the entry point and
 function count, then per function its **rendered signature** (e.g.
 `fn fib(n: Int) -> Int` or `fn id[T](x: T) -> T`) with its definition line,
-followed by `fan_in`/`fan_out`, `recursive`, and the `calls` / `uses(lib)` /
-`called by` lists (library functions tagged `[library]`), then the `unused`,
-`unreachable`, and `recursive cycles` sections (cycles rendered as
-`a <-> b (mutual)` or `f (self-recursive)`). For example:
+followed by `fan_in`/`fan_out`, `recursive`, the `calls` / `uses(lib)` /
+`called by` lists (library functions tagged `[library]`), and up to a couple of
+**typed call lines** (`call: callee(ArgT, ..) -> RetT @ L:C`) showing the
+inferred per-site types (extra sites summarized as `(+N more …)` to keep it
+readable), then the `unused`, `unreachable`, and `recursive cycles` sections
+(cycles rendered as `a <-> b (mutual)` or `f (self-recursive)`). For example:
 
 ```text
-fn fib(n: Int) -> Int  (line 1)
-  fan_in=2 fan_out=1 recursive
-  calls:     fib
-  called by: fib, main
-fn id[T](x: T) -> T  (line 3)
+fn main() -> Int  (line 3)
+  fan_in=0 fan_out=2
+  calls:     add, id
+  call:      add(Int, Int) -> Int  @ 3:20
+  call:      id(Int) -> Int  @ 3:24
+fn id[T](x: T) -> T  (line 2)
   fan_in=1 fan_out=0
   called by: main
 ```
@@ -249,3 +308,9 @@ fn id[T](x: T) -> T  (line 3)
   the call graph.
 - A call to a builtin or prelude function appears under `lib_callees`, never as a
   user edge, and those functions are never reported as "unused user code".
+- `typed_call_sites` types are the checker's INFERRED, fully-resolved types at the
+  site. A type the checker could not pin to a concrete type (rare on a well-typed
+  program — e.g. a result fed nowhere) renders as `"?"` in the type string, and a
+  span with no recorded type at all is `null`; neither fabricates a type. The
+  types are observation only and never alter what typeck accepts or any backend's
+  output.
