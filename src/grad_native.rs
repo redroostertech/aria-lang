@@ -25,17 +25,29 @@
 //!     and the scalar-producing vec builtins `vec_get`, `vec_dot`, `vec_norm`;
 //!   * vectors: the input vector, vec-typed locals, `vec_add`, `vec_sub`,
 //!     `vec_scale`, `vec_from_array([..])`, `vec_push`;
-//!   * `let` bindings (in a `Block`) of either kind.
-//! GATED (clean error): `if`/`match`, calls to user functions or any other
-//! builtin, records/tuples, closures, and any op on a non-{Float,Vector} value.
-//! `f` itself may be a lambda literal `\v -> ..` OR a named top-level function
-//! `grad(loss, x)` (its body is inlined) — as long as that body is straight-line
-//! over the supported subset.
+//!   * `let` bindings (in a `Block`) of either kind;
+//!   * CONTROL FLOW: `if`/`else` and `match` (on a concrete Int/Bool/Float
+//!     scrutinee, with Int/Bool/wildcard/var arms), differentiated through the
+//!     TAKEN branch exactly as the interpreter does. The condition/scrutinee must
+//!     reduce to a CONCRETE (non-differentiated) value — `vec_len`, captured
+//!     scalars, literals, and `+ - * / %`, comparisons, `&& || !` over them — so
+//!     the branch decision never observes a value being differentiated (a
+//!     differentiated-value condition is a clean error in BOTH backends);
+//!   * INTER-PROCEDURAL CALLS: a call to another (non-recursive) top-level
+//!     function inside `f` is inlined — its parameters bound to the traced
+//!     argument values and its body traced — so its ops record tape nodes,
+//!     mirroring the interpreter stepping into the callee at runtime.
+//! GATED (clean error): a condition/scrutinee that depends on a differentiated
+//! value; `match` on constructors/records; (mutually) recursive calls inside `f`;
+//! records/tuples, closures, other builtins, and any op on a non-{Float,Vector}
+//! value. `f` itself may be a lambda literal `\v -> ..` OR a named top-level
+//! function `grad(loss, x)` (its body is inlined) — as long as it stays within
+//! this subset.
 
 use std::collections::HashMap;
 use std::fmt::Write;
 
-use crate::ast::{BinOp, Expr, ExprKind, FnDecl, Item, Program, Stmt, UnOp};
+use crate::ast::{Arm, BinOp, Expr, ExprKind, FnDecl, Item, Pattern, Program, Stmt, UnOp};
 
 /// The C value produced by a traced expression: a scalar tape node-id, or a
 /// traced vector (an `AriaTVec` of node-ids). Both are held in fresh C locals
@@ -46,6 +58,32 @@ enum TVal {
     Scalar(String),
     /// A traced vector: `AriaTVec <name>` of node-ids.
     Vec(String),
+    /// A concrete (non-differentiated) Int forward value: an `int64_t` C local.
+    /// Only `let`-bound concrete Ints (loop counters / structural sizes) and
+    /// captured Ints land here; they may feed `if`/`match` conditions and
+    /// constant `vec_get` indices but never the tape. Mirrors the interpreter,
+    /// where such values stay plain `Value::Int` (never `Tracing`).
+    Int(String),
+    /// A concrete Bool forward value: an `int` C local holding 0/1.
+    Bool(String),
+}
+
+/// A concrete (NON-differentiated) forward value, used only for `if`/`match`
+/// conditions and scrutinees (and constant indices). It is a C expression of a
+/// concrete primitive type. Producing one of these NEVER records a tape node:
+/// it mirrors the interpreter, where a control-flow condition is evaluated to a
+/// plain `Value::Int`/`Value::Bool`/`Value::Float` (a comparison on a *traced*
+/// scalar is a clean error in BOTH backends). The carried `String` is a C rvalue.
+#[derive(Clone)]
+enum FVal {
+    /// A concrete `int64_t` C expression.
+    Int(String),
+    /// A concrete `int` (0/1) C expression.
+    Bool(String),
+    /// A concrete `double` C expression — only ever derived from other concrete
+    /// forward values (literals, captured Floats), NEVER from a traced node, so
+    /// it can be compared without observing a differentiated value.
+    Float(String),
 }
 
 /// One discovered `grad` call site, rewritten to a `vec_grad$N(x, <captures..>)`
@@ -87,7 +125,23 @@ struct Tracer<'a> {
     tmp: usize,
     /// The emitted C statements for the helper body.
     body: String,
+    /// A PROLOGUE emitted once, before the traced body, for statements that must
+    /// dominate every later reference regardless of which `if`/`match` branch
+    /// they appear in — currently the captured-Vector lifts (an `AriaTVec` local
+    /// reused across branches). Emitting these into a branch-local buffer would
+    /// leave them out of scope in sibling branches; the prologue hoists them.
+    prologue: String,
+    /// Inlining call stack: names of user functions currently being inlined
+    /// inside `f`. Guards against (mutual) recursion — a function that calls
+    /// itself, directly or indirectly, cannot be inlined into a finite trace, so
+    /// we gate it cleanly (the interpreter `aria run` handles it).
+    inlining: Vec<String>,
 }
+
+/// Maximum inter-procedural inlining depth inside `f`. A straight-line call
+/// graph is typically shallow; this bounds pathological (but non-recursive)
+/// nesting so a single `grad` trace cannot explode. Beyond it we gate cleanly.
+const MAX_INLINE_DEPTH: usize = 64;
 
 /// Rewrite every `grad(f, x)` in `program` to a `vec_grad$N(x)` call and return
 /// the generated helper C definitions. On any unsupported `f`, return a clean
@@ -258,6 +312,8 @@ fn compile_helper(
         cap_vecs: HashMap::new(),
         tmp: 0,
         body: String::new(),
+        prologue: String::new(),
+        inlining: Vec::new(),
     };
     // The input vector parameter is the traced leaf vector.
     tr.scope.insert(param.to_string(), TVal::Vec("$leaves".to_string()));
@@ -266,6 +322,13 @@ fn compile_helper(
         TVal::Scalar(s) => s,
         TVal::Vec(_) => {
             return Err("grad: `f` must return a Float (scalar), but it returns a Vector".into())
+        }
+        TVal::Int(_) | TVal::Bool(_) => {
+            return Err(
+                "grad: `f` must return a Float (differentiated scalar), but it returns a \
+                 concrete Int/Bool"
+                    .into(),
+            )
         }
     };
     // The captured parameters, in discovery order.
@@ -296,7 +359,9 @@ fn compile_helper(
     // One leaf per input coordinate.
     out.push_str("    AriaTVec $leaves = aria_tvec_alloc($xv->len);\n");
     out.push_str("    for (int64_t $i = 0; $i < $xv->len; $i++) $leaves.ids[$i] = aria_tape_leaf(&$tp, $xv->elems[$i]);\n");
-    // The traced body (declares its own temporaries, including capture lifts).
+    // Capture-Vector lifts, hoisted so they dominate every branch.
+    out.push_str(&tr.prologue);
+    // The traced body (declares its own temporaries).
     out.push_str(&tr.body);
     // Seed + sweep + extract gradient, then free everything traced.
     let _ = writeln!(out, "    aria_tape_backward(&$tp, {});", out_id);
@@ -384,11 +449,8 @@ impl Tracer<'_> {
             ExprKind::Unary(UnOp::Not, _) => Err(
                 "grad: boolean `!` is not differentiable in `f` on the native backend".into(),
             ),
-            ExprKind::If(_, _, _) | ExprKind::Match(_, _) => Err(
-                "grad: control flow (`if`/`match`) inside `f` is not supported on the native \
-                 backend; use a straight-line body, or the interpreter `aria run`"
-                    .into(),
-            ),
+            ExprKind::If(cond, then, els) => self.trace_if(cond, then, els),
+            ExprKind::Match(scrut, arms) => self.trace_match(scrut, arms),
             _ => Err(format!(
                 "grad: unsupported expression in `f` on the native backend: {}",
                 describe(e)
@@ -434,10 +496,12 @@ impl Tracer<'_> {
                     CapKind::Vector => {
                         // Lift the captured AriaVector to a traced constant vector
                         // of leaves (its partials are discarded -- not an input),
-                        // ONCE; reuse the AriaTVec for any later reference.
+                        // ONCE, into the PROLOGUE so the lifted `AriaTVec` local
+                        // dominates every later reference (including ones in other
+                        // `if`/`match` branches); reuse it for any later reference.
                         let t = self.fresh();
                         let _ = writeln!(
-                            self.body,
+                            self.prologue,
                             "    AriaTVec {t} = aria_tvec_from_vec(&$tp, {cparam});"
                         );
                         self.cap_vecs.insert(name.clone(), t.clone());
@@ -458,13 +522,18 @@ impl Tracer<'_> {
         if let Some(r) = self.try_capture(e, CapKind::Scalar) {
             return r.map(|tv| match tv {
                 TVal::Scalar(s) => s,
-                TVal::Vec(_) => unreachable!(),
+                _ => unreachable!("scalar capture yields a Scalar TVal"),
             });
         }
         match self.trace(e)? {
             TVal::Scalar(s) => Ok(s),
             TVal::Vec(_) => Err(
                 "grad: expected a Float (scalar) but got a Vector in `f` on the native backend"
+                    .into(),
+            ),
+            TVal::Int(_) | TVal::Bool(_) => Err(
+                "grad: a concrete Int/Bool (e.g. from `vec_len`) cannot be used as a \
+                 differentiated Float in `f` on the native backend"
                     .into(),
             ),
         }
@@ -475,13 +544,17 @@ impl Tracer<'_> {
         if let Some(r) = self.try_capture(e, CapKind::Vector) {
             return r.map(|tv| match tv {
                 TVal::Vec(v) => v,
-                TVal::Scalar(_) => unreachable!(),
+                _ => unreachable!("vector capture yields a Vec TVal"),
             });
         }
         match self.trace(e)? {
             TVal::Vec(v) => Ok(v),
             TVal::Scalar(_) => Err(
                 "grad: expected a Vector but got a Float (scalar) in `f` on the native backend"
+                    .into(),
+            ),
+            TVal::Int(_) | TVal::Bool(_) => Err(
+                "grad: expected a Vector but got a concrete Int/Bool in `f` on the native backend"
                     .into(),
             ),
         }
@@ -675,21 +748,26 @@ impl Tracer<'_> {
                 let _ = writeln!(self.body, "    {t}.ids[{v}.len] = {x};");
                 Ok(TVal::Vec(t))
             }
-            "vec_len" => Err(
-                "grad: `vec_len` inside `f` is not supported on the native backend (its result \
-                 is a non-differentiable Int used only for control flow)"
-                    .into(),
-            ),
+            "vec_len" => {
+                // `vec_len` yields a CONCRETE Int (the interpreter returns a plain
+                // `Value::Int` for `vec_len` of a TracingVec — line 1429 of
+                // interp.rs). It is non-differentiable; it may feed `if`/`match`
+                // conditions, a constant-foldable index, or a `let` binding. We
+                // realize it into an `int64_t` C local.
+                if args.len() != 1 {
+                    return Err("grad: vec_len expects (Vector)".into());
+                }
+                let v = self.trace_vec(&args[0])?;
+                let t = self.fresh();
+                let _ = writeln!(self.body, "    int64_t {t} = {v}.len;");
+                Ok(TVal::Int(t))
+            }
             other => {
-                // A call to a user function (not yet inlined) or an unsupported
-                // builtin: gate cleanly.
+                // A call to a user function: INLINE it (trace through its body so
+                // its ops record tape nodes), exactly reproducing the interpreter,
+                // which steps into the callee with the same argument values.
                 if self.fns.contains_key(other) {
-                    Err(format!(
-                        "grad: `f` calls the function `{}` — calls to other functions inside `f` \
-                         are not supported on the native backend; inline it, or use the \
-                         interpreter `aria run`",
-                        other
-                    ))
+                    self.trace_inline_call(other, args)
                 } else {
                     Err(format!(
                         "grad: unsupported operation `{}` inside `f` on the native backend",
@@ -698,6 +776,552 @@ impl Tracer<'_> {
                 }
             }
         }
+    }
+
+    /// Inline a call `g(args..)` to a user function: bind each parameter to the
+    /// traced value of the corresponding argument, then trace `g`'s body in that
+    /// scope. This reproduces the interpreter EXACTLY (it evaluates the callee
+    /// with the same argument values, recording the same tape nodes in the same
+    /// order). Recursion is gated cleanly (it cannot be inlined into a finite,
+    /// straight-line trace). Captures are resolved in the CALLER's scope before
+    /// entering the callee, so the callee sees them as ordinary bound locals.
+    fn trace_inline_call(&mut self, name: &str, args: &[Expr]) -> Result<TVal, String> {
+        let fd = *self
+            .fns
+            .get(name)
+            .ok_or_else(|| format!("grad: internal: unknown function `{}`", name))?;
+        if self.inlining.iter().any(|n| n == name) {
+            return Err(format!(
+                "grad: `f` (transitively) calls the recursive function `{}` — recursion inside \
+                 `f` cannot be inlined on the native backend; use the interpreter `aria run`",
+                name
+            ));
+        }
+        if self.inlining.len() >= MAX_INLINE_DEPTH {
+            return Err(format!(
+                "grad: inlining inside `f` exceeded depth {} at `{}` on the native backend; use \
+                 the interpreter `aria run`",
+                MAX_INLINE_DEPTH, name
+            ));
+        }
+        if fd.params.len() != args.len() {
+            return Err(format!(
+                "grad: call to `{}` inside `f` has {} argument(s) but `{}` takes {}",
+                name,
+                args.len(),
+                name,
+                fd.params.len()
+            ));
+        }
+        // Trace each argument FIRST, in the caller's scope (left-to-right, as the
+        // interpreter evaluates arguments). A captured free var used only as an
+        // argument is resolved here via try_capture so the kind is demanded by
+        // the callee's parameter type would be unknown — instead we trace the arg
+        // generically and bind whatever value (Scalar/Vec/Int/Bool) results.
+        let mut bound: Vec<(String, TVal)> = Vec::with_capacity(args.len());
+        for (p, a) in fd.params.iter().zip(args) {
+            let tv = self.trace_arg(a)?;
+            bound.push((p.name.clone(), tv));
+        }
+        // Enter the callee: a fresh scope holding ONLY the bound parameters (a
+        // top-level function closes over nothing but globals, which are resolved
+        // as captures/functions, not locals). Restore the caller scope after.
+        let saved = std::mem::take(&mut self.scope);
+        for (n, tv) in bound {
+            self.scope.insert(n, tv);
+        }
+        self.inlining.push(name.to_string());
+        let r = self.trace(&fd.body);
+        self.inlining.pop();
+        self.scope = saved;
+        r
+    }
+
+    /// Trace a call argument whose demanded kind is not known up front (it is the
+    /// callee parameter's type). Resolve a bare captured free var by peeking: a
+    /// capture used as a function argument must already have a known kind, OR be
+    /// disambiguated inside the callee. Since we cannot know here, we trace it as
+    /// an ordinary expression; a bare unknown `Var` falls through to the capture
+    /// machinery via the demanding op inside the callee. To keep that working, a
+    /// bare captured Var passed straight through is deferred: we look it up as a
+    /// Vector capture by default only if it is ALREADY known; otherwise we error
+    /// with the standard "use it directly" message (same as `trace`).
+    fn trace_arg(&mut self, e: &Expr) -> Result<TVal, String> {
+        // A bare captured Vector/Float var as an argument: if its kind is already
+        // discovered, bind that; if not, we cannot infer it from the call site,
+        // so we require it to be used in a typed position (the same constraint as
+        // a top-level bare capture). Most code passes `vec_*`/arithmetic exprs.
+        if let ExprKind::Var(n) = &e.kind {
+            if !self.scope.contains_key(n) && !self.fns.contains_key(n) {
+                if let Some(kind) = self.captures.get(n).copied() {
+                    return match kind {
+                        CapKind::Vector => self.try_capture(e, CapKind::Vector).unwrap(),
+                        CapKind::Scalar => self.try_capture(e, CapKind::Scalar).unwrap(),
+                    };
+                }
+            }
+        }
+        self.trace(e)
+    }
+
+    /// Trace an `if`: evaluate the condition to a CONCRETE Bool from the forward
+    /// computation (never a traced node — the interpreter likewise computes the
+    /// condition concretely and a comparison on a differentiated value is an
+    /// error in both backends), emit a real C `if`/`else`, and trace BOTH arms,
+    /// each into its own buffer, assigning the chosen arm's traced value to a
+    /// shared result local. Only the taken arm's tape nodes are recorded at
+    /// runtime — exactly the interpreter's behaviour (it traces only the taken
+    /// branch). Both arms must yield the SAME kind (Float or Vector).
+    fn trace_if(&mut self, cond: &Expr, then: &Expr, els: &Expr) -> Result<TVal, String> {
+        let c = self.forward_bool(cond)?;
+        let (then_buf, then_val) = self.sub_trace(then)?;
+        let (else_buf, else_val) = self.sub_trace(els)?;
+        let result = self.join_branches(
+            &[(format!("if ({c})"), then_buf, then_val), ("else".to_string(), else_buf, else_val)],
+        )?;
+        Ok(result)
+    }
+
+    /// Trace a `match` on a CONCRETE scalar scrutinee (Int/Bool/Float) using
+    /// literal / wildcard / var patterns, lowered to a C if-else-if chain on the
+    /// forward scrutinee value. ADT/record scrutinees (which would require
+    /// tracing a traced ADT — outside the differentiable subset) stay gated.
+    fn trace_match(&mut self, scrut: &Expr, arms: &[Arm]) -> Result<TVal, String> {
+        if arms.is_empty() {
+            return Err("grad: empty `match` inside `f`".into());
+        }
+        let sv = self.forward_eval(scrut)?;
+        // Build (guard, body-buffer, body-value) per arm. A wildcard / var pattern
+        // is the catch-all `else`. Each var pattern binds the concrete scrutinee.
+        let mut branches: Vec<(String, String, TVal)> = Vec::with_capacity(arms.len());
+        let mut saw_default = false;
+        for arm in arms {
+            if saw_default {
+                // Arms after an irrefutable one are dead (the interpreter takes
+                // the first match); reject so we never silently drop a branch.
+                return Err(
+                    "grad: `match` inside `f` has arm(s) after an irrefutable pattern on the \
+                     native backend"
+                        .into(),
+                );
+            }
+            let guard = match &arm.pat {
+                Pattern::Wild => {
+                    saw_default = true;
+                    "else".to_string()
+                }
+                Pattern::Var(name) => {
+                    // Bind the concrete scrutinee to `name` for this arm's body.
+                    saw_default = true;
+                    let (buf, val) = self.sub_trace_bound(&arm.body, name, &sv)?;
+                    branches.push(("else".to_string(), buf, val));
+                    continue;
+                }
+                Pattern::Int(n) => match &sv {
+                    FVal::Int(s) => format!("if ({s} == {n})"),
+                    FVal::Bool(s) => format!("if ({s} == {n})"),
+                    FVal::Float(_) => {
+                        return Err(
+                            "grad: `match` integer pattern against a Float scrutinee inside `f`"
+                                .into(),
+                        )
+                    }
+                },
+                Pattern::Bool(b) => match &sv {
+                    FVal::Bool(s) => format!("if ({s} == {})", if *b { 1 } else { 0 }),
+                    _ => {
+                        return Err(
+                            "grad: `match` boolean pattern against a non-Bool scrutinee inside `f`"
+                                .into(),
+                        )
+                    }
+                },
+                Pattern::Ctor(_, _) | Pattern::Record(_, _) => {
+                    return Err(
+                        "grad: `match` on constructors/records inside `f` is not supported on the \
+                         native backend (only Int/Bool/wildcard/var patterns on a concrete \
+                         scalar scrutinee); use the interpreter `aria run`"
+                            .into(),
+                    )
+                }
+            };
+            let (buf, val) = self.sub_trace(&arm.body)?;
+            branches.push((guard, buf, val));
+        }
+        if !saw_default {
+            // No irrefutable arm: a non-matching scrutinee would have no value.
+            // The interpreter raises a runtime "no match arm" error; mirror it
+            // with a runtime trap in a final `else`, after the typed arms.
+            return self.join_branches_with_trap(&branches);
+        }
+        self.join_branches(&branches)
+    }
+
+    /// Trace `e` into a FRESH buffer (not appended to `self.body`), returning the
+    /// buffer and the resulting value. Temporaries still draw from the shared
+    /// counter so names stay globally unique across branches. The scope is saved
+    /// and restored so branch-local `let`s do not leak.
+    fn sub_trace(&mut self, e: &Expr) -> Result<(String, TVal), String> {
+        let saved_body = std::mem::take(&mut self.body);
+        let saved_scope = self.scope.clone();
+        let r = self.trace(e);
+        self.scope = saved_scope;
+        let branch_body = std::mem::replace(&mut self.body, saved_body);
+        Ok((branch_body, r?))
+    }
+
+    /// Like `sub_trace`, but first binds `name` to a copy of the concrete forward
+    /// scrutinee `sv` (for a `match` var pattern) inside the branch buffer.
+    fn sub_trace_bound(
+        &mut self,
+        e: &Expr,
+        name: &str,
+        sv: &FVal,
+    ) -> Result<(String, TVal), String> {
+        let saved_body = std::mem::take(&mut self.body);
+        let saved_scope = self.scope.clone();
+        // Materialize the scrutinee into a fresh local and bind `name` to it.
+        let tv = match sv {
+            FVal::Int(s) => {
+                let t = self.fresh();
+                let _ = writeln!(self.body, "    int64_t {t} = {s};");
+                TVal::Int(t)
+            }
+            FVal::Bool(s) => {
+                let t = self.fresh();
+                let _ = writeln!(self.body, "    int {t} = {s};");
+                TVal::Bool(t)
+            }
+            FVal::Float(s) => {
+                // A Float scrutinee bound by a var pattern is concrete (forward),
+                // not differentiated; it cannot feed the tape. Reject if used as a
+                // differentiated Float — but binding it as a concrete value is fine
+                // only for conditions. Lift to a constant leaf so simple identity
+                // uses still differentiate to zero contribution (it is not an
+                // input). We bind it as a Scalar leaf to keep arithmetic valid.
+                let t = self.fresh();
+                let _ = writeln!(self.body, "    int64_t {t} = aria_tape_leaf(&$tp, {s});");
+                TVal::Scalar(t)
+            }
+        };
+        self.scope.insert(name.to_string(), tv);
+        let r = self.trace(e);
+        self.scope = saved_scope;
+        let branch_body = std::mem::replace(&mut self.body, saved_body);
+        Ok((branch_body, r?))
+    }
+
+    /// Emit a C if/else chain over pre-traced branch buffers, each assigning its
+    /// traced value to ONE shared result local, and return that local as a TVal.
+    /// All branches must produce the same kind. The first element's guard is the
+    /// leading `if (..)`; subsequent guards are `else if (..)` or `else`.
+    fn join_branches(&mut self, branches: &[(String, String, TVal)]) -> Result<TVal, String> {
+        self.emit_join(branches, false)
+    }
+
+    /// Like `join_branches`, but appends a final `else` that traps at runtime
+    /// (for a non-exhaustive `match` with no irrefutable arm — mirrors the
+    /// interpreter's "no match arm" runtime error).
+    fn join_branches_with_trap(&mut self, branches: &[(String, String, TVal)]) -> Result<TVal, String> {
+        self.emit_join(branches, true)
+    }
+
+    fn emit_join(
+        &mut self,
+        branches: &[(String, String, TVal)],
+        trap_default: bool,
+    ) -> Result<TVal, String> {
+        // Determine the shared result kind (Scalar or Vec) — all arms must agree.
+        let kind_is_vec = match &branches[0].2 {
+            TVal::Vec(_) => true,
+            TVal::Scalar(_) => false,
+            TVal::Int(_) | TVal::Bool(_) => {
+                return Err(
+                    "grad: an `if`/`match` arm inside `f` produces a concrete Int/Bool, not a \
+                     differentiated Float/Vector, on the native backend"
+                        .into(),
+                )
+            }
+        };
+        for (_, _, v) in branches {
+            let v_is_vec = match v {
+                TVal::Vec(_) => true,
+                TVal::Scalar(_) => false,
+                TVal::Int(_) | TVal::Bool(_) => {
+                    return Err(
+                        "grad: an `if`/`match` arm inside `f` produces a concrete Int/Bool, not a \
+                         differentiated Float/Vector, on the native backend"
+                            .into(),
+                    )
+                }
+            };
+            if v_is_vec != kind_is_vec {
+                return Err(
+                    "grad: the arms of an `if`/`match` inside `f` must all produce the SAME kind \
+                     (all Float, or all Vector) on the native backend"
+                        .into(),
+                );
+            }
+        }
+        // The shared result local. A Vector result needs its length known to be
+        // consistent; we store the AriaTVec produced by the taken arm directly.
+        let res = self.fresh();
+        if kind_is_vec {
+            let _ = writeln!(self.body, "    AriaTVec {res};");
+        } else {
+            let _ = writeln!(self.body, "    int64_t {res};");
+        }
+        for (i, (guard, buf, val)) in branches.iter().enumerate() {
+            let head = if i == 0 {
+                format!("    {} {{", guard)
+            } else if guard == "else" {
+                "    else {".to_string()
+            } else {
+                // `else if (..)`
+                format!("    else {} {{", guard)
+            };
+            let _ = writeln!(self.body, "{}", head);
+            self.body.push_str(buf);
+            let assign = match val {
+                TVal::Vec(v) => format!("        {res} = {v};"),
+                TVal::Scalar(s) => format!("        {res} = {s};"),
+                _ => unreachable!("kind checked above"),
+            };
+            let _ = writeln!(self.body, "{}", assign);
+            self.body.push_str("    }\n");
+        }
+        if trap_default {
+            self.body.push_str(
+                "    else { aria_trap_msg(\"grad: no matching `match` arm (non-exhaustive)\"); }\n",
+            );
+        }
+        if kind_is_vec {
+            Ok(TVal::Vec(res))
+        } else {
+            Ok(TVal::Scalar(res))
+        }
+    }
+
+    /// Forward-evaluate `e` to a CONCRETE Bool C expression (for an `if`
+    /// condition). Mirrors the interpreter: the condition must reduce to a plain
+    /// Bool from the forward computation; a comparison on a differentiated
+    /// (traced) value is a clean error in both backends.
+    fn forward_bool(&mut self, e: &Expr) -> Result<String, String> {
+        match self.forward_eval(e)? {
+            FVal::Bool(s) => Ok(s),
+            FVal::Int(_) | FVal::Float(_) => Err(
+                "grad: an `if` condition inside `f` must be a Bool on the native backend".into(),
+            ),
+        }
+    }
+
+    /// Forward-evaluate a NON-differentiated expression to a concrete C value
+    /// (Int/Bool/Float). This is the strict analogue of the interpreter
+    /// evaluating a condition/scrutinee to a plain `Value`. It NEVER reads a
+    /// traced node's adjoint and NEVER records on the tape; any subexpression
+    /// that is a traced (differentiated) scalar/vector is rejected, exactly as
+    /// the interpreter rejects a comparison/arithmetic that mixes a `Tracing`
+    /// value into a control-flow decision.
+    fn forward_eval(&mut self, e: &Expr) -> Result<FVal, String> {
+        match &e.kind {
+            ExprKind::Int(n) => Ok(FVal::Int(format!("(int64_t){}", n))),
+            ExprKind::Bool(b) => Ok(FVal::Bool(if *b { "1".into() } else { "0".into() })),
+            ExprKind::Float(f) => Ok(FVal::Float(fmt_f64(*f))),
+            ExprKind::Var(name) => {
+                // A local concrete Int/Bool binding (e.g. a `let n = vec_len(x)`).
+                if let Some(tv) = self.scope.get(name) {
+                    return match tv {
+                        TVal::Int(s) => Ok(FVal::Int(s.clone())),
+                        TVal::Bool(s) => Ok(FVal::Bool(s.clone())),
+                        TVal::Scalar(_) | TVal::Vec(_) => Err(format!(
+                            "grad: the differentiated value `{}` cannot be used in an `if`/`match` \
+                             condition inside `f` (the branch must not depend on a value being \
+                             differentiated) on the native backend",
+                            name
+                        )),
+                    };
+                }
+                // A captured concrete free variable. Its kind is whatever the
+                // enclosing scope holds; for conditions we accept a captured Int,
+                // Bool, or Float (a captured *Vector* is not a scalar condition).
+                if self.fns.contains_key(name) {
+                    return Err(format!(
+                        "grad: `f` references the function `{}` in a condition — not supported \
+                         on the native backend",
+                        name
+                    ));
+                }
+                // Register/lookup as a SCALAR capture and read its concrete C
+                // parameter. We do not know Int vs Float a priori; captured
+                // condition variables are passed as `double $cap_<name>` (the
+                // Scalar capture ABI), so compare as a double. An Int capture is
+                // exact as a double for the magnitudes used in control flow.
+                let cparam = format!("$cap_{}", name);
+                match self.captures.get(name).copied() {
+                    Some(CapKind::Scalar) => Ok(FVal::Float(cparam)),
+                    Some(CapKind::Vector) => Err(format!(
+                        "grad: captured Vector `{}` cannot be used directly in an `if`/`match` \
+                         condition inside `f` on the native backend (use `vec_len({})`)",
+                        name, name
+                    )),
+                    None => {
+                        self.captures.insert(name.clone(), CapKind::Scalar);
+                        self.capture_order.push(name.clone());
+                        Ok(FVal::Float(cparam))
+                    }
+                }
+            }
+            ExprKind::Unary(UnOp::Neg, inner) => match self.forward_eval(inner)? {
+                FVal::Int(s) => Ok(FVal::Int(format!("(-({}))", s))),
+                FVal::Float(s) => Ok(FVal::Float(format!("(-({}))", s))),
+                FVal::Bool(_) => Err("grad: cannot negate a Bool in a condition inside `f`".into()),
+            },
+            ExprKind::Unary(UnOp::Not, inner) => match self.forward_eval(inner)? {
+                FVal::Bool(s) => Ok(FVal::Bool(format!("(!({}))", s))),
+                _ => Err("grad: `!` expects a Bool in a condition inside `f`".into()),
+            },
+            ExprKind::Binary(op, l, r) => self.forward_binary(*op, l, r),
+            ExprKind::Call(name, args) if name == "vec_len" => {
+                if args.len() != 1 {
+                    return Err("grad: vec_len expects (Vector)".into());
+                }
+                // `vec_len` reads the length of a TRACED or captured vector — a
+                // concrete Int, with no dependence on the differentiated values.
+                let v = self.trace_vec(&args[0])?;
+                Ok(FVal::Int(format!("{}.len", v)))
+            }
+            ExprKind::Block(stmts, last) => {
+                // A condition may be a small block of concrete `let`s. Bind each
+                // (concrete) value and forward-eval the result.
+                let saved = self.scope.clone();
+                for s in stmts {
+                    match s {
+                        Stmt::Let(n, _, v) => {
+                            let fv = self.forward_eval(v)?;
+                            let t = self.fresh();
+                            let tv = match fv {
+                                FVal::Int(e) => {
+                                    let _ = writeln!(self.body, "    int64_t {t} = {e};");
+                                    TVal::Int(t)
+                                }
+                                FVal::Bool(e) => {
+                                    let _ = writeln!(self.body, "    int {t} = {e};");
+                                    TVal::Bool(t)
+                                }
+                                FVal::Float(_) => {
+                                    // A concrete-Float `let` inside a condition is
+                                    // rare and not tracked in `scope` (which only
+                                    // holds Int/Bool/traced kinds); gate cleanly.
+                                    self.scope = saved;
+                                    return Err(
+                                        "grad: a `let`-bound Float inside an `if`/`match` \
+                                         condition is not supported on the native backend"
+                                            .into(),
+                                    );
+                                }
+                            };
+                            self.scope.insert(n.clone(), tv);
+                        }
+                        Stmt::Expr(_) => {
+                            self.scope = saved;
+                            return Err(
+                                "grad: a statement-expression inside an `if`/`match` condition is \
+                                 not supported on the native backend"
+                                    .into(),
+                            );
+                        }
+                    }
+                }
+                let r = self.forward_eval(last);
+                self.scope = saved;
+                r
+            }
+            _ => Err(
+                "grad: this `if`/`match` condition/scrutinee is not a supported concrete \
+                 Int/Bool/Float expression on the native backend (supported: literals, captured \
+                 scalars, `vec_len`, and +-*/%, comparisons, &&/||/! over them)"
+                    .into(),
+            ),
+        }
+    }
+
+    /// Forward-evaluate a concrete binary op (arithmetic / comparison / logic) on
+    /// concrete operands. Comparisons yield a Bool; arithmetic preserves Int or
+    /// Float; logic requires Bools. No tape interaction whatsoever.
+    fn forward_binary(&mut self, op: BinOp, l: &Expr, r: &Expr) -> Result<FVal, String> {
+        // Short-circuit logic.
+        if matches!(op, BinOp::And | BinOp::Or) {
+            let a = self.forward_eval(l)?;
+            let b = self.forward_eval(r)?;
+            let (FVal::Bool(a), FVal::Bool(b)) = (a, b) else {
+                return Err("grad: `&&`/`||` expect Bools in a condition inside `f`".into());
+            };
+            let cop = if matches!(op, BinOp::And) { "&&" } else { "||" };
+            return Ok(FVal::Bool(format!("(({}) {} ({}))", a, cop, b)));
+        }
+        let a = self.forward_eval(l)?;
+        let b = self.forward_eval(r)?;
+        // Determine a common numeric form for arithmetic/comparison.
+        let cop = match op {
+            BinOp::Add => "+",
+            BinOp::Sub => "-",
+            BinOp::Mul => "*",
+            BinOp::Div => "/",
+            BinOp::Mod => "%",
+            BinOp::Lt => "<",
+            BinOp::Le => "<=",
+            BinOp::Gt => ">",
+            BinOp::Ge => ">=",
+            BinOp::Eq => "==",
+            BinOp::Ne => "!=",
+            BinOp::And | BinOp::Or => unreachable!("handled above"),
+        };
+        let is_cmp = matches!(
+            op,
+            BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq | BinOp::Ne
+        );
+        match (&a, &b) {
+            (FVal::Int(x), FVal::Int(y)) => {
+                if matches!(op, BinOp::Div | BinOp::Mod) {
+                    // Guard division/modulo by zero with a clean runtime trap,
+                    // matching the interpreter's catchable error.
+                    let _ = writeln!(
+                        self.body,
+                        "    if (({}) == 0) aria_trap_msg(\"grad: division by zero in a condition\");",
+                        y
+                    );
+                }
+                let expr = format!("(({}) {} ({}))", x, cop, y);
+                Ok(if is_cmp { FVal::Bool(expr) } else { FVal::Int(expr) })
+            }
+            // Any Float involved -> compare/compute as double. (Int promotes.)
+            (FVal::Float(_) | FVal::Int(_), FVal::Float(_) | FVal::Int(_)) => {
+                if matches!(op, BinOp::Mod) {
+                    return Err("grad: `%` is not defined on Floats in a condition inside `f`".into());
+                }
+                let xe = fval_as_double(&a);
+                let ye = fval_as_double(&b);
+                let expr = format!("(({}) {} ({}))", xe, cop, ye);
+                Ok(if is_cmp { FVal::Bool(expr) } else { FVal::Float(expr) })
+            }
+            (FVal::Bool(x), FVal::Bool(y)) if matches!(op, BinOp::Eq | BinOp::Ne) => {
+                Ok(FVal::Bool(format!("(({}) {} ({}))", x, cop, y)))
+            }
+            _ => Err(
+                "grad: mismatched operand kinds in an `if`/`match` condition inside `f` on the \
+                 native backend"
+                    .into(),
+            ),
+        }
+    }
+}
+
+/// Render a concrete forward value as a C `double` expression (Int widens).
+fn fval_as_double(v: &FVal) -> String {
+    match v {
+        FVal::Float(s) => s.clone(),
+        FVal::Int(s) => format!("(double)({})", s),
+        FVal::Bool(s) => format!("(double)({})", s),
     }
 }
 

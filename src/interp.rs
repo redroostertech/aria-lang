@@ -1565,14 +1565,21 @@ fn builtin(name: &str, args: &[Value]) -> Result<Option<Value>, String> {
     {
         match tracing_vec_builtin(name, args)? {
             Some(v) => return Ok(Some(v)),
-            // A tracing operand reached a builtin outside the differentiable op
-            // set — fail cleanly rather than fall through to the concrete
-            // dispatch (which would mis-type the tracing value).
             None => {
-                return Err(format!(
-                    "grad: unsupported operation `{}` on a differentiated value",
-                    name
-                ))
+                // The name is not a differentiable builtin. If it is not a builtin
+                // at all, it is a USER FUNCTION called inside `f` with a tracing
+                // argument: fall through (return `Ok(None)`) so the caller steps
+                // into that function, whose body records its own tape nodes — i.e.
+                // inter-procedural calls inside `f` are traced by execution. A
+                // builtin OUTSIDE the differentiable op set, however, must fail
+                // cleanly rather than mis-type the tracing value.
+                if crate::builtins::lookup(name).is_some() {
+                    return Err(format!(
+                        "grad: unsupported operation `{}` on a differentiated value",
+                        name
+                    ));
+                }
+                return Ok(None);
             }
         }
     }

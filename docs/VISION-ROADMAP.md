@@ -69,16 +69,18 @@ ground truth from the current source is:
 ### What is conspicuously absent for "learning / adapting"
 
 - ~~**No automatic differentiation. No gradients. No `backward`/`grad`.**~~
-  *(Updated 2026-06 — see §G.4, §G.6.)* Aria now has **both** forward-mode AD (dual
-  numbers in pure Aria, `examples/autodiff.aria`) **and** a reverse-mode `grad`
-  builtin (tape-based, one backward pass) validated against finite differences and
-  the forward oracle. `grad` runs in **both the interpreter AND the native (C)
-  backend** — the native path uses a runtime `AriaTape` + a traced source-to-source
-  compilation of `f`, producing gradients **bit-for-bit identical** to the
-  interpreter oracle on the supported op subset (§G.6); `examples/grad.aria` now
-  converges identically under `aria native-run`. WASM and `aria mem` keep `grad`
-  gated cleanly. The remaining work for Capability 1 is broadening the native op
-  subset (control flow / inter-procedural `f`) and the speed/persistence work below.
+  *(Updated 2026-06 — see §G.4, §G.6, §G.7.)* Aria now has **both** forward-mode AD
+  (dual numbers in pure Aria, `examples/autodiff.aria`) **and** a reverse-mode
+  `grad` builtin (tape-based, one backward pass) validated against finite
+  differences and the forward oracle. `grad` runs in **both the interpreter AND the
+  native (C) backend** — the native path uses a runtime `AriaTape` + a traced
+  source-to-source compilation of `f`, producing gradients **bit-for-bit identical**
+  to the interpreter oracle on the supported subset (§G.6), which now includes
+  **control flow (`if`/`match`) and inter-procedural calls** inside `f` (§G.7);
+  `examples/grad.aria` converges identically under `aria native-run`. WASM and
+  `aria mem` keep `grad` gated cleanly. The remaining work for Capability 1 is the
+  speed/persistence work below (and, on native, lifting recursion / non-constant
+  indices, which stay cleanly gated).
 - **Scalar f32 kernels only.** `src/tensor.rs` and the C runtime are triple-nested
   scalar loops — **no BLAS, no SIMD, no Accelerate/Metal/CUDA.** Fine for tiny
   demos, orders of magnitude off real training.
@@ -807,14 +809,12 @@ literal** `\v -> ..` OR a **named top-level function** `grad(loss, x)` whose bod
 is inlined — as long as that body is **straight-line** over this subset.
 
 **Gated cleanly on the native backend (clean `grad: …` error, never a panic,
-never a wrong gradient):** control flow (`if`/`match`) inside `f`, calls to other
-user functions inside `f` (inline them, or use `aria run`), `f` passed as anything
-other than a lambda/named-fn, a non-constant `vec_get` index, a non-literal
-`vec_from_array`, records/tuples/closures, and any op outside the subset. These
-limits are **at or narrower than** the interpreter's (e.g. the interpreter also
-rejects `if` on a differentiated value — a comparison on a tracing scalar). **WASM
-and `aria mem` keep `grad` fully gated** (the IR-lowering gate in `src/ir.rs`); the
-native backend is the deploy target.
+never a wrong gradient):** `f` passed as anything other than a lambda/named-fn, a
+non-constant `vec_get` index, a non-literal `vec_from_array`,
+records/tuples/closures, and any op outside the subset. These limits are **at or
+narrower than** the interpreter's. (`if`/`match` and inter-procedural calls were
+broadened in §G.7.) **WASM and `aria mem` keep `grad` fully gated** (the
+IR-lowering gate in `src/ir.rs`); the native backend is the deploy target.
 
 **Validation (gradients are CORRECT on native, not merely produced).** New tests
 in `src/proptest.rs` (cc-gated):
@@ -831,6 +831,52 @@ in `src/proptest.rs` (cc-gated):
 `[2,−1,3,0.5]` with the loss falling 14.25 → ~2.6e-31 — **identical output to
 `aria run`** — and reports `aria_live=0` (garbage-free). Test count: **473 → 475**,
 all green (`RUST_MIN_STACK=536870912 cargo test`).
+
+### G.7 Native `grad` — broadened to control flow + inter-procedural `f` (2026-06)
+
+§G.6's native `grad` only accepted **straight-line** `f`. It now also
+differentiates through **control flow** (`if`/`else`, `match`) and
+**inter-procedural calls** inside `f`, still **bit-for-bit identical** to the
+interpreter oracle and within tolerance of central finite differences.
+
+**`if`/`match` (`src/grad_native.rs::trace_if`/`trace_match`).** The interpreter
+records tape nodes **only along the taken branch**; the condition itself is
+evaluated to a **concrete** (non-differentiated) value — a comparison on a tracing
+scalar is a clean error there. The native tracer mirrors this exactly: it
+**forward-evaluates** the condition/scrutinee to a concrete C `int64_t`/`int`/
+`double` (literals, captured scalars, `vec_len`, and `+ − * / %`, comparisons,
+`&& || !` over them — a new `FVal` path that never reads an adjoint and never
+records a node), emits a **real C `if`/`else`** (or an if-else-if chain for
+`match` over Int/Bool/wildcard/var patterns), and traces **both** arms — each into
+its own buffer assigning to one shared result local, so only the taken arm's tape
+nodes are recorded at runtime. Both arms must yield the same kind (all Float or all
+Vector). A condition that observes a **differentiated** value (`vec_get(w,0)>0.0`)
+stays a clean error on **both** backends (the branch must not depend on what is
+being differentiated — otherwise the single-branch gradient would be wrong at the
+decision boundary). Captured-Vector lifts are hoisted into a **prologue** so a
+capture used in multiple branches stays in scope.
+
+**Inter-procedural calls (`trace_inline_call`).** A call `g(args…)` to another
+top-level function inside `f` is **inlined**: each parameter is bound to the traced
+value of its argument and `g`'s body is traced in that scope, so its ops record
+tape nodes — reproducing the interpreter, which now steps into `g` at runtime when
+a tracing argument is present (a one-line dispatch fix in `src/interp.rs`: a
+non-builtin name with a tracing arg falls through to the user-function call path
+instead of erroring). **(Mutually) recursive** calls cannot be inlined into a
+finite trace and are **gated cleanly** (use `aria run`); a non-recursive call graph
+up to depth 64 is supported. Nested vector-returning + scalar-returning calls
+(`sq(dbl(w))`) and control-flow-plus-call (`if vec_len(v)>3 { sq(v) } else { … }`)
+both compile and match.
+
+**Validation.** `native_grad_matches_interpreter_and_finite_diff` now covers
+**13** programs (was 6) including `if`-then / `if`-else / `match`-on-`vec_len` /
+capture-in-both-branches / single-call / nested-calls / `if`+call — each asserted
+**bit-for-bit equal to the interpreter** AND within tolerance of finite
+differences, AND `aria_live==0`. `native_grad_gates_unsupported_f_and_other_backends`
+now asserts the new boundary: a differentiated-value condition is rejected on
+**both** backends, recursion-in-`f` and constructor-`match` are gated natively, and
+a straight-line/call `f` compiles, while `aria mem`/`wasm` still gate `grad`. All
+**484** tests green.
 
 ### G.5 Summary
 

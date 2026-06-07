@@ -1479,6 +1479,86 @@ fn grad_diff_programs() -> Vec<(&'static str, String, fn(&[f64]) -> f64, Vec<f64
             (|v: &[f64]| v.iter().map(|a| a * a).sum::<f64>().sqrt()) as fn(&[f64]) -> f64,
             vec![3.0, 4.0, 12.0],
         ),
+        // --- Control flow inside `f` (the new native support) ---------------
+        // `if` on a CONCRETE structural condition (vec_len): the THEN branch is
+        // taken here (len 4 > 2), so f(v) = dot(v, v) -> grad = 2v. The branch
+        // decision does not depend on the differentiated values, so the gradient
+        // along the taken branch is exact (== interpreter == finite diff).
+        (
+            "if_then",
+            "fn main() -> Vector = { let x = vec_from_array([1.0, -2.0, 3.5, 0.25]); \
+             grad(\\v -> if vec_len(v) > 2 { vec_dot(v, v) } else { vec_norm(v) }, x) }"
+                .to_string(),
+            (|v: &[f64]| v.iter().map(|a| a * a).sum()) as fn(&[f64]) -> f64,
+            vec![1.0, -2.0, 3.5, 0.25],
+        ),
+        // The ELSE branch of the same shape (len 2 not > 2): f(v) = norm(v).
+        (
+            "if_else",
+            "fn main() -> Vector = { let x = vec_from_array([3.0, 4.0]); \
+             grad(\\v -> if vec_len(v) > 2 { vec_dot(v, v) } else { vec_norm(v) }, x) }"
+                .to_string(),
+            (|v: &[f64]| v.iter().map(|a| a * a).sum::<f64>().sqrt()) as fn(&[f64]) -> f64,
+            vec![3.0, 4.0],
+        ),
+        // `match` on a concrete Int scrutinee (vec_len) with literal + wildcard
+        // arms: the `4 =>` arm is taken -> f(v) = dot(v, v).
+        (
+            "match_len",
+            "fn main() -> Vector = { let x = vec_from_array([1.0, -2.0, 3.5, 0.25]); \
+             grad(\\v -> match vec_len(v) { 2 => vec_norm(v), 4 => vec_dot(v, v), _ => vec_norm(v) }, x) }"
+                .to_string(),
+            (|v: &[f64]| v.iter().map(|a| a * a).sum()) as fn(&[f64]) -> f64,
+            vec![1.0, -2.0, 3.5, 0.25],
+        ),
+        // A captured Vector used in BOTH branches (exercises the prologue hoist
+        // of the capture lift). THEN taken (len 4 > 2): f(v) = dot(v, c).
+        (
+            "if_capture",
+            "fn main() -> Vector = { let x = vec_from_array([1.0, 2.0, 3.0, 4.0]); \
+             let c = vec_from_array([2.0, 3.0, -1.0, 0.25]); \
+             grad(\\v -> if vec_len(v) > 2 { vec_dot(v, c) } else { vec_dot(c, v) }, x) }"
+                .to_string(),
+            (|v: &[f64]| {
+                let c = [2.0, 3.0, -1.0, 0.25];
+                v.iter().zip(c).map(|(a, b)| a * b).sum()
+            }) as fn(&[f64]) -> f64,
+            vec![1.0, 2.0, 3.0, 4.0],
+        ),
+        // --- Inter-procedural calls inside `f` (the new native support) ------
+        // `f` is a named helper that CALLS another function `sq` -> inlined /
+        // traced through. f(v) = dot(v, v) -> grad = 2v.
+        (
+            "call_one",
+            "fn sq(w: Vector) -> Float = vec_dot(w, w)\n\
+             fn main() -> Vector = { let x = vec_from_array([1.0, -2.0, 3.5, 0.25]); \
+             grad(\\v -> sq(v), x) }"
+                .to_string(),
+            (|v: &[f64]| v.iter().map(|a| a * a).sum()) as fn(&[f64]) -> f64,
+            vec![1.0, -2.0, 3.5, 0.25],
+        ),
+        // Nested calls returning a Vector then a scalar: pipe(w)=sq(dbl(w)) with
+        // dbl(w)=2w, sq(u)=dot(u,u) -> f(w)=4||w||^2 -> grad = 8w.
+        (
+            "call_nested",
+            "fn dbl(w: Vector) -> Vector = vec_scale(w, 2.0)\n\
+             fn sq(w: Vector) -> Float = vec_dot(w, w)\n\
+             fn pipe(w: Vector) -> Float = sq(dbl(w))\n\
+             fn main() -> Vector = { let x = vec_from_array([1.0, 2.0, 3.0]); grad(pipe, x) }"
+                .to_string(),
+            (|v: &[f64]| v.iter().map(|a| 4.0 * a * a).sum()) as fn(&[f64]) -> f64,
+            vec![1.0, 2.0, 3.0],
+        ),
+        // Control flow AND a call together: THEN taken (len 4 > 3), calls sq.
+        (
+            "if_and_call",
+            "fn sq(w: Vector) -> Float = vec_dot(w, w)\n\
+             fn main() -> Vector = { let x = vec_from_array([1.0, 2.0, 3.0, 4.0]); \
+             grad(\\v -> if vec_len(v) > 3 { sq(v) } else { vec_norm(v) }, x) }"
+                .to_string(),
+            (|v: &[f64]| v.iter().map(|a| a * a).sum()) as fn(&[f64]) -> f64,
+            vec![1.0, 2.0, 3.0, 4.0],
+        ),
     ]
 }
 
@@ -1543,35 +1623,57 @@ fn native_grad_matches_interpreter_and_finite_diff() {
         checked += 1;
     }
     eprintln!("native_grad_matches_interpreter_and_finite_diff: {} grad programs checked", checked);
-    assert!(checked >= 6, "expected >=6 native grad programs, got {}", checked);
+    assert!(checked >= 13, "expected >=13 native grad programs, got {}", checked);
 }
 
 #[test]
 fn native_grad_gates_unsupported_f_and_other_backends() {
-    // (1) An `f` body using control flow (`if`) is outside the supported subset:
-    //     the native backend must reject it with a clean `grad: ...` error
-    //     (never a panic, never a wrong gradient). The interpreter also rejects
-    //     a comparison on a differentiated value, so this is a shared limit.
+    // (1) `if`/`match` ARE supported when the condition is a CONCRETE structural
+    //     value (e.g. `vec_len`). But a condition that observes a DIFFERENTIATED
+    //     value (`vec_get(w, 0) > 0.0`) must stay gated on BOTH backends — the
+    //     branch must not depend on the value being differentiated. The native
+    //     backend rejects it cleanly, and so does the interpreter oracle (a
+    //     comparison on a `Tracing` scalar is an error there too).
     let if_src = "fn main() -> Vector = { let x = vec_from_array([1.0, 2.0]); \
-                  grad(\\w -> if vec_get(w, 0) > 0.0 { vec_dot(w, w) } else { 0.0 }, x) }";
+                  grad(\\w -> if vec_get(w, 0) > 0.0 { vec_dot(w, w) } else { vec_norm(w) }, x) }";
     let prog = parser::parse(lexer::lex(if_src).expect("lex")).expect("parse");
-    let err = crate::c_backend::compile(&prog).expect_err("if-in-f must be gated natively");
+    let err = crate::c_backend::compile(&prog)
+        .expect_err("a condition on a differentiated value must be gated natively");
     assert!(
-        err.contains("grad") && err.to_lowercase().contains("if"),
-        "expected a clean grad/if gating error, got: {}",
+        err.contains("grad") && err.to_lowercase().contains("condition"),
+        "expected a clean grad/condition gating error, got: {}",
+        err
+    );
+    // The interpreter oracle ALSO rejects it (shared limit) — never a wrong grad.
+    assert!(
+        ast_run(if_src).is_err(),
+        "the interpreter must also reject a differentiated-value condition"
+    );
+
+    // (2a) RECURSION inside `f` cannot be inlined into a finite native trace and
+    //      is gated cleanly (the interpreter `aria run` runs it at runtime). Here
+    //      the base branch is structural, so it is a genuine recursive definition.
+    let rec_src = "fn rec(w: Vector) -> Float = if vec_len(w) > 0 { vec_dot(w, w) } else { rec(w) }\n\
+                   fn main() -> Vector = { let x = vec_from_array([1.0, 2.0]); grad(rec, x) }";
+    let prog = parser::parse(lexer::lex(rec_src).expect("lex")).expect("parse");
+    let err = crate::c_backend::compile(&prog).expect_err("recursion in `f` must be gated natively");
+    assert!(
+        err.contains("grad") && err.to_lowercase().contains("recurs"),
+        "expected a clean grad/recursion gating error, got: {}",
         err
     );
 
-    // (2) An `f` that calls another user function is gated (not inlined).
-    let call_src = "fn sq(w: Vector) -> Float = vec_dot(w, w)\n\
-                    fn main() -> Vector = { let x = vec_from_array([1.0, 2.0]); \
-                    grad(\\w -> sq(w), x) }";
-    let prog = parser::parse(lexer::lex(call_src).expect("lex")).expect("parse");
-    let err = crate::c_backend::compile(&prog).expect_err("fn-call-in-f must be gated natively");
-    assert!(err.contains("grad") && err.contains("sq"), "unexpected error: {}", err);
+    // (2b) `match` on a CONSTRUCTOR/record scrutinee (a traced ADT, outside the
+    //      differentiable subset) stays gated cleanly.
+    let adt_src = "type Tag = | A | B\n\
+                   fn main() -> Vector = { let x = vec_from_array([1.0, 2.0]); \
+                   grad(\\w -> match A { A => vec_dot(w, w), B => vec_norm(w) }, x) }";
+    let prog = parser::parse(lexer::lex(adt_src).expect("lex")).expect("parse");
+    let err = crate::c_backend::compile(&prog).expect_err("ctor-match in `f` must be gated natively");
+    assert!(err.contains("grad"), "expected a clean grad gating error, got: {}", err);
 
-    // (3) A named top-level helper `f` whose body IS straight-line over the
-    //     supported subset is inlined and compiles fine (the example's shape).
+    // (3a) A named top-level helper `f` whose body is straight-line over the
+    //      supported subset compiles fine (the example's shape).
     let named_src = "fn loss(w: Vector) -> Float = { let t = vec_from_array([2.0, -1.0]); \
                      let d = vec_sub(w, t); vec_dot(d, d) }\n\
                      fn main() -> Vector = { let x = vec_from_array([0.0, 0.0]); grad(loss, x) }";
@@ -1579,6 +1681,17 @@ fn native_grad_gates_unsupported_f_and_other_backends() {
     assert!(
         crate::c_backend::compile(&prog).is_ok(),
         "a straight-line named helper `f` should compile on the native backend"
+    );
+
+    // (3b) An `f` that CALLS another user function is now SUPPORTED (inlined /
+    //      traced through) — it compiles on the native backend.
+    let call_src = "fn sq(w: Vector) -> Float = vec_dot(w, w)\n\
+                    fn main() -> Vector = { let x = vec_from_array([1.0, 2.0]); \
+                    grad(\\w -> sq(w), x) }";
+    let prog = parser::parse(lexer::lex(call_src).expect("lex")).expect("parse");
+    assert!(
+        crate::c_backend::compile(&prog).is_ok(),
+        "a call to a straight-line user function inside `f` should now compile natively"
     );
 
     // (4) The IR memory path (`aria mem`) and the WASM backend keep `grad`
