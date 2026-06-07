@@ -964,6 +964,42 @@ fn main() -> Int = code(Blue)
     }
 
     #[test]
+    fn pattern_type_error_publishes_exact_pattern_range_not_whole_line() {
+        // A pattern of the wrong type now carries the pattern NODE's precise span,
+        // so the LSP emits an EXACT range over the pattern, not a whole-line one.
+        // Line 2 (0-based line 1) is `  Box(v) => v,`; `Box(v)` is cols 3..9
+        // (1-based), i.e. 0-based LSP characters 2..8.
+        let src = "fn g(n: Int) -> Int = match n {\n  Box(v) => v,\n  _ => 0\n}\ntype Boxed = | Box(Int)\nfn main() -> Int = g(1)";
+        let diags = check_text(src);
+        assert!(!diags.is_empty(), "expected a pattern type error");
+        let note = publish_diagnostics_notification("file:///pat.aria", &diags, src);
+        assert!(
+            note.contains(r#""range":{"start":{"line":1,"character":2},"end":{"line":1,"character":8}}"#),
+            "expected an exact pattern range, got: {}",
+            note
+        );
+        assert!(!note.contains("1000000"), "should not be a whole-line range: {}", note);
+    }
+
+    #[test]
+    fn let_annotation_error_publishes_exact_statement_range() {
+        // A `let x: Int = true;` annotation mismatch carries the let STATEMENT's
+        // precise span, so the LSP range covers the whole statement exactly. Line 2
+        // (0-based line 1) is `  let x: Int = true;`; the statement is 1-based cols
+        // 3..21, i.e. 0-based LSP characters 2..20.
+        let src = "fn f() -> Int = {\n  let x: Int = true;\n  x\n}\nfn main() -> Int = f()";
+        let diags = check_text(src);
+        assert!(!diags.is_empty(), "expected a let-annotation type error");
+        let note = publish_diagnostics_notification("file:///let.aria", &diags, src);
+        assert!(
+            note.contains(r#""range":{"start":{"line":1,"character":2},"end":{"line":1,"character":20}}"#),
+            "expected an exact let-statement range, got: {}",
+            note
+        );
+        assert!(!note.contains("1000000"), "should not be a whole-line range: {}", note);
+    }
+
+    #[test]
     fn unknown_request_gets_method_not_found_error() {
         let mut out: Vec<u8> = Vec::new();
         let mut got_shutdown = false;

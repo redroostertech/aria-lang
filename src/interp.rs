@@ -923,12 +923,12 @@ impl Interp {
                 scope.push(HashMap::new());
                 let mut run = || -> Result<Value, String> {
                     for s in stmts {
-                        match s {
-                            Stmt::Let(name, _ty, value) => {
+                        match &s.kind {
+                            StmtKind::Let { name, value, .. } => {
                                 let v = self.eval(value, scope)?;
                                 scope.last_mut().unwrap().insert(name.clone(), v);
                             }
-                            Stmt::Expr(e) => {
+                            StmtKind::Expr(e) => {
                                 self.eval(e, scope)?;
                             }
                         }
@@ -1029,12 +1029,12 @@ impl Interp {
                 scope.push(HashMap::new());
                 let run = |me: &Self, scope: &mut Scope| -> Result<TailOutcome, String> {
                     for s in stmts {
-                        match s {
-                            Stmt::Let(name, _ty, value) => {
+                        match &s.kind {
+                            StmtKind::Let { name, value, .. } => {
                                 let val = me.eval(value, scope)?;
                                 scope.last_mut().unwrap().insert(name.clone(), val);
                             }
-                            Stmt::Expr(ex) => {
+                            StmtKind::Expr(ex) => {
                                 me.eval(ex, scope)?;
                             }
                         }
@@ -1343,22 +1343,22 @@ fn match_pattern(
     binds: &mut HashMap<String, Value>,
     record_fields: &HashMap<String, Vec<String>>,
 ) -> bool {
-    match pat {
-        Pattern::Wild => true,
-        Pattern::Var(name) => {
+    match &pat.kind {
+        PatternKind::Wild => true,
+        PatternKind::Var(name) => {
             binds.insert(name.clone(), val.clone());
             true
         }
-        Pattern::Int(i) => matches!(val, Value::Int(v) if v == i),
-        Pattern::Bool(b) => matches!(val, Value::Bool(v) if v == b),
-        Pattern::Ctor(name, subs) => match val {
+        PatternKind::Int(i) => matches!(val, Value::Int(v) if v == i),
+        PatternKind::Bool(b) => matches!(val, Value::Bool(v) if v == b),
+        PatternKind::Ctor(name, subs) => match val {
             Value::Data { ctor, fields } if ctor == name && fields.len() == subs.len() => subs
                 .iter()
                 .zip(fields)
                 .all(|(p, f)| match_pattern(p, f, binds, record_fields)),
             _ => false,
         },
-        Pattern::Record(name, sub_fields) => match val {
+        PatternKind::Record(name, sub_fields) => match val {
             Value::Data { ctor, fields } if ctor == name => {
                 let decl = match record_fields.get(name) {
                     Some(d) => d,

@@ -56,7 +56,11 @@ Each Aria [`Diagnostic`](DIAGNOSTICS.md#schema) maps to one LSP `Diagnostic`:
 A type error mid-expression now highlights the **exact sub-expression**. For
 `fn f() -> Int = 1 + true`, the published range is
 `{start:{line:0,character:16}, end:{line:0,character:24}}` — the `1 + true`
-operand — not the whole line.
+operand — not the whole line. The same precision extends to **statements** and
+**patterns**: a `let x: Int = true;` annotation mismatch highlights the whole
+`let` statement, and a `match`-arm pattern of the wrong type highlights the
+pattern node exactly (e.g. `Box(v)`), since statements and patterns now carry
+their own precise spans.
 
 When the program is **clean**, the server publishes an **empty** `diagnostics`
 array, so the editor clears old squiggles.
@@ -132,13 +136,15 @@ vim.api.nvim_create_autocmd("FileType", {
 
 - **Diagnostics only.** No hover, completion, signature help, or
   go-to-definition yet.
-- **Precise ranges for expression-level errors.** The compiler now tracks
-  **line and column** for every token, and threads a precise source span onto
-  every AST expression, so the type/shape checker locates the offending
-  sub-expression exactly. Expression-level diagnostics publish an **exact
-  range** (the precise span); lex/parse errors (which know only a line) and
-  declaration-level/unlocatable errors fall back to a **whole-line** range. The
-  same span foundation makes hover / go-to-definition tractable as a follow-on.
+- **Precise ranges for expression-, statement-, and pattern-level errors.** The
+  compiler tracks **line and column** for every token, and threads a precise
+  source span onto every AST expression, **statement** (`let`/expression
+  statements), and **pattern** (`match` arms, destructuring), so the type/shape
+  checker locates the offending node exactly. Those diagnostics publish an
+  **exact range** (the precise span); lex/parse errors (which know only a line)
+  and declaration-level/unlocatable errors fall back to a **whole-line** range.
+  The same span foundation makes hover / go-to-definition tractable as a
+  follow-on.
 - **Full sync only** (`textDocumentSync = 1`); no incremental updates. Documents
   are small, so re-checking the whole text on each change is cheap.
 - No workspace/multi-file awareness — each document is checked on its own (with

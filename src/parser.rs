@@ -31,15 +31,10 @@ pub struct Parser {
     /// (which would abort the process with SIGSEGV/exit 134 and break the
     /// "`--json` always emits valid JSON or a clean error" contract).
     depth: usize,
-    /// Side table of precise binder spans for `let`/lambda-param/match-binder
-    /// binders the AST does not itself carry a span for. Pure analysis METADATA
-    /// (see [`crate::ast::BinderSpans`]); consumed only by the data-flow analyzer.
+    /// Side table of precise LAMBDA-PARAMETER binder spans — the one binder kind
+    /// the AST cannot carry a span for directly (see [`crate::ast::BinderSpans`]).
+    /// Pure analysis METADATA, consumed only by the data-flow analyzer.
     binder_spans: BinderSpans,
-    /// Scratch accumulator for the binder `(name, span)` pairs a single match
-    /// pattern introduces, collected during `parse_pattern` (which runs before
-    /// the arm body span is known) and then committed to `binder_spans` keyed by
-    /// the arm body span in `parse_match`.
-    pat_binders: Vec<(String, Span)>,
 }
 
 /// Maximum nesting depth for the expression / type parser. Set far above any
@@ -103,7 +98,6 @@ impl Parser {
             tuple_arities: std::collections::HashSet::new(),
             depth: 0,
             binder_spans: BinderSpans::default(),
-            pat_binders: Vec::new(),
         }
     }
 
@@ -177,6 +171,38 @@ impl Parser {
     fn spanned(&self, start: (usize, usize), kind: ExprKind) -> Expr {
         let (el, ec) = self.prev_end();
         Expr::new(
+            kind,
+            Span {
+                start_line: start.0 as u32,
+                start_col: start.1 as u32,
+                end_line: el as u32,
+                end_col: ec as u32,
+            },
+        )
+    }
+
+    /// Build a `Pattern` from a `kind` and a start position captured BEFORE the
+    /// pattern was parsed, ending at the most recently consumed token — the same
+    /// span discipline `spanned` uses for expressions.
+    fn spanned_pat(&self, start: (usize, usize), kind: PatternKind) -> Pattern {
+        let (el, ec) = self.prev_end();
+        Pattern::new(
+            kind,
+            Span {
+                start_line: start.0 as u32,
+                start_col: start.1 as u32,
+                end_line: el as u32,
+                end_col: ec as u32,
+            },
+        )
+    }
+
+    /// Build a `Stmt` from a `kind` and a start position captured BEFORE the
+    /// statement was parsed, ending at the most recently consumed token (the
+    /// terminating `;` for a `let`/expression statement).
+    fn spanned_stmt(&self, start: (usize, usize), kind: StmtKind) -> Stmt {
+        let (el, ec) = self.prev_end();
+        Stmt::new(
             kind,
             Span {
                 start_line: start.0 as u32,
@@ -933,20 +959,14 @@ impl Parser {
         self.expect(&Tok::LBrace)?;
         let mut arms = Vec::new();
         while *self.peek() != Tok::RBrace {
-            // Collect this arm's pattern binders (name + def span) while parsing
-            // the pattern, then commit them keyed by the arm body span below.
-            self.pat_binders.clear();
+            // Each match-arm pattern now carries its binders' precise spans on the
+            // pattern nodes themselves (a `PatternKind::Var`'s span is its def
+            // site), so no side-table bookkeeping is needed here.
             let pat = self.parse_pattern()?;
-            let arm_binders = std::mem::take(&mut self.pat_binders);
             self.expect(&Tok::FatArrow)?;
             // An arm body is a fresh expression context: record literals are
             // allowed even when the enclosing `match` is in an `if`/`match` head.
             let body = self.parse_sub_expr(0)?;
-            if !body.span.is_none() {
-                for (name, span) in arm_binders {
-                    self.binder_spans.match_binders.insert((body.span, name), span);
-                }
-            }
             arms.push(Arm { pat, body });
             if *self.peek() == Tok::Comma {
                 self.advance();
@@ -962,6 +982,9 @@ impl Parser {
     }
 
     fn parse_pattern(&mut self) -> Result<Pattern, String> {
+        // The pattern's start is the start of the current token; every variant
+        // closes its span at the most recently consumed token via `spanned_pat`.
+        let start = self.here();
         match self.peek().clone() {
             // Tuple pattern `(p, q, ..)` -> the synthetic `$TupleN` ctor pattern;
             // `(p)` is just grouping.
@@ -974,30 +997,32 @@ impl Parser {
                 }
                 self.expect(&Tok::RParen)?;
                 if subs.len() == 1 {
+                    // A parenthesized single pattern keeps its OWN span (the inner
+                    // node), not the paren extent — the parens are pure grouping.
                     Ok(subs.into_iter().next().unwrap())
                 } else {
                     let n = subs.len();
-                    Ok(Pattern::Ctor(self.tuple_name(n), subs))
+                    let tname = self.tuple_name(n);
+                    Ok(self.spanned_pat(start, PatternKind::Ctor(tname, subs)))
                 }
             }
             Tok::Underscore => {
                 self.advance();
-                Ok(Pattern::Wild)
+                Ok(self.spanned_pat(start, PatternKind::Wild))
             }
             Tok::Int(v) => {
                 self.advance();
-                Ok(Pattern::Int(v))
+                Ok(self.spanned_pat(start, PatternKind::Int(v)))
             }
             Tok::True => {
                 self.advance();
-                Ok(Pattern::Bool(true))
+                Ok(self.spanned_pat(start, PatternKind::Bool(true)))
             }
             Tok::False => {
                 self.advance();
-                Ok(Pattern::Bool(false))
+                Ok(self.spanned_pat(start, PatternKind::Bool(false)))
             }
             Tok::Ident(name) => {
-                let ident_span = self.cur_span();
                 self.advance();
                 if is_upper(&name) {
                     // Record pattern `Name { x, y }` (shorthand binds each field
@@ -1007,15 +1032,15 @@ impl Parser {
                         let mut fields = Vec::new();
                         if *self.peek() != Tok::RBrace {
                             loop {
-                                let fspan = self.cur_span();
+                                // The field-name shorthand `{ x }` binds a variable
+                                // whose pattern span is the field-name identifier.
+                                let fstart = self.here();
                                 let fname = self.expect_ident()?;
                                 let sub = if *self.peek() == Tok::Colon {
                                     self.advance();
                                     self.parse_pattern()?
                                 } else {
-                                    // `Point { x }` shorthand binds the field name.
-                                    self.pat_binders.push((fname.clone(), fspan));
-                                    Pattern::Var(fname.clone())
+                                    self.spanned_pat(fstart, PatternKind::Var(fname.clone()))
                                 };
                                 fields.push((fname, sub));
                                 if *self.peek() == Tok::Comma {
@@ -1026,7 +1051,7 @@ impl Parser {
                             }
                         }
                         self.expect(&Tok::RBrace)?;
-                        return Ok(Pattern::Record(name, fields));
+                        return Ok(self.spanned_pat(start, PatternKind::Record(name, fields)));
                     }
                     let mut subs = Vec::new();
                     if *self.peek() == Tok::LParen {
@@ -1043,11 +1068,10 @@ impl Parser {
                         }
                         self.expect(&Tok::RParen)?;
                     }
-                    Ok(Pattern::Ctor(name, subs))
+                    Ok(self.spanned_pat(start, PatternKind::Ctor(name, subs)))
                 } else {
-                    // A bare lowercase variable pattern: record its def span.
-                    self.pat_binders.push((name.clone(), ident_span));
-                    Ok(Pattern::Var(name))
+                    // A bare lowercase variable pattern: its span IS its def site.
+                    Ok(self.spanned_pat(start, PatternKind::Var(name)))
                 }
             }
             other => Err(format!("line {}: invalid pattern {:?}", self.line(), other)),
@@ -1088,8 +1112,11 @@ impl Parser {
             }
             // Not an update: `first` is a statement (`;`) or the block result.
             if *self.peek() == Tok::Semi {
+                // The expression statement spans from the expression's start
+                // through the terminating `;` (consumed next).
+                let stmt_start = (first.span.start_line as usize, first.span.start_col as usize);
                 self.advance();
-                stmts.push(Stmt::Expr(first));
+                stmts.push(self.spanned_stmt(stmt_start, StmtKind::Expr(first)));
                 if *self.peek() == Tok::RBrace {
                     self.advance();
                     return Ok(self.spanned(start, ExprKind::Block(stmts, Box::new(Expr::synth(ExprKind::Unit)))));
@@ -1102,8 +1129,11 @@ impl Parser {
         let final_expr;
         loop {
             if *self.peek() == Tok::Let {
+                // The `let` statement spans from the `let` keyword through its
+                // terminating `;`. `name_span` is the binder identifier alone.
+                let stmt_start = self.here();
                 self.advance();
-                let binder_span = self.cur_span();
+                let name_span = self.cur_span();
                 let name = self.expect_ident()?;
                 let mut ann = None;
                 if *self.peek() == Tok::Colon {
@@ -1114,18 +1144,17 @@ impl Parser {
                 self.expect(&Tok::Eq)?;
                 let value = self.parse_expr(0)?;
                 self.expect(&Tok::Semi)?;
-                // Record the binder's def span keyed by the RHS value span (a
-                // stable, unique in-AST key) for the data-flow analyzer.
-                if !value.span.is_none() {
-                    self.binder_spans.lets.insert(value.span, binder_span);
-                }
-                stmts.push(Stmt::Let(name, ann, value));
+                stmts.push(self.spanned_stmt(
+                    stmt_start,
+                    StmtKind::Let { name, name_span, ann, value },
+                ));
                 continue;
             }
             let e = self.parse_expr(0)?;
             if *self.peek() == Tok::Semi {
+                let stmt_start = (e.span.start_line as usize, e.span.start_col as usize);
                 self.advance();
-                stmts.push(Stmt::Expr(e));
+                stmts.push(self.spanned_stmt(stmt_start, StmtKind::Expr(e)));
                 if *self.peek() == Tok::RBrace {
                     // trailing `;` then close: result is Unit (synthesized, no span).
                     final_expr = Expr::synth(ExprKind::Unit);
@@ -1173,7 +1202,9 @@ pub fn parse(toks: Vec<Token>) -> Result<Program, String> {
 }
 
 /// Parse like [`parse`], additionally returning the [`BinderSpans`] side table of
-/// precise `let`/lambda-param/match-binder definition spans. Used by the
+/// precise LAMBDA-PARAMETER definition spans — the one binder kind the AST cannot
+/// carry a span for directly (`let` names, match-arm pattern variables, and
+/// function parameters now carry their binder span IN the AST). Used by the
 /// data-flow analyzer (`aria analyze`) so it can report each local binding's
 /// definition site; ordinary compilation uses [`parse`] and ignores the table.
 pub fn parse_with_binders(toks: Vec<Token>) -> Result<(Program, BinderSpans), String> {
@@ -1270,5 +1301,193 @@ pure fn c() -> Int = 9
             prog.items.iter().any(|it| matches!(it, Item::Fn(f) if f.name == "main")),
             "parsed program should contain `main`"
         );
+    }
+
+    // ---- precise statement / pattern spans -------------------------------
+    //
+    // These mirror the expression-span style (the lexer's
+    // `tokens_carry_precise_line_and_column` and the `synth`/`spanned` discipline):
+    // each assertion pins an EXACT 1-based `(start_line, start_col)` ..
+    // `(end_line, end_col)` half-open range so a regression that drifts a span by a
+    // column is caught.
+
+    /// The body block of function `name`, as `(stmts, last)`.
+    fn fn_block<'a>(prog: &'a Program, name: &str) -> (&'a [Stmt], &'a Expr) {
+        let f = prog
+            .items
+            .iter()
+            .find_map(|it| match it {
+                Item::Fn(f) if f.name == name => Some(f),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no fn {}", name));
+        match &f.body.kind {
+            ExprKind::Block(stmts, last) => (stmts.as_slice(), last),
+            other => panic!("fn {} body is not a block: {:?}", name, other),
+        }
+    }
+
+    fn span_tuple(s: Span) -> (u32, u32, u32, u32) {
+        (s.start_line, s.start_col, s.end_line, s.end_col)
+    }
+
+    #[test]
+    fn let_statement_carries_precise_span_and_binder_span() {
+        // Line 2 is `  let x = 1 + 2;` (two leading spaces).
+        //  col: 1   2='l' of `let` at col 3 ... the terminating `;` ends at col 17.
+        //  `let` starts at col 3; `x` (the binder) is at col 7..8.
+        let src = "\
+fn f() -> Int = {
+  let x = 1 + 2;
+  x
+}
+";
+        let prog = parse_src(src).expect("parse");
+        let (stmts, last) = fn_block(&prog, "f");
+        assert_eq!(stmts.len(), 1, "one let statement");
+        let s = &stmts[0];
+        let (name, name_span) = match &s.kind {
+            StmtKind::Let { name, name_span, .. } => (name.as_str(), *name_span),
+            other => panic!("expected a let, got {:?}", other),
+        };
+        assert_eq!(name, "x");
+        // The whole `let` statement spans `let` (line 2, col 3) through the `;`
+        // (which ends at col 17 — `  let x = 1 + 2;` is 16 chars, `;` at col 16,
+        // ending one-past at col 17).
+        assert_eq!(span_tuple(s.span), (2, 3, 2, 17), "let-statement span");
+        // The binder `x` alone sits at line 2, cols 7..8.
+        assert_eq!(span_tuple(name_span), (2, 7, 2, 8), "let binder span");
+        // The block result `x` is on line 3, col 3..4 (sanity that spans flow).
+        assert_eq!(span_tuple(last.span), (3, 3, 3, 4), "block result span");
+    }
+
+    #[test]
+    fn expression_statement_span_runs_through_its_semicolon() {
+        // `  print_int(0);` — the statement spans the call through the `;`.
+        let src = "\
+fn f() -> Int = {
+  print_int(0);
+  1
+}
+";
+        let prog = parse_src(src).expect("parse");
+        let (stmts, _last) = fn_block(&prog, "f");
+        assert_eq!(stmts.len(), 1);
+        match &stmts[0].kind {
+            StmtKind::Expr(_) => {}
+            other => panic!("expected an expression statement, got {:?}", other),
+        }
+        // `print_int(0)` starts at col 3; the `;` ends one-past at col 16
+        // (`  print_int(0);` is 15 chars, `;` at col 15, end col 16).
+        assert_eq!(span_tuple(stmts[0].span), (2, 3, 2, 16), "expr-stmt span");
+    }
+
+    #[test]
+    fn match_arm_patterns_carry_precise_spans() {
+        // A constructor pattern with a variable sub-binder, and a wildcard arm.
+        // `    Some(v) => v,` and `    None    => 0`.
+        let src = "\
+type Opt = | Some(Int) | None
+fn g(o: Opt) -> Int = match o {
+  Some(v) => v,
+  None => 0
+}
+";
+        let prog = parse_src(src).expect("parse");
+        let f = prog
+            .items
+            .iter()
+            .find_map(|it| match it {
+                Item::Fn(f) if f.name == "g" => Some(f),
+                _ => None,
+            })
+            .expect("fn g");
+        let arms = match &f.body.kind {
+            ExprKind::Match(_, arms) => arms,
+            other => panic!("g body is not a match: {:?}", other),
+        };
+        assert_eq!(arms.len(), 2);
+        // Arm 0: `Some(v)` at line 3, cols 3..10 (`Some(v)` is 7 chars at col 3).
+        assert_eq!(span_tuple(arms[0].pat.span), (3, 3, 3, 10), "Some(v) ctor pattern span");
+        // Its sub-pattern `v` is at line 3, cols 8..9.
+        let v_span = match &arms[0].pat.kind {
+            PatternKind::Ctor(name, subs) => {
+                assert_eq!(name, "Some");
+                assert_eq!(subs.len(), 1);
+                subs[0].span
+            }
+            other => panic!("expected Some(..) ctor pattern, got {:?}", other),
+        };
+        assert_eq!(span_tuple(v_span), (3, 8, 3, 9), "binder `v` sub-pattern span");
+        // Arm 1: `None` (nullary ctor) at line 4, cols 3..7.
+        assert_eq!(span_tuple(arms[1].pat.span), (4, 3, 4, 7), "None ctor pattern span");
+    }
+
+    #[test]
+    fn record_field_shorthand_binder_span_is_the_field_name() {
+        // `Point { x, y }` — the shorthand binders `x`/`y` get the field-name span.
+        let src = "\
+type Point = { x: Int, y: Int }
+fn px(p: Point) -> Int = match p {
+  Point { x, y } => x
+}
+";
+        let prog = parse_src(src).expect("parse");
+        let f = prog
+            .items
+            .iter()
+            .find_map(|it| match it {
+                Item::Fn(f) if f.name == "px" => Some(f),
+                _ => None,
+            })
+            .expect("fn px");
+        let arms = match &f.body.kind {
+            ExprKind::Match(_, arms) => arms,
+            other => panic!("px body is not a match: {:?}", other),
+        };
+        let fields = match &arms[0].pat.kind {
+            PatternKind::Record(name, fields) => {
+                assert_eq!(name, "Point");
+                fields
+            }
+            other => panic!("expected a record pattern, got {:?}", other),
+        };
+        // `Point { x, y }`: `x` is at line 3, col 11..12; `y` at col 14..15.
+        let x = fields.iter().find(|(n, _)| n == "x").map(|(_, p)| p.span).unwrap();
+        let y = fields.iter().find(|(n, _)| n == "y").map(|(_, p)| p.span).unwrap();
+        assert_eq!(span_tuple(x), (3, 11, 3, 12), "shorthand binder `x` span");
+        assert_eq!(span_tuple(y), (3, 14, 3, 15), "shorthand binder `y` span");
+        // The whole record pattern spans `Point { x, y }`: col 3 through col 17.
+        assert_eq!(span_tuple(arms[0].pat.span), (3, 3, 3, 17), "record pattern span");
+    }
+
+    #[test]
+    fn literal_and_wildcard_pattern_spans() {
+        // Integer-literal and wildcard patterns get precise single-token spans.
+        let src = "\
+fn h(n: Int) -> Int = match n {
+  0 => 10,
+  _ => 20
+}
+";
+        let prog = parse_src(src).expect("parse");
+        let f = prog
+            .items
+            .iter()
+            .find_map(|it| match it {
+                Item::Fn(f) if f.name == "h" => Some(f),
+                _ => None,
+            })
+            .expect("fn h");
+        let arms = match &f.body.kind {
+            ExprKind::Match(_, arms) => arms,
+            other => panic!("h body is not a match: {:?}", other),
+        };
+        // `0` at line 2, col 3..4.
+        assert!(matches!(arms[0].pat.kind, PatternKind::Int(0)));
+        assert_eq!(span_tuple(arms[0].pat.span), (2, 3, 2, 4), "int pattern span");
+        // `_` at line 3, col 3..4.
+        assert!(matches!(arms[1].pat.kind, PatternKind::Wild));
+        assert_eq!(span_tuple(arms[1].pat.span), (3, 3, 3, 4), "wildcard pattern span");
     }
 }

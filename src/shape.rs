@@ -158,7 +158,7 @@ pub fn infer(e: &TExpr) -> Result<Shape, ShapeError> {
 // `.aria` programs that catches tensor dimension mismatches before runtime.
 // ===========================================================================
 
-use crate::ast::{Expr, ExprKind, Item, Pattern, Program, Stmt};
+use crate::ast::{Expr, ExprKind, Item, Pattern, PatternKind, Program, StmtKind};
 use std::collections::HashMap;
 
 /// A statically-known tensor shape, or `None` when it cannot be determined.
@@ -293,12 +293,12 @@ impl ShapeCtx<'_> {
             ExprKind::Block(stmts, result) => {
                 let mut child = env.clone();
                 for s in stmts {
-                    match s {
-                        Stmt::Let(name, _, rhs) => {
-                            let sh = self.visit(rhs, &child);
+                    match &s.kind {
+                        StmtKind::Let { name, value, .. } => {
+                            let sh = self.visit(value, &child);
                             child.insert(name.clone(), sh);
                         }
-                        Stmt::Expr(ex) => {
+                        StmtKind::Expr(ex) => {
                             self.visit(ex, &child);
                         }
                     }
@@ -374,10 +374,10 @@ fn int_lit(e: &Expr) -> Option<usize> {
 
 /// The variables a pattern binds (so an arm body can shadow them as unknown).
 fn pattern_vars(p: &Pattern) -> Vec<String> {
-    match p {
-        Pattern::Var(v) => vec![v.clone()],
-        Pattern::Ctor(_, sub) => sub.iter().flat_map(pattern_vars).collect(),
-        Pattern::Record(_, fields) => {
+    match &p.kind {
+        PatternKind::Var(v) => vec![v.clone()],
+        PatternKind::Ctor(_, sub) => sub.iter().flat_map(pattern_vars).collect(),
+        PatternKind::Record(_, fields) => {
             fields.iter().flat_map(|(_, sp)| pattern_vars(sp)).collect()
         }
         _ => Vec::new(),

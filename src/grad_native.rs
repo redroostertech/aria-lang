@@ -35,7 +35,7 @@
 use std::collections::HashMap;
 use std::fmt::Write;
 
-use crate::ast::{BinOp, Expr, ExprKind, FnDecl, Item, Program, Stmt, UnOp};
+use crate::ast::{BinOp, Expr, ExprKind, FnDecl, Item, Program, StmtKind, UnOp};
 
 /// The C value produced by a traced expression: a scalar tape node-id, or a
 /// traced vector (an `AriaTVec` of node-ids). Both are held in fresh C locals
@@ -175,9 +175,9 @@ fn rewrite_expr(
         }
         ExprKind::Block(stmts, last) => {
             for s in stmts.iter_mut() {
-                match s {
-                    Stmt::Let(_, _, v) => rewrite_expr(v, fns, sites, counter)?,
-                    Stmt::Expr(ex) => rewrite_expr(ex, fns, sites, counter)?,
+                match &mut s.kind {
+                    StmtKind::Let { value, .. } => rewrite_expr(value, fns, sites, counter)?,
+                    StmtKind::Expr(ex) => rewrite_expr(ex, fns, sites, counter)?,
                 }
             }
             rewrite_expr(last, fns, sites, counter)?;
@@ -366,12 +366,12 @@ impl Tracer<'_> {
             ExprKind::Block(stmts, last) => {
                 let saved = self.scope.clone();
                 for s in stmts {
-                    match s {
-                        Stmt::Let(n, _, v) => {
-                            let tv = self.trace(v)?;
-                            self.scope.insert(n.clone(), tv);
+                    match &s.kind {
+                        StmtKind::Let { name, value, .. } => {
+                            let tv = self.trace(value)?;
+                            self.scope.insert(name.clone(), tv);
                         }
-                        Stmt::Expr(ex) => {
+                        StmtKind::Expr(ex) => {
                             // Evaluate for its (recorded) effect; discard result.
                             let _ = self.trace(ex)?;
                         }

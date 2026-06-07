@@ -20,7 +20,7 @@
 
 use std::collections::HashMap;
 
-use crate::ast::{BinOp, Expr, ExprKind, Item, Pattern, Program, Stmt, UnOp};
+use crate::ast::{BinOp, Expr, ExprKind, Item, Pattern, PatternKind, Program, StmtKind, UnOp};
 
 /// Atomic operand: a variable or an unboxed literal.
 #[derive(Debug, Clone)]
@@ -242,17 +242,17 @@ struct Lowerer {
 
 /// Variable names a pattern binds (used by the closure free-variable walk).
 pub(crate) fn pattern_vars(p: &Pattern, acc: &mut std::collections::HashSet<String>) {
-    match p {
-        Pattern::Var(n) => {
+    match &p.kind {
+        PatternKind::Var(n) => {
             acc.insert(n.clone());
         }
-        Pattern::Wild | Pattern::Int(_) | Pattern::Bool(_) => {}
-        Pattern::Ctor(_, subs) => {
+        PatternKind::Wild | PatternKind::Int(_) | PatternKind::Bool(_) => {}
+        PatternKind::Ctor(_, subs) => {
             for s in subs {
                 pattern_vars(s, acc);
             }
         }
-        Pattern::Record(_, fields) => {
+        PatternKind::Record(_, fields) => {
             for (_, s) in fields {
                 pattern_vars(s, acc);
             }
@@ -333,12 +333,12 @@ pub(crate) fn ast_free(e: &Expr, bound: &std::collections::HashSet<String>, acc:
         ExprKind::Block(stmts, last) => {
             let mut b: HashSet<String> = bound.clone();
             for s in stmts {
-                match s {
-                    Stmt::Let(name, _, v) => {
-                        ast_free(v, &b, acc);
+                match &s.kind {
+                    StmtKind::Let { name, value, .. } => {
+                        ast_free(value, &b, acc);
                         b.insert(name.clone());
                     }
-                    Stmt::Expr(ex) => ast_free(ex, &b, acc),
+                    StmtKind::Expr(ex) => ast_free(ex, &b, acc),
                 }
             }
             ast_free(last, &b, acc);
@@ -631,13 +631,13 @@ impl Lowerer {
                 // non-recursive — the value is lowered before the name is bound.)
                 let block_saved = self.bound.clone();
                 for s in block_stmts {
-                    match s {
-                        Stmt::Let(name, _ty, value) => {
+                    match &s.kind {
+                        StmtKind::Let { name, value, .. } => {
                             let va = self.lower(value, stmts)?;
                             stmts.push((name.clone(), Bind::Atom(va)));
                             self.bound.insert(name.clone());
                         }
-                        Stmt::Expr(ex) => {
+                        StmtKind::Expr(ex) => {
                             // Evaluate for effect; bind to a discarded temp.
                             let a = self.lower(ex, stmts)?;
                             let t = self.fresh();
@@ -665,24 +665,24 @@ impl Lowerer {
     /// `None` if the arm is already flat or has a refutable (literal) sub-pattern.
     fn flatten_nested_arm(&mut self, arm: &crate::ast::Arm) -> Option<crate::ast::Arm> {
         use crate::ast::Arm;
-        let (name, subs) = match &arm.pat {
-            Pattern::Ctor(n, s) => (n, s),
+        let (name, subs) = match &arm.pat.kind {
+            PatternKind::Ctor(n, s) => (n, s),
             _ => return None,
         };
-        if !subs.iter().any(|s| matches!(s, Pattern::Ctor(..))) {
+        if !subs.iter().any(|s| matches!(s.kind, PatternKind::Ctor(..))) {
             return None; // already flat
         }
-        if subs.iter().any(|s| matches!(s, Pattern::Int(_) | Pattern::Bool(_))) {
+        if subs.iter().any(|s| matches!(s.kind, PatternKind::Int(_) | PatternKind::Bool(_))) {
             return None; // refutable nesting needs fall-through; leave to the error
         }
         let mut flat = Vec::with_capacity(subs.len());
         let mut body = arm.body.clone();
         for sub in subs {
-            match sub {
-                Pattern::Var(_) | Pattern::Wild => flat.push(sub.clone()),
-                Pattern::Ctor(..) => {
+            match &sub.kind {
+                PatternKind::Var(_) | PatternKind::Wild => flat.push(sub.clone()),
+                PatternKind::Ctor(..) => {
                     let f = self.fresh();
-                    flat.push(Pattern::Var(f.clone()));
+                    flat.push(Pattern::synth(PatternKind::Var(f.clone())));
                     body = Expr::synth(ExprKind::Match(
                         Box::new(Expr::synth(ExprKind::Var(f))),
                         vec![Arm { pat: sub.clone(), body }],
@@ -691,7 +691,7 @@ impl Lowerer {
                 _ => return None,
             }
         }
-        Some(Arm { pat: Pattern::Ctor(name.clone(), flat), body })
+        Some(Arm { pat: Pattern::synth(PatternKind::Ctor(name.clone(), flat)), body })
     }
 
     fn lower_match(&mut self, scrut: Atom, arms: &[crate::ast::Arm]) -> Result<Bind, LowerError> {
@@ -702,20 +702,20 @@ impl Lowerer {
                 return self.lower_match(scrut, std::slice::from_ref(&flat));
             }
         }
-        let has_ctor = arms.iter().any(|a| matches!(a.pat, Pattern::Ctor(_, _)));
+        let has_ctor = arms.iter().any(|a| matches!(a.pat.kind, PatternKind::Ctor(_, _)));
         if has_ctor {
             let mut iarms = Vec::new();
             for arm in arms {
                 // Determine what the arm binds BEFORE lowering its body, so those
                 // binders are in scope (they shadow same-named globals) while the
                 // body is lowered.
-                let (ctor, binders): (Option<String>, Vec<String>) = match &arm.pat {
-                    Pattern::Ctor(name, subs) => {
+                let (ctor, binders): (Option<String>, Vec<String>) = match &arm.pat.kind {
+                    PatternKind::Ctor(name, subs) => {
                         let mut binders = Vec::new();
                         for sp in subs {
-                            match sp {
-                                Pattern::Var(n) => binders.push(n.clone()),
-                                Pattern::Wild => binders.push(self.fresh()),
+                            match &sp.kind {
+                                PatternKind::Var(n) => binders.push(n.clone()),
+                                PatternKind::Wild => binders.push(self.fresh()),
                                 _ => {
                                     return Err(LowerError(
                                         "nested constructor patterns not supported in IR yet".into(),
@@ -725,8 +725,8 @@ impl Lowerer {
                         }
                         (Some(name.clone()), binders)
                     }
-                    Pattern::Var(n) => (None, vec![n.clone()]),
-                    Pattern::Wild => (None, vec![self.fresh()]),
+                    PatternKind::Var(n) => (None, vec![n.clone()]),
+                    PatternKind::Wild => (None, vec![self.fresh()]),
                     _ => {
                         return Err(LowerError(
                             "mixed literal/constructor patterns not supported in IR yet".into(),
@@ -752,11 +752,11 @@ impl Lowerer {
             // first catch-all last makes it dominate later arms correctly.
             let mut chain = IExpr::Ret(Atom::Unit); // exhaustiveness => unreachable
             for arm in arms.iter().rev() {
-                match &arm.pat {
-                    Pattern::Var(_) | Pattern::Wild => {
+                match &arm.pat.kind {
+                    PatternKind::Var(_) | PatternKind::Wild => {
                         chain = self.lower_catchall(&scrut, arm)?;
                     }
-                    Pattern::Int(_) | Pattern::Bool(_) => {
+                    PatternKind::Int(_) | PatternKind::Bool(_) => {
                         let cond = self.lit_cond(&scrut, &arm.pat)?;
                         let then = self.lower_block(&arm.body)?;
                         let c = self.fresh();
@@ -783,8 +783,8 @@ impl Lowerer {
         // Bind the catch-all variable (if any) to the scrutinee, then the body —
         // with that variable in scope (it shadows a same-named global) while the
         // body is lowered.
-        match &arm.pat {
-            Pattern::Var(n) => {
+        match &arm.pat.kind {
+            PatternKind::Var(n) => {
                 let saved = self.bound.clone();
                 self.bound.insert(n.clone());
                 let body = self.lower_block(&arm.body)?;
@@ -796,9 +796,9 @@ impl Lowerer {
     }
 
     fn lit_cond(&mut self, scrut: &Atom, pat: &Pattern) -> Result<Bind, LowerError> {
-        let rhs = match pat {
-            Pattern::Int(i) => Atom::Int(*i),
-            Pattern::Bool(b) => Atom::Bool(*b),
+        let rhs = match &pat.kind {
+            PatternKind::Int(i) => Atom::Int(*i),
+            PatternKind::Bool(b) => Atom::Bool(*b),
             _ => return Err(LowerError("unsupported literal pattern".into())),
         };
         Ok(Bind::Prim(BinOp::Eq, scrut.clone(), rhs))

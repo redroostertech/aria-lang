@@ -121,11 +121,12 @@ the lint low-noise for an AI authoring loop.
 
 ## Location precision (what is populated today)
 
-Every AST expression now carries a precise source **span** (1-based start/end
-line+column), threaded from the lexer (which tracks line **and** column per
-token) through the parser. The type/shape checker records the span of the
-**innermost offending sub-expression** on each error, so expression-level
-diagnostics point at the EXACT operand / call site, not just the function.
+Every AST **expression**, **statement**, and **pattern** now carries a precise
+source **span** (1-based start/end line+column), threaded from the lexer (which
+tracks line **and** column per token) through the parser. The type/shape checker
+records the span of the **innermost offending node** on each error, so
+diagnostics point at the EXACT operand / call site / `let` statement / `match`
+pattern, not just the function.
 
 - **`lex` / `parse` errors:** `line` IS populated (these messages carry a
   `line N:` prefix). `col`/`end_line`/`end_col` are `null` — a lex/parse failure
@@ -135,6 +136,12 @@ diagnostics point at the EXACT operand / call site, not just the function.
   span — e.g. `fn f() -> Int = 1 + true` reports the precise location of
   `1 + true`, and `1 + (2 * true)` reports the inner `2 * true`. A whole-body
   return-type mismatch is located at the function's result expression.
+- **`let`-statement and `match`-pattern errors:** a `let x: Int = true;`
+  annotation mismatch is located at the **whole `let` statement** span (the `let`
+  keyword through the terminating `;`), and a `match`-arm pattern of the wrong
+  type (`Box(v)` against an `Int` scrutinee) is located at the **pattern node's**
+  span — e.g. `Box(v)` exactly, recorded innermost-first so a nested sub-pattern
+  pins the deepest failing node.
 - **`function`** is populated **for function-scoped errors** (extracted from the
   message, which names the enclosing function). It is `null` for
   declaration-level errors not inside any function body — e.g.
