@@ -904,9 +904,9 @@ fn annotate_expr(e: &mut Expr, resolved: &HashMap<String, Ty>) {
         }
         ExprKind::Block(stmts, last) => {
             for s in stmts {
-                match s {
-                    Stmt::Let(_, _, v) => annotate_expr(v, resolved),
-                    Stmt::Expr(ex) => annotate_expr(ex, resolved),
+                match &mut s.kind {
+                    StmtKind::Let { value, .. } => annotate_expr(value, resolved),
+                    StmtKind::Expr(ex) => annotate_expr(ex, resolved),
                 }
             }
             annotate_expr(last, resolved);
@@ -984,9 +984,9 @@ fn collect_calls(e: &Expr, out: &mut HashSet<String>) {
         }
         ExprKind::Block(stmts, tail) => {
             for s in stmts {
-                match s {
-                    Stmt::Let(_, _, x) => collect_calls(x, out),
-                    Stmt::Expr(x) => collect_calls(x, out),
+                match &s.kind {
+                    StmtKind::Let { value, .. } => collect_calls(value, out),
+                    StmtKind::Expr(x) => collect_calls(x, out),
                 }
             }
             collect_calls(tail, out);
@@ -1120,9 +1120,9 @@ fn higher_order_effect_witness(
             .or_else(|| arms.iter().find_map(|a| higher_order_effect_witness(&a.body, fnset))),
         ExprKind::Block(stmts, tail) => {
             for s in stmts {
-                let inner = match s {
-                    Stmt::Let(_, _, x) => x,
-                    Stmt::Expr(x) => x,
+                let inner = match &s.kind {
+                    StmtKind::Let { value, .. } => value,
+                    StmtKind::Expr(x) => x,
                 };
                 if let Some(w) = higher_order_effect_witness(inner, fnset) {
                     return Some(w);
@@ -1748,11 +1748,14 @@ impl Checker {
                 scope.push(HashMap::new());
                 let result = (|| {
                     for s in stmts {
-                        match s {
-                            Stmt::Let(name, ann, value) => {
+                        match &s.kind {
+                            StmtKind::Let { name, ann, value, .. } => {
                                 let vt = self.synth(value, scope)?;
                                 let bound = if let Some(a) = ann {
                                     self.unify(a, &vt).map_err(|_| {
+                                        // Point the diagnostic at the let STATEMENT
+                                        // (its precise span), not just the value.
+                                        self.note_err_span(s.span);
                                         format!(
                                             "let `{}`: annotated {} but value is {}",
                                             name,
@@ -1766,7 +1769,7 @@ impl Checker {
                                 };
                                 scope.last_mut().unwrap().insert(name.clone(), bound);
                             }
-                            Stmt::Expr(e) => {
+                            StmtKind::Expr(e) => {
                                 self.synth(e, scope)?;
                             }
                         }
@@ -1952,7 +1955,11 @@ impl Checker {
 
         for arm in arms {
             let mut binds = HashMap::new();
-            self.check_pattern(&arm.pat, &s, &mut binds)?;
+            // On a pattern type error, point the diagnostic at the precise span
+            // of the offending pattern (recorded innermost-first by check_pattern).
+            self.check_pattern(&arm.pat, &s, &mut binds).inspect_err(|_| {
+                self.note_err_span(arm.pat.span);
+            })?;
             scope.push(binds);
             let bt = self.synth(&arm.body, scope);
             scope.pop();
@@ -2041,14 +2048,14 @@ impl Checker {
     /// for wildcard/variable patterns (which match any value). Record patterns
     /// are normalized to positional `Ctor` form so they share the ADT logic.
     fn pat_head(&self, pat: &Pattern) -> Option<(String, Vec<Pattern>)> {
-        match pat {
-            Pattern::Wild | Pattern::Var(_) => None,
-            Pattern::Bool(b) => {
+        match &pat.kind {
+            PatternKind::Wild | PatternKind::Var(_) => None,
+            PatternKind::Bool(b) => {
                 Some((if *b { "true" } else { "false" }.to_string(), vec![]))
             }
-            Pattern::Int(_) => Some((format!("{:?}", pat), vec![])),
-            Pattern::Ctor(name, subs) => Some((name.clone(), subs.clone())),
-            Pattern::Record(name, sub_fields) => {
+            PatternKind::Int(n) => Some((format!("Int({})", n), vec![])),
+            PatternKind::Ctor(name, subs) => Some((name.clone(), subs.clone())),
+            PatternKind::Record(name, sub_fields) => {
                 // Reorder named sub-patterns into declared field order, filling
                 // omitted fields with wildcards.
                 let decl = self
@@ -2063,7 +2070,7 @@ impl Checker {
                             .iter()
                             .find(|(n, _)| n == fname)
                             .map(|(_, p)| p.clone())
-                            .unwrap_or(Pattern::Wild)
+                            .unwrap_or(Pattern::synth(PatternKind::Wild))
                     })
                     .collect();
                 Some((name.clone(), subs))
@@ -2186,7 +2193,7 @@ impl Checker {
                 Some(_) => {} // different constructor: drop
                 None => {
                     // wildcard/var head: expands to `arity` wildcards
-                    let mut new_row = vec![Pattern::Wild; arity];
+                    let mut new_row = vec![Pattern::synth(PatternKind::Wild); arity];
                     new_row.extend_from_slice(&row[1..]);
                     out.push(new_row);
                 }
@@ -2229,19 +2236,35 @@ impl Checker {
         expected: &Ty,
         binds: &mut HashMap<String, Ty>,
     ) -> Result<(), String> {
-        match pat {
-            Pattern::Wild => Ok(()),
-            Pattern::Var(n) => {
+        // Record the precise span of the innermost failing pattern (the deepest
+        // node sets it first; enclosing nodes do not overwrite it), mirroring how
+        // `synth`/`check` locate expression errors.
+        let r = self.check_pattern_inner(pat, expected, binds);
+        if r.is_err() {
+            self.note_err_span(pat.span);
+        }
+        r
+    }
+
+    fn check_pattern_inner(
+        &self,
+        pat: &Pattern,
+        expected: &Ty,
+        binds: &mut HashMap<String, Ty>,
+    ) -> Result<(), String> {
+        match &pat.kind {
+            PatternKind::Wild => Ok(()),
+            PatternKind::Var(n) => {
                 binds.insert(n.clone(), expected.clone());
                 Ok(())
             }
-            Pattern::Int(_) => self
+            PatternKind::Int(_) => self
                 .unify(&Ty::Int, expected)
                 .map_err(|_| format!("integer pattern matched against {}", show(&self.resolve(expected)))),
-            Pattern::Bool(_) => self
+            PatternKind::Bool(_) => self
                 .unify(&Ty::Bool, expected)
                 .map_err(|_| format!("boolean pattern matched against {}", show(&self.resolve(expected)))),
-            Pattern::Ctor(name, subs) => {
+            PatternKind::Ctor(name, subs) => {
                 let sig = self
                     .ctors
                     .get(name)
@@ -2288,7 +2311,7 @@ impl Checker {
                 }
                 Ok(())
             }
-            Pattern::Record(name, sub_fields) => {
+            PatternKind::Record(name, sub_fields) => {
                 let sig = self
                     .ctors
                     .get(name)
@@ -3494,5 +3517,52 @@ mod tests {
         let via_types = check_with_types(&prog).unwrap_err();
         let via_check = check(&prog).unwrap_err();
         assert_eq!(via_types, via_check);
+    }
+
+    #[test]
+    fn let_annotation_error_points_at_the_let_statement_span() {
+        // A `let x: Int = true;` annotation mismatch now reports the precise span
+        // of the WHOLE `let` statement (the new statement span), not just a line.
+        // Line 2 is `  let x: Int = true;`; `let` starts at col 3, the `;` ends
+        // one-past at col 21.
+        let src = "\
+fn f() -> Int = {
+  let x: Int = true;
+  x
+}
+fn main() -> Int = f()
+";
+        let d = structured_src(src);
+        assert_eq!(d.len(), 1, "exactly one error: {:?}", d);
+        assert_eq!(d[0].phase, "type");
+        // Precise range on the let statement.
+        assert_eq!(d[0].line, Some(2), "let-error start line");
+        assert_eq!(d[0].col, Some(3), "let-error start col (the `let` keyword)");
+        assert_eq!(d[0].end_line, Some(2));
+        assert_eq!(d[0].end_col, Some(21), "let-error end col (one past the `;`)");
+    }
+
+    #[test]
+    fn pattern_type_error_points_at_the_offending_pattern_span() {
+        // A constructor pattern of the wrong type reports the precise span of the
+        // PATTERN node. `Box(v)` cannot match an `Int` scrutinee. Line 3 is
+        // `  Box(v) => v,`; `Box(v)` sits at cols 3..9.
+        let src = "\
+type Boxed = | Box(Int)
+fn g(n: Int) -> Int = match n {
+  Box(v) => v,
+  _ => 0
+}
+fn main() -> Int = g(1)
+";
+        let d = structured_src(src);
+        assert!(!d.is_empty(), "expected a pattern type error");
+        // The first error is the pattern mismatch, located at the pattern's span.
+        let pe = &d[0];
+        assert_eq!(pe.phase, "type");
+        assert_eq!(pe.line, Some(3), "pattern-error start line");
+        assert_eq!(pe.col, Some(3), "pattern-error start col (the `Box` ctor)");
+        assert_eq!(pe.end_line, Some(3));
+        assert_eq!(pe.end_col, Some(9), "pattern-error end col (one past `)`)");
     }
 }

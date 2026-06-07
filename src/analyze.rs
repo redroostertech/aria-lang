@@ -28,7 +28,7 @@
 //! a bare function-name reference as a use). Constructor applications are not part
 //! of the call graph (they are data, not control flow).
 
-use crate::ast::{Expr, ExprKind, FnDecl, Item, Program, Span, Stmt};
+use crate::ast::{Expr, ExprKind, FnDecl, Item, Program, Span, StmtKind};
 use crate::diagnostics::json_escape;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -467,19 +467,19 @@ impl Scope {
     /// Bind every variable a pattern introduces (record-field binders, ctor
     /// sub-binders, var patterns) into scope for the arm body.
     fn bind_pattern(&mut self, pat: &crate::ast::Pattern) {
-        use crate::ast::Pattern;
-        match pat {
-            Pattern::Var(name) => self.push(name),
-            Pattern::Ctor(_, subs) => {
+        use crate::ast::PatternKind;
+        match &pat.kind {
+            PatternKind::Var(name) => self.push(name),
+            PatternKind::Ctor(_, subs) => {
                 for s in subs {
                     self.bind_pattern(s);
                 }
             }
-            Pattern::Record(_, fields) => {
+            PatternKind::Record(_, fields) => {
                 for (name, sub) in fields {
-                    match sub {
+                    match &sub.kind {
                         // `Point { x }` shorthand binds the field name itself.
-                        Pattern::Var(v) => self.push(v),
+                        PatternKind::Var(v) => self.push(v),
                         // `Point { x: <pat> }` binds whatever the nested pattern does.
                         _ => {
                             let _ = name;
@@ -488,7 +488,7 @@ impl Scope {
                     }
                 }
             }
-            Pattern::Wild | Pattern::Int(_) | Pattern::Bool(_) => {}
+            PatternKind::Wild | PatternKind::Int(_) | PatternKind::Bool(_) => {}
         }
     }
 }
@@ -577,14 +577,14 @@ fn collect_call_names(e: &Expr, out: &mut BTreeSet<String>, scope: &mut Scope) {
             // the entry depth and drop all block-local binders when leaving.
             let depth = scope.depth();
             for s in stmts {
-                match s {
-                    Stmt::Let(name, _, v) => {
+                match &s.kind {
+                    StmtKind::Let { name, value, .. } => {
                         // The bound expression is evaluated in the PRE-binding
                         // scope; then the name comes into scope for the rest.
-                        collect_call_names(v, out, scope);
+                        collect_call_names(value, out, scope);
                         scope.push(name);
                     }
-                    Stmt::Expr(ex) => collect_call_names(ex, out, scope),
+                    StmtKind::Expr(ex) => collect_call_names(ex, out, scope),
                 }
             }
             collect_call_names(last, out, scope);
@@ -681,12 +681,12 @@ fn collect_call_sites(
         ExprKind::Block(stmts, last) => {
             let depth = scope.depth();
             for s in stmts {
-                match s {
-                    Stmt::Let(name, _, v) => {
-                        collect_call_sites(v, out, scope);
+                match &s.kind {
+                    StmtKind::Let { name, value, .. } => {
+                        collect_call_sites(value, out, scope);
                         scope.push(name);
                     }
-                    Stmt::Expr(ex) => collect_call_sites(ex, out, scope),
+                    StmtKind::Expr(ex) => collect_call_sites(ex, out, scope),
                 }
             }
             collect_call_sites(last, out, scope);
@@ -805,12 +805,12 @@ fn collect_typed_sites(
         ExprKind::Block(stmts, last) => {
             let depth = scope.depth();
             for s in stmts {
-                match s {
-                    Stmt::Let(name, _, v) => {
-                        collect_typed_sites(v, out, scope, tm);
+                match &s.kind {
+                    StmtKind::Let { name, value, .. } => {
+                        collect_typed_sites(value, out, scope, tm);
                         scope.push(name);
                     }
-                    Stmt::Expr(ex) => collect_typed_sites(ex, out, scope, tm),
+                    StmtKind::Expr(ex) => collect_typed_sites(ex, out, scope, tm),
                 }
             }
             collect_typed_sites(last, out, scope, tm);

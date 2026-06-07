@@ -1110,8 +1110,10 @@ impl<'a> Mono<'a> {
                     .position(|n| n == field)
                     .ok_or_else(|| format!("monomorphize: no field `{}` on `{}`", field, ctor))?;
                 let binders = fresh_field_binders(fnames.len());
-                let pat =
-                    Pattern::Ctor(ctor, binders.iter().cloned().map(Pattern::Var).collect());
+                let pat = Pattern::synth(PatternKind::Ctor(
+                    ctor,
+                    binders.iter().cloned().map(|n| Pattern::synth(PatternKind::Var(n))).collect(),
+                ));
                 let arm = Arm { pat, body: Expr::synth(ExprKind::Var(binders[idx].clone())) };
                 Ok((Expr::synth(ExprKind::Match(Box::new(robj), vec![arm])), ftys[idx].clone()))
             }
@@ -1131,10 +1133,10 @@ impl<'a> Mono<'a> {
                     .zip(binders.iter())
                     .map(|(fname, b)| new_vals.remove(fname).unwrap_or_else(|| Expr::synth(ExprKind::Var(b.clone()))))
                     .collect();
-                let pat = Pattern::Ctor(
+                let pat = Pattern::synth(PatternKind::Ctor(
                     ctor.clone(),
-                    binders.iter().cloned().map(Pattern::Var).collect(),
-                );
+                    binders.iter().cloned().map(|n| Pattern::synth(PatternKind::Var(n))).collect(),
+                ));
                 let arm = Arm { pat, body: Expr::synth(ExprKind::Ctor(ctor, rebuilt)) };
                 Ok((Expr::synth(ExprKind::Match(Box::new(rbase), vec![arm])), base_ty))
             }
@@ -1421,8 +1423,8 @@ impl<'a> Mono<'a> {
                 let mut scope = env.clone();
                 let mut rstmts = Vec::new();
                 for s in stmts {
-                    match s {
-                        Stmt::Let(name, ann, value) => {
+                    match &s.kind {
+                        StmtKind::Let { name, name_span, ann, value } => {
                             // An annotation gives a concrete expected type.
                             let ann_ty = match ann {
                                 Some(a) => Some(self.subst_ty(a, tymap)?),
@@ -1433,11 +1435,22 @@ impl<'a> Mono<'a> {
                             let bound = ann_ty.clone().unwrap_or(vt);
                             scope.insert(name.clone(), bound.clone());
                             let rann = ann_ty.map(|_| bound);
-                            rstmts.push(Stmt::Let(name.clone(), rann, rv));
+                            // Preserve the source spans (the rewrite is a pure
+                            // type-specialization; the binder/statement still maps
+                            // to the same source location).
+                            rstmts.push(Stmt::new(
+                                StmtKind::Let {
+                                    name: name.clone(),
+                                    name_span: *name_span,
+                                    ann: rann,
+                                    value: rv,
+                                },
+                                s.span,
+                            ));
                         }
-                        Stmt::Expr(ex) => {
+                        StmtKind::Expr(ex) => {
                             let (re, _) = self.rewrite_expr(ex, &mut scope, tymap, None)?;
-                            rstmts.push(Stmt::Expr(re));
+                            rstmts.push(Stmt::new(StmtKind::Expr(re), s.span));
                         }
                     }
                 }
@@ -1549,21 +1562,24 @@ impl<'a> Mono<'a> {
         scrut_ty: &Ty,
         binds: &mut HashMap<String, Ty>,
     ) -> Result<Pattern, String> {
-        match pat {
-            Pattern::Wild => Ok(Pattern::Wild),
-            Pattern::Var(n) => {
+        // Preserve the original pattern's source span across the rewrite (a pure
+        // type-specialization that does not move the pattern in the source).
+        let span = pat.span;
+        match &pat.kind {
+            PatternKind::Wild => Ok(Pattern::new(PatternKind::Wild, span)),
+            PatternKind::Var(n) => {
                 binds.insert(n.clone(), scrut_ty.clone());
-                Ok(Pattern::Var(n.clone()))
+                Ok(Pattern::new(PatternKind::Var(n.clone()), span))
             }
-            Pattern::Int(i) => Ok(Pattern::Int(*i)),
-            Pattern::Bool(b) => Ok(Pattern::Bool(*b)),
+            PatternKind::Int(i) => Ok(Pattern::new(PatternKind::Int(*i), span)),
+            PatternKind::Bool(b) => Ok(Pattern::new(PatternKind::Bool(*b), span)),
             // Record patterns are interpreter-only so far; cleanly rejected in the
             // compiled pipeline (records never reach here in practice, since a
             // record scrutinee comes from a record expression already gated).
             // `Ctor { f: p, .. }` -> positional `Ctor(p0, .., pn)` (unmentioned
             // fields become `_`), then recurse so the ctor name is mangled from
             // the scrutinee type and sub-patterns are bound.
-            Pattern::Record(name, sub_fields) => {
+            PatternKind::Record(name, sub_fields) => {
                 let sig = self
                     .ctors
                     .get(name)
@@ -1580,12 +1596,16 @@ impl<'a> Mono<'a> {
                             .iter()
                             .find(|(n, _)| n == fname)
                             .map(|(_, p)| p.clone())
-                            .unwrap_or(Pattern::Wild)
+                            .unwrap_or_else(|| Pattern::synth(PatternKind::Wild))
                     })
                     .collect();
-                self.rewrite_pattern(&Pattern::Ctor(name.clone(), ordered), scrut_ty, binds)
+                self.rewrite_pattern(
+                    &Pattern::new(PatternKind::Ctor(name.clone(), ordered), span),
+                    scrut_ty,
+                    binds,
+                )
             }
-            Pattern::Ctor(name, subs) => {
+            PatternKind::Ctor(name, subs) => {
                 let sig = self
                     .ctors
                     .get(name)
@@ -1647,7 +1667,7 @@ impl<'a> Mono<'a> {
                 for (sp, ft) in subs.iter().zip(field_tys.iter()) {
                     rsubs.push(self.rewrite_pattern(sp, ft, binds)?);
                 }
-                Ok(Pattern::Ctor(cname, rsubs))
+                Ok(Pattern::new(PatternKind::Ctor(cname, rsubs), span))
             }
         }
     }

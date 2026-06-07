@@ -30,7 +30,9 @@
 //! Top-level function names, prelude functions, and builtins are NOT local
 //! bindings and are never reported here (the call graph already models them).
 
-use crate::ast::{BinderSpans, Expr, ExprKind, FnDecl, Item, Pattern, Program, Span, Stmt, Ty};
+use crate::ast::{
+    BinderSpans, Expr, ExprKind, FnDecl, Item, Pattern, PatternKind, Program, Span, StmtKind, Ty,
+};
 use crate::diagnostics::json_escape;
 use std::collections::HashMap;
 
@@ -223,43 +225,30 @@ impl<'a> DfWalk<'a> {
     }
 
     /// Bind every variable a match pattern introduces into scope (a match
-    /// binder), looking up each binder's def span from the side table (keyed by
-    /// the arm body span) and its type from the span->type table at the def site.
-    fn bind_pattern(&mut self, pat: &Pattern, arm_body: Span) {
-        match pat {
-            Pattern::Var(name) => {
-                let def = self
-                    .binders
-                    .match_binders
-                    .get(&(arm_body, name.clone()))
-                    .copied()
-                    .unwrap_or(Span::none());
+    /// binder). Each binder's def span is the variable pattern's OWN span (now
+    /// carried directly on the [`Pattern`] node), and its type is looked up from
+    /// the span->type table at the def site.
+    fn bind_pattern(&mut self, pat: &Pattern) {
+        match &pat.kind {
+            PatternKind::Var(name) => {
+                let def = pat.span;
                 let ty = self.lookup_type(def);
                 self.declare(name, BindKind::MatchBinder, def, ty);
             }
-            Pattern::Ctor(_, subs) => {
+            PatternKind::Ctor(_, subs) => {
                 for s in subs {
-                    self.bind_pattern(s, arm_body);
+                    self.bind_pattern(s);
                 }
             }
-            Pattern::Record(_, fields) => {
+            PatternKind::Record(_, fields) => {
                 for (_, sub) in fields {
-                    match sub {
-                        Pattern::Var(v) => {
-                            let def = self
-                                .binders
-                                .match_binders
-                                .get(&(arm_body, v.clone()))
-                                .copied()
-                                .unwrap_or(Span::none());
-                            let ty = self.lookup_type(def);
-                            self.declare(v, BindKind::MatchBinder, def, ty);
-                        }
-                        _ => self.bind_pattern(sub, arm_body),
-                    }
+                    // A record field's sub-pattern (incl. the `{ x }` shorthand,
+                    // which the parser expands to a `Var` whose span is the field
+                    // name) is just another pattern; recurse uniformly.
+                    self.bind_pattern(sub);
                 }
             }
-            Pattern::Wild | Pattern::Int(_) | Pattern::Bool(_) => {}
+            PatternKind::Wild | PatternKind::Int(_) | PatternKind::Bool(_) => {}
         }
     }
 
@@ -329,7 +318,7 @@ impl<'a> DfWalk<'a> {
                 self.walk(scrut);
                 for arm in arms {
                     let depth = self.scope.len();
-                    self.bind_pattern(&arm.pat, arm.body.span);
+                    self.bind_pattern(&arm.pat);
                     self.walk(&arm.body);
                     self.scope.truncate(depth);
                 }
@@ -337,26 +326,23 @@ impl<'a> DfWalk<'a> {
             ExprKind::Block(stmts, last) => {
                 let depth = self.scope.len();
                 for s in stmts {
-                    match s {
-                        Stmt::Let(name, ann, v) => {
+                    match &s.kind {
+                        StmtKind::Let { name, name_span, ann, value } => {
                             // The RHS is evaluated in the PRE-binding scope.
-                            self.walk(v);
-                            let def = self
-                                .binders
-                                .lets
-                                .get(&v.span)
-                                .copied()
-                                .unwrap_or(Span::none());
+                            self.walk(value);
+                            // The binder's def span is the `let` name's own span,
+                            // carried directly on the statement node.
+                            let def = *name_span;
                             // A `let`'s type: prefer an explicit annotation, else
                             // the inferred type of its RHS value expression.
                             let ty = ann
                                 .as_ref()
                                 .and_then(render_ty)
-                                .or_else(|| self.lookup_type(v.span))
+                                .or_else(|| self.lookup_type(value.span))
                                 .or_else(|| self.lookup_type(def));
                             self.declare(name, BindKind::Let, def, ty);
                         }
-                        Stmt::Expr(ex) => self.walk(ex),
+                        StmtKind::Expr(ex) => self.walk(ex),
                     }
                 }
                 self.walk(last);

@@ -47,7 +47,7 @@
 use std::collections::HashMap;
 use std::fmt::Write;
 
-use crate::ast::{Arm, BinOp, Expr, ExprKind, FnDecl, Item, Pattern, Program, Stmt, UnOp};
+use crate::ast::{Arm, BinOp, Expr, ExprKind, FnDecl, Item, PatternKind, Program, StmtKind, UnOp};
 
 /// The C value produced by a traced expression: a scalar tape node-id, or a
 /// traced vector (an `AriaTVec` of node-ids). Both are held in fresh C locals
@@ -229,9 +229,9 @@ fn rewrite_expr(
         }
         ExprKind::Block(stmts, last) => {
             for s in stmts.iter_mut() {
-                match s {
-                    Stmt::Let(_, _, v) => rewrite_expr(v, fns, sites, counter)?,
-                    Stmt::Expr(ex) => rewrite_expr(ex, fns, sites, counter)?,
+                match &mut s.kind {
+                    StmtKind::Let { value, .. } => rewrite_expr(value, fns, sites, counter)?,
+                    StmtKind::Expr(ex) => rewrite_expr(ex, fns, sites, counter)?,
                 }
             }
             rewrite_expr(last, fns, sites, counter)?;
@@ -431,12 +431,12 @@ impl Tracer<'_> {
             ExprKind::Block(stmts, last) => {
                 let saved = self.scope.clone();
                 for s in stmts {
-                    match s {
-                        Stmt::Let(n, _, v) => {
-                            let tv = self.trace(v)?;
-                            self.scope.insert(n.clone(), tv);
+                    match &s.kind {
+                        StmtKind::Let { name, value, .. } => {
+                            let tv = self.trace(value)?;
+                            self.scope.insert(name.clone(), tv);
                         }
-                        Stmt::Expr(ex) => {
+                        StmtKind::Expr(ex) => {
                             // Evaluate for its (recorded) effect; discard result.
                             let _ = self.trace(ex)?;
                         }
@@ -905,19 +905,19 @@ impl Tracer<'_> {
                         .into(),
                 );
             }
-            let guard = match &arm.pat {
-                Pattern::Wild => {
+            let guard = match &arm.pat.kind {
+                PatternKind::Wild => {
                     saw_default = true;
                     "else".to_string()
                 }
-                Pattern::Var(name) => {
+                PatternKind::Var(name) => {
                     // Bind the concrete scrutinee to `name` for this arm's body.
                     saw_default = true;
                     let (buf, val) = self.sub_trace_bound(&arm.body, name, &sv)?;
                     branches.push(("else".to_string(), buf, val));
                     continue;
                 }
-                Pattern::Int(n) => match &sv {
+                PatternKind::Int(n) => match &sv {
                     FVal::Int(s) => format!("if ({s} == {n})"),
                     FVal::Bool(s) => format!("if ({s} == {n})"),
                     FVal::Float(_) => {
@@ -927,7 +927,7 @@ impl Tracer<'_> {
                         )
                     }
                 },
-                Pattern::Bool(b) => match &sv {
+                PatternKind::Bool(b) => match &sv {
                     FVal::Bool(s) => format!("if ({s} == {})", if *b { 1 } else { 0 }),
                     _ => {
                         return Err(
@@ -936,7 +936,7 @@ impl Tracer<'_> {
                         )
                     }
                 },
-                Pattern::Ctor(_, _) | Pattern::Record(_, _) => {
+                PatternKind::Ctor(_, _) | PatternKind::Record(_, _) => {
                     return Err(
                         "grad: `match` on constructors/records inside `f` is not supported on the \
                          native backend (only Int/Bool/wildcard/var patterns on a concrete \
@@ -1195,8 +1195,8 @@ impl Tracer<'_> {
                 // (concrete) value and forward-eval the result.
                 let saved = self.scope.clone();
                 for s in stmts {
-                    match s {
-                        Stmt::Let(n, _, v) => {
+                    match &s.kind {
+                        StmtKind::Let { name: n, value: v, .. } => {
                             let fv = self.forward_eval(v)?;
                             let t = self.fresh();
                             let tv = match fv {
@@ -1222,7 +1222,7 @@ impl Tracer<'_> {
                             };
                             self.scope.insert(n.clone(), tv);
                         }
-                        Stmt::Expr(_) => {
+                        StmtKind::Expr(_) => {
                             self.scope = saved;
                             return Err(
                                 "grad: a statement-expression inside an `if`/`match` condition is \

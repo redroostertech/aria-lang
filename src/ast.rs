@@ -134,9 +134,47 @@ pub enum ExprKind {
     Block(Vec<Stmt>, Box<Expr>),
 }
 
+/// A block statement: its `kind` (a `let` binding or a bare expression
+/// statement) plus the precise source `span` covering the whole statement
+/// (from its first token through the terminating `;`'s end, or through the
+/// value/expression for a non-terminated final form). Mirrors the
+/// [`Expr`]`{ kind, span }` split so a single field carries the statement's
+/// location and matching is done on `&stmt.kind`. Synthesized statements (none
+/// are produced today, but rewrites use it for safety) carry [`Span::none`].
+///
+/// Like every span, this is pure METADATA: no backend, the monomorphizer, or
+/// the evaluator reads it, so it never affects codegen or a program's result.
+/// It feeds diagnostics, the data-flow analyzer, and the LSP.
 #[derive(Debug, Clone)]
-pub enum Stmt {
-    Let(String, Option<Ty>, Expr),
+pub struct Stmt {
+    pub kind: StmtKind,
+    pub span: Span,
+}
+
+impl Stmt {
+    /// Build a statement node from its kind and span.
+    pub fn new(kind: StmtKind, span: Span) -> Stmt {
+        Stmt { kind, span }
+    }
+
+    /// Build a compiler-synthesized statement (no source location).
+    pub fn synth(kind: StmtKind) -> Stmt {
+        Stmt { kind, span: Span::none() }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum StmtKind {
+    /// A `let` binding `let name[: Ty] = value;`. `name_span` is the precise
+    /// source span of the BINDER (the bound name identifier alone), used by the
+    /// data-flow analyzer and the unused-binding lint to point exactly at the
+    /// dead name; the enclosing [`Stmt::span`] covers the whole statement.
+    Let {
+        name: String,
+        name_span: Span,
+        ann: Option<Ty>,
+        value: Expr,
+    },
     Expr(Expr),
 }
 
@@ -146,15 +184,44 @@ pub struct Arm {
     pub body: Expr,
 }
 
+/// A pattern: its `kind` (the shape of the pattern) plus the precise source
+/// `span` it was parsed from. Mirrors the [`Expr`]`{ kind, span }` design so a
+/// single field carries the location and matching is done on `&pat.kind`.
+/// Compiler-synthesized patterns (the monomorphizer's record→positional
+/// rewrite, trait-dispatcher wildcards, the IR's nested-pattern flattening) use
+/// [`Span::none`]. Spans are pure METADATA (never read by any backend, the
+/// monomorphizer, or the evaluator) and feed diagnostics / data-flow / the LSP.
 #[derive(Debug, Clone)]
-pub enum Pattern {
+pub struct Pattern {
+    pub kind: PatternKind,
+    pub span: Span,
+}
+
+impl Pattern {
+    /// Build a pattern node from its kind and span.
+    pub fn new(kind: PatternKind, span: Span) -> Pattern {
+        Pattern { kind, span }
+    }
+
+    /// Build a compiler-synthesized pattern (no source location): used by the
+    /// monomorphizer's record→positional rewrite, trait lowering, and the IR's
+    /// nested-pattern flattening, which fabricate patterns with no source token.
+    pub fn synth(kind: PatternKind) -> Pattern {
+        Pattern { kind, span: Span::none() }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum PatternKind {
     Wild,
     Var(String),
     Int(i64),
     Bool(bool),
     Ctor(String, Vec<Pattern>),
     /// A record pattern, e.g. `Point { x, y }`, binding each named field to a
-    /// same-named variable. Unmentioned fields are ignored.
+    /// same-named variable. Unmentioned fields are ignored. For the field-name
+    /// shorthand (`{ x }`), the sub-pattern is a [`PatternKind::Var`] whose span
+    /// is the field name's source extent.
     Record(String, Vec<(String, Pattern)>),
 }
 
@@ -282,25 +349,22 @@ pub struct Program {
     pub items: Vec<Item>,
 }
 
-/// A parser-built SIDE TABLE of precise binder source spans for the binders that
-/// the AST does not itself carry a span for (`let` names, lambda parameters, and
-/// match-arm pattern variables). It is pure METADATA consumed only by the
-/// data-flow analyzer to report each local binding's definition site; no backend,
-/// the monomorphizer, or the evaluator reads it, so it never affects codegen or a
-/// program's result.
+/// A parser-built SIDE TABLE of precise binder source spans for the ONE binder
+/// kind the AST cannot carry a span for directly: LAMBDA PARAMETERS. A lambda's
+/// parameters are a bare `Vec<(String, Ty)>` (no per-parameter node), so unlike a
+/// function [`Param`] (which has its own `span`), a `let` ([`StmtKind::Let`]'s
+/// `name_span`), or a match-arm pattern variable ([`PatternKind::Var`]'s pattern
+/// `span`) — all of which now carry their binder span IN the AST — a lambda
+/// parameter has nowhere on the node to record it.
 ///
-/// Each binder is keyed by an in-AST span that survives unchanged from parse to
-/// analysis (the program is not monomorphized before `aria analyze`):
-///   * a `let` binder by the span of its right-hand-side value expression,
-///   * a lambda parameter by `(lambda-body span, parameter index)`,
-///   * a match-arm pattern variable by `(arm-body span, binder name)`.
-/// (Function parameters carry their own span directly on [`Param`].)
+/// It is pure METADATA consumed only by the data-flow analyzer to report each
+/// lambda parameter's definition site; no backend, the monomorphizer, or the
+/// evaluator reads it, so it never affects codegen or a program's result. Each
+/// entry is keyed by `(lambda-body span, parameter index)` — an in-AST span that
+/// survives unchanged from parse to analysis (the program is not monomorphized
+/// before `aria analyze`).
 #[derive(Debug, Clone, Default)]
 pub struct BinderSpans {
-    /// `let` binder span, keyed by the let's RHS value expression span.
-    pub lets: std::collections::HashMap<Span, Span>,
     /// Lambda parameter binder span, keyed by `(lambda body span, param index)`.
     pub lambda_params: std::collections::HashMap<(Span, usize), Span>,
-    /// Match-arm pattern-variable binder span, keyed by `(arm body span, name)`.
-    pub match_binders: std::collections::HashMap<(Span, String), Span>,
 }

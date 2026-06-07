@@ -241,10 +241,10 @@ pub fn lower(
                 let call_args: Vec<Expr> =
                     params.iter().map(|p| Expr::synth(ExprKind::Var(p.name.clone()))).collect();
                 for v in variants {
-                    let pat = Pattern::Ctor(
+                    let pat = Pattern::synth(PatternKind::Ctor(
                         v.name.clone(),
-                        v.fields.iter().map(|_| Pattern::Wild).collect(),
-                    );
+                        v.fields.iter().map(|_| Pattern::synth(PatternKind::Wild)).collect(),
+                    ));
                     arms.push(Arm {
                         pat,
                         body: Expr::synth(ExprKind::Call(impl_fn.clone(), call_args.clone())),
